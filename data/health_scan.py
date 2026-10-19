@@ -128,27 +128,29 @@ def main() -> int:
     except Exception as e:
         bad.append(f"一致性异常: {str(e)[:60]}")
 
-    # 4) ★计划任务（调度层健康，2026-08-12 百轮后#113：7 个 LWQuant 任务应全部就绪——
-    #    防 dev_auto 熔断/手动禁用后静默停摆；08-11 DailyPipeline 0xC0000142 误杀事故归因后加）
-    SCHED_TASKS = ["LWQuant-DevDriver", "LWQuant-DailyPipeline", "LWQuant-TushareInc",
-                   "LWQuant-FactorDaily", "LWQuant-FactorArchive", "LWQuant-BreakoutMon",
-                   "LWQuant-DeckGuard"]
+    # 4) ★计划任务（调度层健康）
+    #   ★2026-10-18 重写：原实现硬编码 7 个 "LWQuant-*" 任务名，而实际注册为 "DSHQuant-*"
+    #     → 7 个全判「缺失」→ 调度维度永远红灯（同时 dev_auto 那边又是永远绿灯），两头都在骗人。
+    #     现统一走 data/task_registry.py：后缀解析、前缀无关、查询失败返回 Unknown 而非假装健康。
+    #     另：FactorDaily / FactorArchive 对应的 data/factorpool/core/scheduler.py 在本构建中不存在
+    #     （因子池是外包组件，未随包发布），已从规格中移除——不对着不存在的规格报红灯。
     sched_ok = True
     sched_disabled = []
     try:
-        import subprocess as _sp
-        _r = _sp.run(["schtasks", "/query", "/fo", "LIST", "/v"], capture_output=True, timeout=30)
-        _txt = _r.stdout.decode("gbk", errors="replace") + _r.stderr.decode("gbk", errors="replace")
-        for _t in SCHED_TASKS:
-            _idx = _txt.find(_t)
-            _seg = _txt[_idx:_idx + 400] if _idx >= 0 else ""
-            if "禁用" in _seg or "Disabled" in _seg:
-                sched_disabled.append(_t)
-            elif _idx < 0:
-                sched_disabled.append(_t + "(缺失)")
-        if sched_disabled:
+        from data.task_registry import snapshot as _task_snap
+        _snap = _task_snap()
+        if not _snap["queryable"]:
             sched_ok = False
-            bad.append(f"计划任务禁用/缺失: {','.join(sched_disabled)}")
+            bad.append("计划任务状态未知（查询失败）")
+            sched_disabled.append("(查询失败)")
+        else:
+            for _sfx in _snap["missing"]:
+                sched_disabled.append(_sfx + "(缺失)")
+            for _nm in _snap["disabled"]:
+                sched_disabled.append(_nm + "(禁用)")
+            if sched_disabled:
+                sched_ok = False
+                bad.append(f"计划任务禁用/缺失: {','.join(sched_disabled)}")
     except Exception as e:
         sched_ok = False
         bad.append(f"计划任务检查异常: {str(e)[:50]}")

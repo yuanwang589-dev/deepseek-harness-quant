@@ -22,6 +22,7 @@
 """
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -68,6 +69,27 @@ def _eval_time_series_factor(name: str) -> dict:
     return evaluate_time_series(name, series, mkt)
 
 
+# factor_evaluator 的评分行形如：  `  评分 54.0 ｜ 反向弱有效 ｜ 低权重（10-30%，反用）`
+_SCORE_RE = re.compile(r"评分\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)")
+
+
+def parse_evaluator_score(out: str):
+    """从 factor_evaluator 的 stdout 解析评分；解析不出返回 None。
+
+    ★2026-10-15 修复：原实现用 `line.split(":")[-1]` 解析这一行，而该行**没有冒号**
+      → float() 必抛 ValueError → score 恒为 None → 下游一律判成 retired。
+      即「cross_sectional 评估通路从未真正生效，且每次评估都在淘汰因子」。
+    """
+    for line in (out or "").splitlines():
+        m = _SCORE_RE.search(line)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                continue
+    return None
+
+
 def evaluate_factor(reg: FactorRegistry, f: dict) -> dict:
     """单因子评估 → 评分卡 → 状态流转"""
     kind = f["kind"]
@@ -83,17 +105,19 @@ def evaluate_factor(reg: FactorRegistry, f: dict) -> dict:
          "--factors", f["name"]],
         capture_output=True, text=True, timeout=1800, encoding="utf-8", errors="replace")
     out = (r.stdout or "")[-1500:]
-    # 从输出解析评分（factor_evaluator 输出格式为评分卡；宽松解析 score 行）
-    score = None
-    for line in out.splitlines():
-        if "总评" in line or "score" in line.lower() or "评分" in line:
-            try:
-                score = float(line.split(":")[-1].split("/")[0].strip())
-                break
-            except ValueError:
-                continue
-    status = "active" if score and score >= 65 else ("candidate" if score and score >= 40 else "retired")
-    detail = {"stdout_tail": out, "score_parsed": score}
+    score = parse_evaluator_score(out)
+    detail = {"stdout_tail": out, "score_parsed": score, "returncode": r.returncode}
+
+    if score is None:
+        # ★无有效分数时**不流转状态**：原实现在此把因子判成 retired，
+        #   于是「评估器输出格式一变 / 因子无评估通路」= 好因子被静默淘汰。
+        #   正确做法：保持原状态与原有分数，只记录本次尝试。
+        cur = reg.get(f["name"]) or {}
+        detail["note"] = "评估未产出分数 → 状态与分数保持原样（不判 retired）"
+        reg.update_score(f["name"], cur.get("score"), status=None, detail=detail)
+        return detail
+
+    status = "active" if score >= 65 else ("candidate" if score >= 40 else "retired")
     reg.update_score(f["name"], score, status=status, detail=detail)
     return detail
 

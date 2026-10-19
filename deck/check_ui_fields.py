@@ -5,6 +5,7 @@
 原理: 按变量名绑定（const X = await j('/api/...')）分组校验，避免误报（d vs cd2 vs r 不同作用域）
 """
 import urllib.request, json, re, glob, os, sys
+from data.io_utils import read_json, read_text
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -36,7 +37,7 @@ def _check_page(pg):
     f = _page_files(pg)
     if not f:
         return [], "无页面文件"
-    html = open(f, encoding="utf-8").read()
+    html = read_text(f)
     binds = _binds(html)
     issues = []
     # map/forEach 回调变量（如 r）不校验——它们是行内元素字段，需人工确认

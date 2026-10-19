@@ -47,6 +47,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from data.io_utils import read_json, read_text
 
 BASE = Path(__file__).resolve().parent
 PROJECT = BASE.parent                       # 项目根目录（桌面DeepSeek HARNESS Quant）
@@ -64,10 +65,22 @@ NOTES_EXT = (".md", ".py", ".txt")
 # ---- 熔断配置 ----
 STOP_FILE = BASE / "STOP.md"                 # 手动熔断标记文件
 STATE_FILE = LOG_DIR / "breaker_state.json"  # 熔断状态（自动熔断记录）
-TASK_NAME = "LWQuant-DevDriver"              # Windows 计划任务名
+# ★2026-10-18 修虚假绿灯：原名 "LWQuant-DevDriver" 是历史前缀，实际注册为 "DSHQuant-DevDriver"，
+#   两套名字互不相认 → 查询必然失败 → 旧代码 `except: return True` 让界面显示「🟢 启用中」，
+#   而该任务从未注册。现改为「后缀解析」（data/task_registry.py），前缀无关，换名也不会再失联。
+TASK_SUFFIX = "DevDriver"
 MAX_STALE_ROUNDS = 3                          # 连续 N 轮进度无变化 → 自动熔断
 MAX_ERRORS_PER_RUN = 5                        # 单轮异常 ≥N 次 → 熔断
 RUN_TIMEOUT_MIN = 60                          # 每轮超时（分钟）
+
+
+def _task_name() -> str | None:
+    """解析真实注册的任务名（DSHQuant-DevDriver / LWQuant-DevDriver 都能命中）。"""
+    try:
+        from data.task_registry import resolve
+        return resolve(TASK_SUFFIX)
+    except Exception:
+        return None
 
 
 def log(msg):
@@ -93,22 +106,33 @@ def _write_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _task_enabled() -> bool:
-    """查询计划任务是否启用（Windows 输出可能为 GBK 编码，容错处理）"""
+def _task_enabled() -> bool | None:
+    """计划任务是否「已注册且未禁用」。
+
+    ★2026-10-18 修虚假绿灯：返回三态，不再用 True 兜底。
+      True  = 已注册且未禁用
+      False = 已注册但被禁用
+      None  = 任务不存在 / 查询失败 → **无法判定**
+    旧实现 `except: return True` 把「查不到」当成「启用中」，导致界面显示 🟢
+    而任务实际从未注册（本机 10-18 前的真实状况）。
+    """
     try:
-        r = subprocess.run(["schtasks", "/Query", "/TN", TASK_NAME, "/FO", "LIST"],
-                           capture_output=True, timeout=15)
-        out = r.stdout.decode("gbk", errors="ignore") + r.stderr.decode("gbk", errors="ignore")
-        return "禁用" not in out and "Disabled" not in out
-    except Exception:
-        return True  # 查询失败时保守假设启用（由自动熔断兜底）
+        from data.task_registry import is_healthy
+        return is_healthy(TASK_SUFFIX)
+    except Exception as e:
+        log(f"计划任务状态查询失败（不假定为启用）: {type(e).__name__}: {e}")
+        return None
 
 
 def _set_task(enabled: bool) -> bool:
-    """启用/禁用计划任务"""
+    """启用/禁用计划任务（任务名走后缀解析，前缀无关）"""
     flag = "/Enable" if enabled else "/Disable"
+    name = _task_name()
+    if not name:
+        log(f"计划任务 {flag} 失败：未找到 *-{TASK_SUFFIX} 任务（未注册？）")
+        return False
     try:
-        r = subprocess.run(["schtasks", "/Change", "/TN", TASK_NAME, flag],
+        r = subprocess.run(["schtasks", "/Change", "/TN", name, flag],
                            capture_output=True, timeout=15)
         return r.returncode == 0
     except Exception as e:
@@ -132,11 +156,15 @@ def _set_breaker(reason: str, auto: bool):
         f"- 来源：{'自动' if auto else '手动'}\n\n> 删除本文件或运行 `python dev_auto.py --reset` 恢复。\n",
         encoding="utf-8")
     _write_state({"breaker": True, "reason": reason, "auto": auto, "at": ts})
-    if _task_enabled():
+    _st = _task_enabled()
+    if _st is True:
         ok = _set_task(False)
         log(f"★熔断触发[{reason}]：计划任务{'已禁用' if ok else '禁用失败，请手动处理'}")
-    else:
+    elif _st is False:
         log(f"★熔断触发[{reason}]：计划任务已处于禁用状态")
+    else:
+        # 任务不存在或查不了：熔断标记照写（本进程不再自驱），但要诚实说明调度层没断开
+        log(f"★熔断触发[{reason}]：⚠ 计划任务状态未知（未注册/查询失败）→ 调度层未能断开，请手动核查")
     log(f"熔断原因已写入 STOP.md（恢复方式: python dev_auto.py --reset）")
 
 
@@ -546,6 +574,19 @@ def run_update():
         log(f"动态择时(均线金叉6/12): {out7.splitlines()[0] if out7 else '无输出'}")
     except Exception as e:
         log(f"动态择时失败: {e}")
+    # 8.1) ★新择时系统（适合买入判断）——决策链"新择时"节点
+    #   ★2026-10-19 修复：此前仅数据管道(daily_pipeline / manual_update_worker)调用，
+    #   dev_auto 每日调度遗漏 → 新择时长期停在上一完整交易日（本次卡在 2026-10-16）。
+    #   现纳入每日确定性更新，与观察池/今日信号同频刷新（date 取 bars.db 合并最新日）。
+    try:
+        import subprocess as _sp_t
+        r_t = _sp_t.run(
+            [sys.executable, "-X", "utf8", str(BASE / "factors" / "policy" / "timing_system.py")],
+            capture_output=True, text=True, timeout=300, encoding="utf-8", errors="replace")
+        out_t = (r_t.stdout or "")[-200:].strip()
+        log(f"新择时系统(适合买入): {out_t.splitlines()[0] if out_t else '无输出'}")
+    except Exception as e:
+        log(f"新择时系统失败: {e}")
     # 8.5) ★机会发现引擎（v3.0 重构：多类型机会扫描 → 大池子统一评分 → Pitch 三重过滤）
     try:
         import subprocess
@@ -559,7 +600,7 @@ def run_update():
         import glob as _glob
         op_files = sorted(_glob.glob(str(BASE / "logs" / "opp_pool_*.json")))
         if op_files:
-            data = _json3.loads(open(op_files[-1], encoding="utf-8").read())
+            data = _json3.loads(read_text(op_files[-1]))
             pitch = data.get("pitch", [])
             brief = "; ".join("{} ({} score={})".format(p["code"], p["otype"], p["score"]) for p in pitch)
             log(f"机会大池子 {data.get('n', 0)} 条 | Pitch 候选 {len(pitch)} 只: {brief}")
@@ -931,7 +972,16 @@ def run_status():
     st = _read_state()
     print(f"\n熔断状态: {'🔴 已熔断' if breaker_active() else '🟢 正常'}"
           f"（原因: {st.get('reason', '无')}）")
-    print(f"计划任务: {'🔴 已禁用' if not _task_enabled() else '🟢 启用中'}（{TASK_NAME}）")
+    # ★2026-10-18 三态显示：查不到就说查不到，不再一律 🟢
+    _te, _tn = _task_enabled(), _task_name()
+    if _te is True:
+        _disp = f"🟢 启用中（{_tn}）"
+    elif _te is False:
+        _disp = f"🔴 已禁用（{_tn}）"
+    else:
+        _disp = (f"⚪ 未注册（未找到 *-{TASK_SUFFIX} 任务 → 例行运行不会自动触发）"
+                 if _tn is None else f"🟡 状态未知（{_tn}）")
+    print(f"计划任务: {_disp}")
 
 
 def main():

@@ -3,4 +3,4 @@
 # 相对路径以本文件所在目录（DSH_HOME/profiles/web/）为基准
 - insert:
     - id: dsq-quant-bridge
-      name: ./plugins/dsq-quant-bridge.js
+      name: ../../../plugins/dsq-quant-bridge/index.js

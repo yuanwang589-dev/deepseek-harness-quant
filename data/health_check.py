@@ -72,14 +72,37 @@ def check_chains() -> list:
 
 
 def check_tasks() -> list:
-    names = ["DSHQuant-DevDriver", "DSHQuant-DailyPipeline", "DSHQuant-FactorDaily",
-             "DSHQuant-FactorArchive", "DSHQuant-DeckGuard", "DSHQuant-BreakoutMon"]
+    """计划任务就绪度。
+
+    ★2026-10-18 二次修复（任务书 D1 的 ⚠️ 收口）：
+      上一版把 schtasks 异常降级为"未验证"——不崩了，但**永远查不出结果**：
+      本机安全策略把 schtasks.exe 列入程序黑名单，6 项恒为"未验证"，这个检查形同虚设。
+      同时它还硬编码了 DSHQuant-FactorDaily / FactorArchive 两个**根本没有脚本**的任务
+      （因子池 scheduler.py 不随包发布），schtasks 一旦可用就会恒报"缺失"。
+
+      现改为走 data/task_registry.py（PowerShell Get-ScheduledTask，不受黑名单影响）：
+        · 任务名按后缀解析，前缀无关，不存在的不列入规格
+        · 查不到 → 明确区分"未注册"与"查询失败"，不再混淆
+    """
+    try:
+        from data.task_registry import snapshot as _snap
+        s = _snap()
+    except Exception as e:
+        return [{"name": "(全部)", "ok": False, "unverified": True,
+                 "issue": f"task_registry 不可用（{type(e).__name__}）"}]
+    if not s.get("queryable"):
+        return [{"name": "(全部)", "ok": False, "unverified": True,
+                 "issue": s.get("note") or "计划任务查询失败"}]
     rows = []
-    for n in names:
-        r = subprocess.run(["schtasks", "/query", "/tn", n], capture_output=True,
-                           text=True, errors="replace")
-        rows.append({"name": n, "ok": r.returncode == 0,
-                     "issue": "" if r.returncode == 0 else "计划任务缺失"})
+    for suffix, info in s["found"].items():
+        st = info["state"]
+        if st == "Missing":
+            rows.append({"name": f"*-{suffix}", "ok": False,
+                         "issue": "未注册（例行运行不会自动触发）"})
+        elif st == "Disabled":
+            rows.append({"name": info["name"], "ok": False, "issue": "已被禁用"})
+        else:
+            rows.append({"name": info["name"], "ok": True, "issue": ""})
     return rows
 
 
@@ -122,12 +145,14 @@ def main():
     db = check_db()
     n_ok = sum(1 for c in chains if c["ok"])
     n_task = sum(1 for t in tasks if t["ok"])
+    n_unv = sum(1 for t in tasks if t.get("unverified"))
     lines = [f"===== 系统一键巡检 {now:%Y-%m-%d %H:%M} =====",
              f"数据链: {n_ok}/{len(chains)} 时效正常"]
     for c in chains:
         flag = "✅" if c["ok"] else "❌"
         lines.append(f"  {flag} {c['name']}: {c.get('mtime') or '—'} {c.get('issue') or ''}")
-    lines.append(f"计划任务: {n_task}/{len(tasks)} 就绪")
+    lines.append(f"计划任务: {n_task}/{len(tasks)} 就绪"
+                 + (f"（{n_unv} 项无法查询，未验证）" if n_unv else ""))
     for t in tasks:
         lines.append(f"  {'✅' if t['ok'] else '❌'} {t['name']} {t.get('issue')}")
     lines.append(f"Deck(8787): {'✅' if deck['ok'] else '❌'} 端口={deck['port']} HTTP={deck['http']}")

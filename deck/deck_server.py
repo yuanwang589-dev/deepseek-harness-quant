@@ -35,6 +35,7 @@ except Exception:
     pass
 
 import os
+import signal
 import sys
 import threading
 import time
@@ -43,15 +44,139 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
+
+# ★2026-10-19 安全修复：路径逃逸防护（路径穿越 H-1/M-4）
+#   背景：/dl/ 与 /v2/ 静态路由用字符串拼接 + 黑名单过滤构造路径，
+#   `../config/params.yaml` 可读出 output/ 之外的任意文件（含明文 token）。
+#   修法：先 resolve() 消解 `..`/符号链接，再用 is_relative_to() 做**包含性**判定，
+#   并叠加扩展名白名单（原先 Content-Type 由用户输入的 .endswith 决定）。
+#   注意：str.replace("..","") 是黑名单——`//etc/passwd` 形式仍会逃逸（已在 Windows 实测）。
+def _safe_join(root: Path, rel: str, allowed_suffixes=None):
+    """把用户可控的相对路径安全地拼到 root 下；越界或扩展名不符返回 None。
+
+    root  : 允许的基准目录（会被 resolve）
+    rel   : 用户传入的相对路径（可能含 ../、//、绝对路径）
+    allowed_suffixes : 允许的扩展名白名单（含点，如 ".xlsx"）；None 表示不限制
+    """
+    try:
+        root_r = root.resolve()
+        fp = (root_r / rel).resolve()
+        if not fp.is_relative_to(root_r):      # 核心：必须落在 root 之内
+            return None
+        # 目录本身或符号链接逃逸都要挡住
+        if allowed_suffixes is not None and fp.suffix.lower() not in allowed_suffixes:
+            return None
+        return fp
+    except Exception:
+        return None
+# ★2026-10-18 审查修复：仓库根自举到 sys.path。
+#   `python deck/deck_server.py` 时 sys.path[0] 是 deck/，而 live_api.py 需要
+#   `from data.io_utils import ...` → ModuleNotFoundError → 36 个 /api/live/* 全 500、
+#   启动预热恒跳过（"No module named 'data'"）。此前只有 scripts/watchdog.py 用
+#   PYTHONPATH 兜住，任何人按本文件 docstring / 仓库地图直接启动都起不来。
+#   这里自举，去掉对调用方环境的隐式依赖（幂等，不改变 import 优先级语义）。
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
 LOGS = BASE / "logs"
 OUTPUT = BASE / "output"
 REPORT = BASE / "report"
 DECISIONS = LOGS / "deck_decisions.json"
 
+
+def _log_slow(msg: str):
+    """慢请求日志：stdout（watchdog_server.out）+ logs/deck_slow.log（带 2MB 截断）。"""
+    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+    try:
+        p = LOGS / "deck_slow.log"
+        if p.exists() and p.stat().st_size > 2 * 1024 * 1024:
+            p.write_text("", encoding="utf-8")
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _sector_parquet_hint(e) -> dict:
+    """板块研究台缺 output/daily_close.parquet 时的降级响应。★2026-10-18 审查修复。
+
+    该 parquet 只由 data/subj_quant_stats._load_daily_close() 懒生成，sector_research._daily()
+    直接 pd.read_parquet 无兜底 → 缺失时 FileNotFoundError → 500 + 把本机绝对路径
+    原样回给浏览器（信息泄露，且用户无从下手）。改为 503 + 可执行提示。
+    刻意不在请求路径里自动生成：8.6M 行 pivot 会占满请求线程（同 live_funnel 的教训）。
+    """
+    return {"ok": False,
+            "error": "板块研究台依赖的日线透视缓存未生成（output/daily_close.parquet）",
+            "hint": "python -c \"from data.subj_quant_stats import _load_daily_close as f; f()\" 生成一次即可",
+            "detail": str(e)[:120]}
+
 # ★2026-08-15 并发写锁：ThreadingHTTPServer 多线程下 /api/decide 的
 #   读-改-写（读最新 deck_decisions → append → 写新时间戳文件）存在竞争，
 #   并发审批会丢记录（实测 10 并发仅存 4 条）→ 串行化整个决策读写区
 DECIDE_LOCK = threading.Lock()
+
+# ★2026-10-18 进程级单实例锁句柄（持有到进程退出，见 _acquire_server_lock）
+_SRV_LOCK_HANDLE = None
+
+
+def _acquire_server_lock(port: int) -> bool:
+    """独占端口锁：保证同一端口只有一个 deck 实例能进入「启动」阶段。
+
+    ★2026-10-18 为什么在 _port_already_served() 之外还要这一层：
+      探测式防双开存在**启动竞态**——实例 A 还在 import（几十秒，deck_server 依赖很重），
+      尚未 bind；此时实例 B 探测得到 ConnectionRefusedError → 判定"端口空闲" → 也去 bind。
+      而 DeckServer.allow_reuse_address = True（Windows 上等价 SO_REUSEADDR）允许两个
+      进程绑同一端口，于是两个都在"监听"，连接只落到其中一个 →
+        改代码重启后旧实例继续服务、新实例空跑；请求行为随机不一致。
+      本轮实测踩中：同一个 /api/system_live 响应里混着新旧两版字段（scheduled 走旧
+      schtasks 解析、next_schedule 走新通路），排查成本极高。
+      文件锁把「启动」这段串行化，竞态窗口直接关掉。
+
+    返回 False 表示已有实例持有锁 → 调用方应退出。
+    锁机制本身异常时返回 True（fail-open，保服务可用），但会打印原因。
+    """
+    global _SRV_LOCK_HANDLE
+    lock_path = LOGS / f"deck_server_{port}.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(lock_path, "a+")
+    except PermissionError:
+        # Windows 字节范围锁是强制锁：另一实例持锁后连 open("a+") 都 EACCES
+        # → 这就是"已有实例在跑"的确定性信号，必须拒绝启动（不能 fail-open）
+        return False
+    except Exception as e:
+        print(f"  [单实例锁] 打开锁文件失败（fail-open）: {e}", flush=True)
+        return True
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            fh.close()
+        except Exception:
+            pass
+        return False
+    except Exception as e:
+        print(f"  [单实例锁] 加锁异常（fail-open）: {e}", flush=True)
+        _SRV_LOCK_HANDLE = fh
+        return True
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()))
+        fh.flush()
+    except Exception:
+        pass
+    _SRV_LOCK_HANDLE = fh          # 故意不关闭：持有到进程退出
+    return True
 
 
 def _json_safe(o):
@@ -164,17 +289,77 @@ def _resolve_route(path: str) -> Path:
                        if not any(t in m.name for t in ("test", "done", "calib", "_old"))]
         if matches:
             return matches[-1]
-    # ★2026-08-11 审批链路修复：/api/pool 读最新含 pitch 的 opp_pool_*.json（原固定名 opportunity_pool.json 是 08-08 旧数据）
-    if path == "/api/pool":
-        _best = _latest_opp_pool()
-        return _best if _best is not None else f
+    # ★2026-10-18 删除死代码：原此处调用未定义的 _latest_opp_pool()（ruff F821）。
+    #   /api/pool 实际由 do_GET 的 _latest_pool_path() 分支处理（见 handler），
+    #   本分支永不可达；一旦哪天可达就是 NameError→500。删除后行为不变。
     if f.exists():
         return f
     return f
 
 
 
+# ─────────────────────────────────────────────────────────────────────
+# ★2026-10-15 可靠性加固：服务器层
+# 原缺陷（ThreadingHTTPServer 裸用）：
+#   A. daemon_threads 默认 False —— 任一请求线程卡住（慢端点 / 客户端半开连接 /
+#      前端启动瞬间 6~8 个并发请求抢同一个大库），进程就无法干净退出：Ctrl+C 无效、
+#      端口持续被占，而 watchdog 拉起的新实例会撞 "Address already in use" 反复失败
+#      → 表现为「服务莫名起不来 / 重启无效」。
+#   B. 无 handle_error —— 工作线程未捕获异常时，默认实现只往 stderr 打一遍 traceback，
+#      **不给客户端发任何响应**，浏览器/前端一直挂到自身超时 → 表现为「连接假死」。
+#   C. request_queue_size 默认 5 —— listen backlog 太小，前端集中刷新时直接拒连。
+#
+# 修法：自定义 DeckServer（守护线程 + 雪崩时回 500 + 大 backlog + 错误落盘可观测）。
+# ─────────────────────────────────────────────────────────────────────
+class DeckServer(ThreadingHTTPServer):
+    daemon_threads = True          # A：工作线程改守护，卡住也不阻塞进程退出
+    allow_reuse_address = True     # A：关服后立刻重启不再撞 WSAEADDRINUSE
+    request_queue_size = 64        # C：listen backlog 5 → 64
+
+    # 近 60s 未捕获异常时间戳（客户端主动断连不计入；供 /api/live/server_errors 观测）
+    _err_window = []
+
+    # ★2026-10-15 未捕获异常日志路径。做成类属性（可被实例/子类覆盖）是为了让测试
+    #   把合成异常重定向到临时文件——否则每跑一轮测试都往真实观测面写噪音，
+    #   运维看 logs/deck_server_errors.log 时分不清哪些是真异常。
+    err_log = LOGS / "deck_server_errors.log"
+
+    # 客户端主动断开的行为/码：刷新、关标签页、无头工具超时。非服务缺陷，静默跳过。
+    _CLIENT_ABORT_CODES = {10053, 10054, 10058, 10060, 10051, 10004}
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if getattr(exc, "code", None) in self._CLIENT_ABORT_CODES or isinstance(
+                exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, TimeoutError)):
+            return
+        now = time.time()
+        self._err_window[:] = [t for t in self._err_window if now - t < 60.0]
+        self._err_window.append(now)
+        summary = f"{type(exc).__name__}: {exc}"
+        try:
+            _lf = Path(self.err_log)
+            _lf.parent.mkdir(parents=True, exist_ok=True)
+            with open(_lf, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {client_address or '?'} "
+                        f"{summary}\n")
+        except Exception:
+            pass
+        sys.stderr.write(f"[deck] 工作线程未捕获异常 → {summary}\n")
+        # B：尽力回 500，绝不让客户端悬挂等超时
+        try:
+            request.sendall(b"HTTP/1.0 500 Internal Server Error\r\n"
+                            b"Content-Type: application/json\r\n"
+                            b"Content-Length: 21\r\n"
+                            b"Cache-Control: no-store\r\n\r\n"
+                            b'{"error":"internal"}')
+        except Exception:
+            pass
+
+
 class Handler(BaseHTTPRequestHandler):
+    # ★2026-10-15：单请求 socket 超时。防客户端半开连接长期占用工作线程
+    # （配合 DeckServer.daemon_threads，双保险）。
+    timeout = 120
     # ★2026-08-10 个股检测缓存（类变量：跨请求共享；每请求实例会重置实例属性）
     _sc_cache = {}
 
@@ -219,8 +404,76 @@ class Handler(BaseHTTPRequestHandler):
             return {}
         return json.loads(self.rfile.read(n).decode("utf-8"))
 
+    # ★2026-10-18 借 GitHub 惯例：请求计时 + 慢请求日志（Starlette/Grafana 式中间件的最小等价物）
+    #   stdlib http.server 没有中间件，但 do_GET 就是唯一入口，包一层即可。
+    #   价值：本轮 P0（funnel 72s 拖死全站）是"没有慢请求可观测性"才拖了三天没被发现——
+    #   上线后只要某个接口变慢，日志里立刻出现 SLOW，不用再等用户报"看板打不开"。
+    SLOW_S = float(os.environ.get("DECK_SLOW_S", "1.0"))
+    VERY_SLOW_S = 10.0
+
+    def _require_auth(self):
+        """DECK_API_TOKEN 未设置 → 不启用鉴权（保持本地现状）。
+        设置后，所有非探针请求须带 `Authorization: Bearer <token>`，否则回 401。
+        返回 True 表示『需要鉴权且未通过，已回 401』。"""
+        tok = os.environ.get("DECK_API_TOKEN")
+        if not tok:
+            return False
+        if self.headers.get("Authorization", "") == "Bearer " + tok:
+            return False
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", "Bearer")
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"ok": False, "error": "unauthorized"}).encode("utf-8"))
+        return True
+
     def do_GET(self):
+        t0 = time.time()
+        try:
+            return self._do_GET_impl()
+        finally:
+            dt = time.time() - t0
+            if dt >= self.VERY_SLOW_S:
+                _log_slow(f"VERYSLOW {dt:6.1f}s  GET {self.path}")
+            elif dt >= self.SLOW_S:
+                _log_slow(f"SLOW     {dt:6.1f}s  GET {self.path}")
+
+    def _do_GET_impl(self):
         path = self.path.split("?")[0]
+        # ★2026-10-19 H-5 修复：启用 DECK_API_TOKEN 时，对所有非探针 GET 要求 Bearer 鉴权
+        if path not in ("/healthz", "/readyz") and self._require_auth():
+            return
+        # ★2026-10-18 探针（借 Kubernetes liveness/readiness 语义，见 deck/health.py 顶部说明）
+        #   /healthz 零 I/O，只回进程内状态 —— watchdog 用它判"该不该重启"。
+        #   /readyz  查依赖与产物新鲜度 —— 只用于"能不能服务/数据新不新"，**绝不触发重启**。
+        if path == "/healthz":
+            try:
+                from deck.health import liveness
+                return self._send_json(liveness())
+            except Exception as e:
+                return self._send_json({"status": "ok", "degraded_probe": str(e)[:80]})
+        if path == "/readyz":
+            try:
+                from deck.health import readiness
+                r = readiness()
+                return self._send_json(r, 200 if r["status"] != "failed" else 503)
+            except Exception as e:
+                return self._send_json({"status": "failed", "ok": False,
+                                        "errors": [{"name": "readyz", "detail": str(e)[:120]}]}, 503)
+        if path == "/api/live/server_errors":
+            # ★2026-10-15 服务端未捕获异常观测面（近 60s 计数 + 日志尾部）。
+            #   客户端主动断连不计入；count>0 说明有真异常，需看 logs/deck_server_errors.log。
+            _ew = getattr(self.server, "_err_window", []) or []
+            _tail = []
+            _lf = Path(getattr(self.server, "err_log", LOGS / "deck_server_errors.log"))
+            if _lf.exists():
+                try:
+                    _tail = _lf.read_text(encoding="utf-8", errors="ignore").strip().splitlines()[-15:]
+                except Exception:
+                    _tail = []
+            return self._send_json({"ok": True, "recent_60s": len(_ew),
+                                    "log": "logs/deck_server_errors.log",
+                                    "recent_lines": _tail})
         if path == "/api/portfolio":     # ★T-2：持仓（strategy/portfolio.py）
             try:
                 sys.path.insert(0, str(BASE))
@@ -264,14 +517,87 @@ class Handler(BaseHTTPRequestHandler):
             return self._v2_page("etf.html", "etf missing")
         if path == "/pitchtrack" or path == "/pitchtrack.html":   # ★2026-08-15 主观多池远期（5 池对比 + 牛散决策者分组）
             return self._v2_page("pitchtrack.html", "pitchtrack missing")
-        if path == "/api/harness":   # ★2026-08-15 harness 状态快照（output/harness_state.json，agent 维护）
+        if path == "/api/harness":   # ★2026-08-16 连接状态：实时探测 :3080 + 合并可选快照（不再因快照缺失返 404）
+            # ★修复（#v1.0.9 复审）：旧实现在 output/harness_state.json 缺失时返回 404，而该文件全项目无生产者
+            #   （注释称"agent 维护"，DSH_HOME 无工作区/会话时 agent 从未运行）→ /control「连接状态」卡片
+            #   长期显示红字「读取失败：Error: HTTP 404」。现改为：
+            #   ① 实时探测 :3080（/quantapi/sessions，桥接插件提供）判定在线 + 桥接是否加载；
+            #   ② 快照存在则合并其 agent/goal/rounds/links（agent 维护的自主推进信息）；
+            #   ③ 无论如何返回 200，缺失字段交给前端 R._f() 兜底为 '—'。
+            _probe = {}
+            _online = False           # :3080 是否在监听
+            _bridge = False           # 桥接插件是否已加载（决定对话/会话管理能否用）
+            import urllib.request as _ur
+            # ★2026-10-15 必须显式绕开系统代理：有 http_proxy 时对 127.0.0.1 的探测
+            #   会被代理应答 → HARNESS 离线也被误报成在线，「连接状态」卡片长期假绿。
+            _hopener = _ur.build_opener(_ur.ProxyHandler({}))
+            try:
+                _pr = _hopener.open(_ur.Request("http://127.0.0.1:3080/quantapi/sessions"), timeout=3)
+                _probe = json.loads(_pr.read().decode("utf-8")) or {}
+                _online = True
+                _bridge = isinstance(_probe.get("sessions"), list)
+            except Exception:
+                _online = False
+            if not _online:   # 桥接不可用时退回探测首页：仍能判定"HARNESS 在跑但桥接缺失"
+                try:
+                    _hopener.open(_ur.Request("http://127.0.0.1:3080/"), timeout=3).read(1)
+                    _online = True
+                except Exception:
+                    _online = False
+            # 活跃根会话（current=True）= 前端「主系统」会话；headless 建的历史会话不算活跃
+            _root_ids = [str(s.get("id")) for s in (_probe.get("sessions") or [])
+                         if isinstance(s, dict) and s.get("id") and s.get("current")]
+            # 版本号：:3080 首页 __DSH_BOOT__ 里的 rev（探测失败不影响在线判定）
+            _rev = None
+            if _online:
+                try:
+                    import urllib.request as _ur
+                    _page = _ur.urlopen(_ur.Request("http://127.0.0.1:3080/"), timeout=3).read().decode("utf-8", "replace")
+                    _m = re.search(r'"rev"\s*:\s*"([0-9a-fA-F]+)"', _page)
+                    _rev = _m.group(1) if _m else None
+                except Exception:
+                    _rev = None
+            # 框架版本：读 harness/package.json（文件驱动，不写死版本号）
+            _fw = "DeepSeek HARNESS"
+            try:
+                _pj = json.loads((BASE / "harness" / "package.json").read_text(encoding="utf-8"))
+                _dv = (_pj.get("dependencies") or {}).get("@deepseek-ai/dsh")
+                if _dv:
+                    _fw = "DeepSeek HARNESS (dsh " + str(_dv) + ")"
+            except Exception:
+                pass
+            _snap = {}
             try:
                 _hs = BASE / "output" / "harness_state.json"
                 if _hs.exists():
-                    return self._send_json(json.loads(_hs.read_text(encoding="utf-8")))
-                return self._send_json({"harness": {"online": False}, "error": "harness_state.json 未生成"}, 404)
-            except Exception as e:
-                return self._send_json({"error": str(e)}, 500)
+                    _snap = json.loads(_hs.read_text(encoding="utf-8")) or {}
+            except Exception:
+                _snap = {}
+            _sh = _snap.get("harness") or {}
+            _out = dict(_snap)
+            _out["harness"] = {
+                "online": _online,
+                "name": _sh.get("name") or "DeepSeek HARNESS",
+                "rev": _sh.get("rev") or _rev,
+                "updated_at": _sh.get("updated_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "endpoint": "http://127.0.0.1:3080",
+                "bridge": _bridge,
+                "root_ids": _root_ids,
+            }
+            _ag = dict(_snap.get("agent") or {})
+            _ag.setdefault("framework", _fw)
+            _ag.setdefault("session_id", _root_ids[0] if _root_ids else None)
+            _out["agent"] = _ag
+            _out.setdefault("goal", {})
+            _out.setdefault("rounds", [])
+            _out.setdefault("links", {})
+            if not _online:
+                _out["hint"] = "HARNESS :3080 未响应 —— 双击 启动DSHQuant.cmd 启动"
+            elif not _bridge:
+                _out["hint"] = "HARNESS 在运行，但量化桥接插件未加载 —— 检查 harness/home/profiles/web/cordis.patch.yml"
+            elif not _snap:
+                _out["hint"] = "HARNESS 在线；output/harness_state.json 尚未生成（由 :3080 的 agent 维护，缺省不影响连接）"
+            return self._send_json(_out)
         if path == "/api/build_mode":   # ★2026-08-16 构建模式（dev=开发版徽章 / release=公测发布版无徽章；config/ui_build.json 驱动）
             try:
                 _bm = BASE / "config" / "ui_build.json"
@@ -380,6 +706,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "code": code,
                                         "timing": timing, "factors": factors,
                                         "pitch": pitch, "retail": retail, "crowd": crowd})
+            except FileNotFoundError as e:
+                return self._send_json(_sector_parquet_hint(e), 503)
             except Exception as e:
                 return self._send_json({"ok": False, "error": str(e)}, 500)
         if path == "/api/sector_research/stock_search":   # ★2026-08-14 板块研究台：股票搜索
@@ -402,6 +730,8 @@ class Handler(BaseHTTPRequestHandler):
                 sys.path.insert(0, str(BASE))
                 from data.sector_research import stock_factors
                 return self._send_json(stock_factors(code))
+            except FileNotFoundError as e:
+                return self._send_json(_sector_parquet_hint(e), 503)
             except Exception as e:
                 return self._send_json({"ok": False, "error": str(e)}, 500)
         if path == "/api/live/backtest_archive":   # ★2026-08-14 回测档案（latest 当前 + history 历史）
@@ -529,12 +859,19 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v2" or path == "/v2/":   # ★#366 旧骨架页 → 301 门户（index.html 是"V2 建设中"历史残留，主入口已切 /）
             return self._redirect("/")
         if path.startswith("/v2/"):   # ★2026-08-13 UI v2 静态路由（ui_v2/ 目录——API 驱动静态页，无生成器机制）
-            _rel = path[len("/v2/"):].replace("..", "")
-            f = BASE / "ui_v2" / _rel
-            if f.is_file():
-                _ct = "text/css; charset=utf-8" if _rel.endswith(".css") else (
-                    "application/javascript; charset=utf-8" if _rel.endswith(".js") else "text/html; charset=utf-8")
-                return self._send(200, f.read_bytes(), _ct)
+            _rel = path[len("/v2/"):]
+            # ★2026-10-19 安全修复：原 `.replace("..","")` 是黑名单，`/v2/../../etc/passwd`
+            #   过滤后成 `//etc/passwd`，在 Windows 解析为 UNC 根 → 逃逸 ui_v2（已实测）。
+            #   改为 _safe_join 包含性判定；静态资源白名单含 css/js/html/svg/png/ico/json。
+            _sv = {".css": "text/css; charset=utf-8", ".js": "application/javascript; charset=utf-8",
+                   ".html": "text/html; charset=utf-8", ".htm": "text/html; charset=utf-8",
+                   ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg",
+                   ".jpeg": "image/jpeg", ".gif": "image/gif", ".ico": "image/x-icon",
+                   ".json": "application/json; charset=utf-8", ".map": "application/json; charset=utf-8",
+                   ".woff": "font/woff", ".woff2": "font/woff2"}
+            f = _safe_join(BASE / "ui_v2", _rel, allowed_suffixes=tuple(_sv.keys()))
+            if f is not None and f.is_file():
+                return self._send(200, f.read_bytes(), _sv.get(f.suffix.lower(), "text/html; charset=utf-8"))
             return self._send(404, b"ui_v2 404", "text/plain; charset=utf-8")
         if path == "/stock_link.js":   # ★2026-08-12 用户需求#181：全站个股代码联动组件（点击弹全息）
             f = BASE / "deck" / "stock_link.js"
@@ -637,9 +974,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": str(e)}, 500)
         if path.startswith("/dl/"):   # ★2026-08-12 #179：导出文件下载（/dl/data_export_xxx.xlsx）
             _name = path.split("/", 2)[2]
-            _fp = BASE / "output" / _name
-            if _fp.exists():
-                _ct = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"                     if _name.endswith(".xlsx") else "text/html; charset=utf-8"
+            # ★2026-10-19 安全修复：原本 `BASE/"output"/_name` 直接拼接，`../` 可逃逸到
+            #   output/ 之外（实测可读 config/params.yaml 明文 token）。改为 _safe_join 包含性校验。
+            _fp = _safe_join(BASE / "output", _name,
+                             allowed_suffixes=(".xlsx", ".html", ".csv", ".json"))
+            if _fp is not None and _fp.is_file():
+                _ct = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"                     if _fp.suffix.lower() == ".xlsx" else "text/html; charset=utf-8"
                 return self._send(200, _fp.read_bytes(), _ct)
             return self._send(404, b"file not found")
         if path == "/api/stock_check":   # ★2026-08-10 个股交叉评级（GET ?code=000650）
@@ -751,6 +1091,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
+        # ★2026-10-19 H-5 修复：启用 DECK_API_TOKEN 时，所有 POST 要求 Bearer 鉴权（含 /api/proxy 与 /api/import）
+        if self._require_auth():
+            return
         if path.startswith("/api/proxy/"):   # ★2026-08-16 反向代理 POST → :3080（删除/批量/清空/发送全走这里）
             import urllib.request as _ur
             import urllib.error as _ue
@@ -1206,15 +1549,112 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_json({"error": f"未知路由 {path}"}, 404)
 
 
+def _port_already_served(port: int, path: str = "/", timeout: float = 3.0,
+                         attempts: int = 3) -> bool:
+    """端口上是否已有另一个存活的 HTTP 实例在应答（双开自检用）。
+
+    ★关键语义（2026-10-15 实测踩坑后修正）：必须区分「拒连」与「超时」。
+      - 拒连 = 端口真的空 → 放行（这是 watchdog 故障转移的路径，不能堵）；
+      - 超时 = 端口上有活实例但正忙（deck 重端点会把 GIL 打满，探测超过 timeout 不应答）
+              → 视为被占用：重试若干次，仍不应答则拒绝启动。
+    原实现把"没拿到 200"一律当成空端口：实测被重请求占满的 deck 探测 3s 超时 →
+    误判空闲 → 第二个实例双开成功——这正是本轮线上双实例端口劫持的成因
+    （34776 活着在服务，15220 的探测超时后被放行绑上同一个端口）。
+
+    另外两点：
+      - 探测必须显式绕开系统代理（ProxyHandler({})）：有 http_proxy 时对 127.0.0.1 的
+        探测会被代理应答，把空闲端口误判成"被占用"→ 服务永远起不来。
+      - 故意不用 bind 试探：bind 试探分不清"已死实例的 TIME_WAIT 残留"和"活实例"，
+        而 allow_reuse_address 已让我们能绑上有残留的端口。
+    """
+    import urllib.error
+    import urllib.request
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for attempt in range(max(1, attempts)):
+        try:
+            with opener.open(urllib.request.Request(f"http://127.0.0.1:{port}{path}"),
+                             timeout=timeout) as r:
+                r.read(1)
+                return True         # 有东西在应答（哪怕 404）就算被占用
+        except urllib.error.HTTPError:
+            return True             # HTTP 错误码也是"有实例在应答"
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", e)
+            if isinstance(reason, ConnectionRefusedError):
+                return False        # 端口真的没有活实例 → 允许接管
+            # 超时 / 连接被重置 / 其他网络错 → 疑似有活实例但忙，重试
+        except Exception:
+            pass
+        if attempt < max(1, attempts) - 1:
+            time.sleep(1.5)
+    return True    # 始终不应答：保守视为被占用（不双开，也不给累死的服务器雪上加霜）
+
+
 def main():
     port = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else PORT
-    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    # ★2026-10-15 双开自检。Windows 上 SO_REUSEADDR（allow_reuse_address=True）允许
+    #   第二个进程绑同一端口，结果是两个 deck 同时"监听"而连接只落在一个实例上：
+    #   改代码重启后旧实例继续服务、新实例空跑。本轮实测踩中——请求全落在加固前的
+    #   旧进程上，/api/live/server_errors 持续 404，新代码形同没部署，且极难排查。
+    #   判定语义：端口有另一个存活实例在应答 HTTP → 拒绝启动并说清该杀谁；
+    #   没有 → 正常绑定（旧实例已死，端口可安全接管，这也是 watchdog 故障转移的路径）。
+    # ★2026-10-18 先抢进程级独占锁（消除启动竞态），再做端口探测（处理"锁已释放但
+    #   旧实例仍在应答"的残留情形）。两者都过才允许 bind。
+    if not _acquire_server_lock(port):
+        print(f"✗ 端口 {port} 已有另一个 deck 实例持有单实例锁，本次拒绝启动。", flush=True)
+        print("  双开会造成「新进程空跑、旧进程继续服务」：改代码不生效、请求行为随机。", flush=True)
+        print(f"  处理：结束旧进程后重试；查占用：netstat -ano | findstr :{port}", flush=True)
+        sys.exit(3)
+    if _port_already_served(port):
+        print(f"✗ 端口 {port} 已被另一个存活的 deck 实例占用，本次拒绝启动（防双开劫持）。",
+              flush=True)
+        print("  双开会造成「新进程空跑、旧进程继续服务」：改代码不生效、请求行为不一致。",
+              flush=True)
+        print(f"  处理：结束占用 {port} 的旧进程后重试；查占用：netstat -ano | findstr :{port}",
+              flush=True)
+        sys.exit(2)
+    # ★2026-10-15 用加固版服务器（见 DeckServer 注释：守护线程/异常回500/大backlog）
+    srv = DeckServer(("127.0.0.1", port), Handler)
     print(f"★ Deck/看板 服务器已启动：http://127.0.0.1:{port}/deck.html")
     print(f"  看板：http://127.0.0.1:{port}/dashboard.html  （Ctrl+C 退出）")
+    # ★2026-10-15 启动即触发后台全市场快照预热（~22s/70 页，守护线程，不阻塞服务）。
+    #   修复：原先首个 holdings 请求同步拉全市场 → 阻塞 22s 且 GIL 饿死全站（连接被拒）。
     try:
-        srv.serve_forever()
+        sys.path.insert(0, str(BASE / "deck"))
+        import live_api as _la
+        _la.live_realtime()   # 缓存未就绪 → 仅启动后台刷新并立即返回
+        print("  [预热] 实时快照后台刷新已触发（约 25s 后就绪；此前持仓现价走轻量按需报价）", flush=True)
+    except Exception as _e:
+        print(f"  [预热] 跳过（不影响服务）: {_e}", flush=True)
+
+    # ★2026-10-15 优雅退出：Ctrl+C / 任务管理器结束 / 计划任务 stop 都会走到这里。
+    #   原实现只捕 KeyboardInterrupt；SIGTERM 下 serve_forever 不返回，
+    #   且非守护线程会把进程挂住 → 端口不释放，重启即失败。
+    _stop = threading.Event()
+
+    def _graceful(signum, _frame):
+        print(f"\n收到信号 {signum}，正在优雅退出…", flush=True)
+        _stop.set()
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+
+    for _sig in ("SIGINT", "SIGTERM"):
+        try:
+            signal.signal(getattr(signal, _sig), _graceful)
+        except (ValueError, AttributeError, OSError):
+            pass   # 非主线程/平台不支持时忽略，不影响服务本身
+
+    try:
+        # poll_interval=0.5：shutdown() 最多等 0.5s 即可返回，退出不再拖沓
+        while not _stop.is_set():
+            srv.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         print("\n已退出")
+    finally:
+        try:
+            srv.server_close()
+        except Exception:
+            pass
+        print("端口已释放")
 
 
 if __name__ == "__main__":

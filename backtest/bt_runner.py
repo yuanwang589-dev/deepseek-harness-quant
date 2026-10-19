@@ -12,6 +12,7 @@
 
 性能：价格面板 + 财务/市值数据按 key 缓存，重复跑不重载（首次 ~5-15s → 后续 ~1-2s）。
 """
+import re
 import sqlite3
 import subprocess
 import sys
@@ -73,6 +74,28 @@ def list_strategies() -> dict:
 
 # ★2026-08-16 动态化铁律：策略外部注册（config/strategies.yaml extra 合并进注册表，同名覆盖）
 _EXT_LOADED = False
+
+
+class MissingDataError(RuntimeError):
+    """★2026-10-15：回测所需数据文件缺失——带定位信息与补数指引。
+
+    原缺陷链：`_q()` 用 `mode=ro&immutable=1` 打开不存在的库 → sqlite3 抛裸
+    `OperationalError("unable to open database file")` → 一路冒到
+    `/api/live/backtest_run` → 500 + 满屏 traceback。
+    关键问题：**traceback 里不会告诉你是哪个库、该跑什么命令补**，
+    每次调用还会重刷一遍 traceback 把日志冲掉真正有用的信息。
+
+    本类型让缺失库变成「可诊断的结构化结果」而不是「一次崩溃 + 一段噪音」。
+    """
+    def __init__(self, db: str, table: str = "", hint: str = ""):
+        self.db, self.table, self.hint = str(db), table, hint
+        super().__init__(f"回测所需数据缺失：{self.db} :: {table or '?'}。{hint}")
+
+
+def _require_db(db_path: str, table: str, hint: str):
+    """库文件不存在 → MissingDataError（带库路径/表名/补数指引）"""
+    if not Path(db_path).exists():
+        raise MissingDataError(db_path, table, hint)
 
 
 def _load_external_strategies():
@@ -166,8 +189,14 @@ def _get_panel(stocks, start, end):
 def _load_fin():
     global _FIN
     if _FIN is None:
+        _fdb = f"{CACHE}/finance_ts.db"
+        # ★2026-10-15：先查后连。缺库时改为带指引的 MissingDataError，
+        #   替代原先裸 OperationalError（见 MissingDataError 注释）。
+        _require_db(_fdb, "financials_ts",
+                    "补法：python data/build_unified_db.py（Tushare 三表 PIT 建库）。"
+                    "补齐前 script1 策略不可用，请改用 tech3 或 turn_low。")
         rows = _q("SELECT code, end_date, ann_date, total_revenue, n_income FROM financials_ts",
-                  f"{CACHE}/finance_ts.db")
+                  _fdb)
         fin = pd.DataFrame(rows, columns=["code", "end_date", "ann_date", "total_revenue", "n_income"])
         fin["code6"] = fin["code"].str[:6]
         fin["end"] = pd.to_datetime(fin["end_date"])
@@ -208,8 +237,8 @@ def _tech3_score(closes):
 
 def _script1_score(closes):
     """脚本1 三因子（营收增长率 + 市值 + Beta）：只算月末，返回 rank 越大越好"""
-    beta = _compute_beta(closes)
-    fin = _load_fin()
+    fin = _load_fin()        # ★2026-10-15 前置：缺库立刻失败。
+    beta = _compute_beta(closes)   # 原放在 _load_fin() 前，缺库时白算十几秒 beta 才报错
     mdf = _load_mv()
     codes6 = [c.split(".")[0] for c in closes.columns]
     score = pd.DataFrame(np.nan, index=closes.index, columns=closes.columns)
@@ -250,6 +279,20 @@ def _turn_low_score(closes):
     r = t20.rank(axis=1, pct=True)                 # 小 = 低换手
     r = r.reindex(index=closes.index, columns=codes).ffill().fillna(0.5)
     return -r                                      # 取反 → 低换手高分（score 越大越好）
+
+
+_RB_DAYS = {"D": 1, "W": 5, "M": 20, "Q": 60, "Y": 244}
+
+
+def _rebalance_days(rb) -> int:
+    """调仓周期 → 间隔交易日数。
+
+    ★2026-10-15 新增：成本折算的地基。原实现把「60 次全换仓/年」写死在分母里，
+    与 meta['rebalance'] 和回测窗口长度双双脱钩（详见 run_backtest 内成本注释）。
+    """
+    if isinstance(rb, int):
+        return max(int(rb), 1)
+    return _RB_DAYS.get(str(rb).upper(), 20)
 
 
 def _monthly_backtest(closes, opens, highs, score, topn):
@@ -322,10 +365,17 @@ def _period_backtest(closes, opens, highs, score, topn, rebalance="M"):
 def run_backtest(strategy="tech3", topn=5, stocks=300, start="2021-01-01", end="2025-12-31"):
     """运行回测 → {metrics, dates, nav, bench_nav, params, elapsed_s}。
     ★每次运行自动存档：历史 JSON（时间戳）+ 当前最新（latest_{key}，同参数覆盖）。
-    ★2026-08-16：按 STRATEGIES 注册表分发（tech3/script1/turn_low 即时；factor_all 批处理）。"""
+    ★2026-08-16：按 STRATEGIES 注册表分发（tech3/script1/turn_low 即时；factor_all 批处理）。
+    ★2026-10-19 安全修复：strategy 来自 HTTP 查询参数且会拼进存档文件名，
+       原 `STRATEGIES.get(strategy) or STRATEGIES["tech3"]` 对未知值回落而非拒绝，
+       `../../../../evil` 可把 JSON/HTML 写到 output/backtest_archive/ 之外（路径穿越任意写）。
+       改为：入口白名单拒绝未知策略 + 文件名消毒。"""
     from backtest.bt_report import archive, compute_metrics, save_latest
     _load_external_strategies()   # ★动态化：合并外部策略注册（config/strategies.yaml）
-    meta = STRATEGIES.get(strategy) or STRATEGIES["tech3"]
+    # 白名单：strategy 必须命中注册表，否则拒绝（不再静默回落到 tech3）
+    if strategy not in STRATEGIES:
+        raise ValueError(f"unknown strategy: {strategy!r}（可选：{sorted(STRATEGIES)}）")
+    meta = STRATEGIES[strategy]
 
     # ── factor_all：批处理（调用 backtest_all_factors.main，结果已归档到 output/backtest_archive/）──
     if strategy == "factor_all":
@@ -335,6 +385,7 @@ def run_backtest(strategy="tech3", topn=5, stocks=300, start="2021-01-01", end="
             subprocess.run([py, str(BASE / "backtest" / "backtest_all_factors.py")],
                            cwd=str(BASE), timeout=600)
             return {
+                "ok": True,
                 "metrics": {"annual_return": None, "sharpe": None, "max_drawdown": None, "n_days": 0},
                 "params": {"strategy": strategy, "topn": topn, "stocks": stocks, "start": start, "end": end},
                 "elapsed_s": round(time.time() - t0, 2),
@@ -348,22 +399,40 @@ def run_backtest(strategy="tech3", topn=5, stocks=300, start="2021-01-01", end="
     panel = _get_panel(stocks, start, end)
     closes, opens, highs = panel["close"], panel["open"], panel["high"]
     # ★动态化：外部策略评分分发（factor_list 声明式组合 / scorer 内置函数 / 内置策略）
-    if meta.get("factor_list"):
-        score = _compose_score(closes, meta["factor_list"])
-    elif meta.get("scorer") == "script1":
-        score = _script1_score(closes)
-    elif meta.get("scorer") == "turn_low" or (meta.get("external") and meta.get("factors") == ["turn_20d"]):
-        score = _turn_low_score(closes)
-    elif strategy == "script1":
-        score = _script1_score(closes)
-    elif strategy == "turn_low":
-        score = _turn_low_score(closes)
-    else:
-        score = _tech3_score(closes)
+    try:
+        if meta.get("factor_list"):
+            score = _compose_score(closes, meta["factor_list"])
+        elif meta.get("scorer") == "script1":
+            score = _script1_score(closes)
+        elif meta.get("scorer") == "turn_low" or (meta.get("external") and meta.get("factors") == ["turn_20d"]):
+            score = _turn_low_score(closes)
+        elif strategy == "script1":
+            score = _script1_score(closes)
+        elif strategy == "turn_low":
+            score = _turn_low_score(closes)
+        else:
+            score = _tech3_score(closes)
+    except MissingDataError as _mde:
+        # ★2026-10-15：数据缺失 → 结构化返回（ok:False + missing_db + hint），
+        #   前端可直接把补数指引显示给用户；不再抛异常、不再满屏 traceback 冲掉日志。
+        return {"ok": False, "error": str(_mde), "missing_db": _mde.db,
+                "missing_table": _mde.table, "hint": _mde.hint,
+                "params": {"strategy": strategy, "topn": topn, "stocks": stocks,
+                           "start": start, "end": end}}
     ret = _period_backtest(closes, opens, highs, score, topn, rebalance=meta.get("rebalance", "M"))
     ret = ret.loc[ret.index.astype(str) >= start]
-    cost = 0.00026 + 0.0005 + 0.001   # 佣金+印花税+滑点，每月全换仓摊到日
-    ret = ret - cost * 2 * 60 / max(len(ret), 1)
+    # ★2026-10-15 成本折算修正
+    #   正确关系：一次「全换仓」摩擦 = 2×cost（卖旧+买新各一次）；
+    #             回测窗口内全换仓次数 = len(ret)/调仓间隔(交易日)；
+    #             → 日均拖累 = 2×cost/调仓间隔。
+    #   原式 `cost * 2 * 60 / max(len(ret),1)` 把「60 次/年」写死，两处脱钩：
+    #     ① 与回测窗口长度脱钩——只有恰好 5 年窗口才对，短窗口分母偏小→成本被高估；
+    #     ② 与策略调仓频率脱钩——本条在 run_backtest 内对所有策略一刀切：
+    #        turn_low（40 交易日调仓）真实拖累应为 2×cost/40，
+    #        factor_all（季度）应为 2×cost/60，原式都按 60 次/年算 → 系统性高估 2~3 倍成本。
+    cost = 0.00026 + 0.0005 + 0.001   # 佣金万2.6 + 印花税万5 + 滑点千1
+    _rb_days = _rebalance_days(meta.get("rebalance", "M"))
+    ret = ret - 2.0 * cost / _rb_days
     bench = closes.pct_change().fillna(0).mean(axis=1).loc[ret.index]
     nav = (1 + ret).cumprod()
     bench_nav = (1 + bench).cumprod()
@@ -374,19 +443,29 @@ def run_backtest(strategy="tech3", topn=5, stocks=300, start="2021-01-01", end="
 
     # 归档（每次运行都存档；latest 覆盖旧值，历史时间戳保留）
     n_stocks = int(closes.shape[1])
-    key = f"{strategy}_t{topn}_s{n_stocks}_{start}_{end}".replace("-", "")
+    # ★2026-10-19 安全修复：key/slug 会成为 output/backtest_archive/ 下的文件名。
+    #   原实现仅 `.replace("-","")`（只删连字符，斜杠原样保留）→ 路径穿越任意文件写。
+    #   现在做白名单消毒：只保留字母数字下划线连字符点，任何分隔符都会被剔除。
+    _san = lambda s: re.sub(r"[^A-Za-z0-9_.-]", "_", str(s))
+    key = f"{_san(strategy)}_t{topn}_s{n_stocks}_{_san(start)}_{_san(end)}"
     title = f"{meta['name']}Top{topn}"
     category = meta["category"]
     verdict = "有效" if metrics["annual_return"] >= 0 else "无效"
     pfull = {"name": title, "strategy": strategy, "topn": topn, "stocks": n_stocks,
              "start": start, "end": end}
-    slug = f"{strategy}_t{topn}_s{n_stocks}"
+    slug = f"{_san(strategy)}_t{topn}_s{n_stocks}"
     archive(ret, params=pfull, benchmark=bench, name=slug, category=category,
             factors=meta.get("factors", []), verdict=verdict, save_html=False)   # 历史（JSON，轻量）
     save_latest(key, ret, params=pfull, benchmark=bench, category=category,
                 factors=meta.get("factors", []), verdict=verdict)                 # 当前最新（覆盖）
 
     return {
+        # ★2026-10-15：成功路径必须显式声明 ok:True。
+        #   此前成功返回没有 ok 字段，而失败路径有 ok:False —— 调用方
+        #   `if r.get("ok")` 对「成功」与「结构异常」无法区分（两者都取不到真值），
+        #   导致 script1 跑通后 test_backtest_script1_runs 仍判失败、
+        #   test_script1_returns_structured_failure 的 skip 守卫也不生效。
+        "ok": True,
         "metrics": metrics,
         "bench_metrics": {"annual_return": bench_metrics["annual_return"],
                           "sharpe": bench_metrics["sharpe"],

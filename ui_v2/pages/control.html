@@ -327,7 +327,7 @@
   function targetQuery() {
     if (!curTarget) return null;
     return curTarget.kind === 'niu'
-      ? '/api/proxy/niuapi/recent?persona=' + encodeURIComponent(curTarget.persona) + '&limit=30'
+      ? '/api/proxy/quantapi/niu/recent?persona=' + encodeURIComponent(curTarget.persona) + '&limit=30'
       : '/api/proxy/quantapi/recent?sessionId=' + encodeURIComponent(curTarget.id) + '&limit=30';
   }
   function loadRecent() {
@@ -576,7 +576,7 @@
   function loadSessions() {
     return Promise.all([
       hzGet('/api/proxy/quantapi/sessions', 20000).then(function (d) { rootsCache = d.sessions || []; }),
-      hzGet('/api/proxy/niuapi/sessions', 15000).then(function (d) { niuCache = d.personas || []; })
+      hzGet('/api/proxy/quantapi/niu/sessions', 15000).then(function (d) { niuCache = d.personas || []; })
     ]).then(function () {
       if (!curTarget) {
         var rel = relatedRoots();
@@ -612,7 +612,7 @@
     renderMsgs([]);
     document.getElementById('hz-chat-status').textContent = '发送中…';
     var p = curTarget.kind === 'niu'
-      ? hzPost('/api/proxy/niuapi/chat', { persona: curTarget.persona, text: text, snapshot: snapshotCache })
+      ? hzPost('/api/proxy/quantapi/niu/chat', { persona: curTarget.persona, text: text, snapshot: snapshotCache })
       : hzPost('/api/proxy/quantapi/chat2', { text: text, sessionId: curTarget.id });
     p.then(function (res) {
       if (res.ok && res.accepted) {

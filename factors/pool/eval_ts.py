@@ -66,7 +66,8 @@ def _spearman_ic(factor: pd.Series, fwd: pd.Series) -> dict:
     import scipy.stats as st
     df = pd.concat([factor, fwd], axis=1, keys=["f", "r"]).dropna()
     if len(df) < 12:
-        return {"ic_mean": np.nan, "icir": np.nan, "ic_pos_ratio": np.nan, "t_stat": np.nan, "n": 0}
+        return {"ic_mean": np.nan, "icir": np.nan, "ic_pos_ratio": np.nan,
+                "t_stat": np.nan, "n": 0, "ic_series": {}}
     win = 12
     vals, idxs = [], []
     x, y = df["f"].values, df["r"].values
@@ -76,12 +77,16 @@ def _spearman_ic(factor: pd.Series, fwd: pd.Series) -> dict:
         idxs.append(df.index[i])
     ic_series = pd.Series(vals, index=idxs).dropna()
     if len(ic_series) < 6:
-        return {"ic_mean": np.nan, "icir": np.nan, "ic_pos_ratio": np.nan, "t_stat": np.nan, "n": len(ic_series)}
+        return {"ic_mean": np.nan, "icir": np.nan, "ic_pos_ratio": np.nan,
+                "t_stat": np.nan, "n": len(ic_series),
+                "ic_series": {str(k): float(v) for k, v in ic_series.items()}}
     m = ic_series.mean()
     sd = ic_series.std(ddof=1)
     t = m / (sd / np.sqrt(len(ic_series))) if sd > 0 else 0.0
     return {"ic_mean": float(m), "icir": float(m / sd) if sd > 0 else 0.0,
-            "ic_pos_ratio": float((ic_series > 0).mean()), "t_stat": float(t), "n": int(len(ic_series))}
+            "ic_pos_ratio": float((ic_series > 0).mean()), "t_stat": float(t), "n": int(len(ic_series)),
+            # ★2026-10-18 补"有池无序列"：逐窗口序列随结果返回（原来算完就扔，只交汇总）
+            "ic_series": {str(k): float(v) for k, v in ic_series.items()}}
 
 
 def _group_gap(factor: pd.Series, fwd1: pd.Series) -> dict:
@@ -153,6 +158,7 @@ def evaluate_time_series(name: str, factor: pd.Series, mkt_ret: pd.Series,
 
     ic1 = ic_results.get("h1", {})
     ic3 = ic_results.get("h3", {})
+    ic6 = ic_results.get("h6", {})
     # ---- 评分（0-100）----
     def sig_score(t, ic):
         if np.isnan(t) or np.isnan(ic):
@@ -189,6 +195,11 @@ def evaluate_time_series(name: str, factor: pd.Series, mkt_ret: pd.Series,
         "t_h1": round(ic1.get("t_stat", np.nan), 2) if not np.isnan(ic1.get("t_stat", np.nan)) else None,
         "ic_h3": round(ic3.get("ic_mean", np.nan), 3) if not np.isnan(ic3.get("ic_mean", np.nan)) else None,
         "t_h3": round(ic3.get("t_stat", np.nan), 2) if not np.isnan(ic3.get("t_stat", np.nan)) else None,
+        "icir_h3": round(ic3.get("icir", np.nan), 2) if not np.isnan(ic3.get("icir", np.nan)) else None,
+        "ic_h6": round(ic6.get("ic_mean", np.nan), 3) if not np.isnan(ic6.get("ic_mean", np.nan)) else None,
+        "icir_h6": round(ic6.get("icir", np.nan), 2) if not np.isnan(ic6.get("icir", np.nan)) else None,
+        # ★2026-10-18：h1 逐窗口 IC 序列（YYYY-MM → IC），供 ic_store 落库 / monitor 衰减巡检
+        "ic_series_h1": ic1.get("ic_series") or {},
         "gap_hl": round(gap.get("gap", np.nan), 3) if not np.isnan(gap.get("gap", np.nan)) else None,
         "gap_high": round(gap.get("high", np.nan), 3) if not np.isnan(gap.get("high", np.nan)) else None,
         "gap_low": round(gap.get("low", np.nan), 3) if not np.isnan(gap.get("low", np.nan)) else None,
@@ -208,6 +219,20 @@ def main():
     series = get_factor(args.factor)
     mkt = market_monthly_returns()
     res = evaluate_time_series(args.factor, series, mkt)
+    # ★2026-10-18 补"有池无序列"：逐窗口 IC 序列落库 + 因子表指标回填（ic_store）
+    try:
+        from factors.pool.ic_store import connect as _ic_connect, save_series as _ic_save
+        _con = _ic_connect()
+        _s = pd.Series(res.get("ic_series_h1") or {})
+        if not _s.empty:
+            _n = _ic_save(_con, args.factor, _s, source="eval_ts")
+            print(f"[ic_store] {args.factor}: 落库 {_n} 期 IC 序列", file=sys.stderr)
+        else:
+            print(f"[ic_store] {args.factor}: 无 IC 序列可落（评估未产出）", file=sys.stderr)
+        _con.close()
+    except Exception as e:
+        print(f"[ic_store] 落库失败（不影响评估结果输出）：{type(e).__name__}: {e}",
+              file=sys.stderr)
     import json
     print(json.dumps(res, ensure_ascii=False, indent=2, default=str))
 

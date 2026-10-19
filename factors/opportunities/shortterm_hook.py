@@ -23,7 +23,13 @@ BASE = Path(__file__).resolve().parent.parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
-EXT_POOL_DIR = Path(r"data/factorpool/output/daily_scores")
+try:
+    from data.cache import db_uri   # ★2026-10-15 P1-A：SQLite 只读 URI 单出口
+except Exception:
+    db_uri = None
+
+# ★2026-10-15 P1-A：改绝对路径（原相对路径依赖 cwd，换目录运行即静默 glob 落空）
+EXT_POOL_DIR = BASE / "data" / "factorpool" / "output" / "daily_scores"
 
 _cache = {"ts": 0.0, "data": None}
 
@@ -159,8 +165,9 @@ def one_word_disclosure(entries: list) -> int:
         import sqlite3
         import glob as _glob
         from pathlib import Path as _P
-        _db_paths = ["data/cache/bars.db"] + [
-            str(p) for p in sorted(_P("data/cache").glob("bars_incr_*.db"))[-3:]]
+        # ★2026-10-15 修复：绝对路径（as_uri() 不接受相对路径，原写法静默失败）
+        _db_paths = [str(BASE / "data" / "cache" / "bars.db")] + [
+            str(p) for p in sorted((BASE / "data" / "cache").glob("bars_incr_*.db"))[-3:]]
         n = 0
         for e in entries:
             code, d = e.get("code"), e.get("add_date") or e.get("entry_date")
@@ -169,8 +176,8 @@ def one_word_disclosure(entries: list) -> int:
             row = None
             for _p in _db_paths:
                 try:
-                    con = sqlite3.connect(_P(_p).as_uri() + "?mode=ro&immutable=1",
-                                          uri=True, timeout=3)
+                    _uri = (db_uri(_p) if db_uri else _P(_p).resolve().as_uri() + "?mode=ro&immutable=1")
+                    con = sqlite3.connect(_uri, uri=True, timeout=3)
                     row = con.execute(
                         "SELECT open, high, low, close FROM daily_bar WHERE code=? AND date=?",
                         (code, d)).fetchone()

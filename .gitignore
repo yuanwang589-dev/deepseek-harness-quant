@@ -4,9 +4,11 @@ venv/
 __pycache__/
 *.pyc
 *.pyo
+.ruff_cache/
 
 # ---- 本地配置（含真实密钥，勿提交） ----
 config/params.yaml
+config/wecom.yaml
 harness/home/.credentials.yaml
 
 # ---- HARNESS 运行时与用户数据 ----
@@ -56,3 +58,21 @@ harness/home/profiles/node_modules/
 # ---- 内部维护文档（含本机路径，不进公开仓库） ----
 docs/上传GitHub.md
 docs/发布清单_v1.0.9.md
+
+# ---- 2026-10-19 补齐（工程化审计 P1-5：防止一次 git add . 误提交垃圾/对话记录） ----
+# AI 工具元数据目录
+.workbuddy-ai/
+.workbuddy/
+# 临时/备份/损坏产物
+*.bak
+*.broken.*/
+*.orig
+*.rej
+# 探测脚本（一次性排查用，不入库）
+scripts/_probe_*.py
+# 评审过程临时文件
+_prior_review.txt
+# HARNESS 会话记录（可能含对话内容与内部数据）
+harness/home/quantapi_*.json
+# 审批待办队列（本机工作流状态，含时间戳 churn）
+待办队列.md

@@ -33,17 +33,29 @@ sys.path.insert(0, str(BASE))
 import numpy as np
 import pandas as pd
 
-BARS_DB = Path(r"D:/劳威派量化数据/cache/bars.db")
-FIN_DB = Path(r"D:/劳威派量化数据/cache/finance.db")
-BASIC_DB = Path(r"D:/劳威派量化数据/cache/stock_basic.db")
-MV_CSV = Path(r"D:/劳威派量化数据/cache/circ_mv_map_full.csv")
+# ★2026-10-15 P1-A 修复：原硬编码 D:/劳威派量化数据/ 旧机器路径——部署机不存在 →
+#   "unable to open database file" → 三层池静默失败（旧 worker 丢弃返回值假成功 ✓）。
+#   收敛到 data.cache CACHE_DIR 单出口；只读 URI 一律走 db_uri（中文路径需 percent-encode，
+#   裸 f"file:{path}" 拼法非法）。
+try:
+    from data.cache import CACHE_DIR
+    BARS_DB = CACHE_DIR / "bars.db"
+    FIN_DB = CACHE_DIR / "finance.db"
+    BASIC_DB = CACHE_DIR / "stock_basic.db"
+    MV_CSV = CACHE_DIR / "circ_mv_map_full.csv"
+except Exception:
+    BARS_DB = Path(r"D:/劳威派量化数据/cache/bars.db")
+    FIN_DB = Path(r"D:/劳威派量化数据/cache/finance.db")
+    BASIC_DB = Path(r"D:/劳威派量化数据/cache/stock_basic.db")
+    MV_CSV = Path(r"D:/劳威派量化数据/cache/circ_mv_map_full.csv")
 
 
 def load_close_panel(days=300, end=None) -> pd.DataFrame:
     """近 N 个交易日全市场 close+volume 面板（date × code，qfq）
     ★2026-08-07 扩展：days 默认 130→300（决策池技术确认需要 MA200/52 周高点）；
     返回 (close_df, volume_df) 双面板"""
-    con = sqlite3.connect(f"file:{BARS_DB}?mode=ro&immutable=1", uri=True, timeout=3)
+    from data.cache import db_uri
+    con = sqlite3.connect(db_uri(BARS_DB), uri=True, timeout=3)
     # ★#143 双库合并：主库写保护后增量库含最新日（08-12 起排行不虚标旧日）
     if end:
         last = con.execute(
@@ -56,7 +68,7 @@ def load_close_panel(days=300, end=None) -> pd.DataFrame:
             from pathlib import Path as _P
             for _p in sorted(_P(BARS_DB).parent.glob("bars_incr_*.db"))[-3:]:
                 try:
-                    _c = sqlite3.connect(f"file:{_p}?mode=ro&immutable=1", uri=True, timeout=3)
+                    _c = sqlite3.connect(db_uri(_p), uri=True, timeout=3)
                     _m = _c.execute(
                         "SELECT MAX(date) FROM daily_bar WHERE adjust='qfq'").fetchone()[0]
                     _c.close()
@@ -74,7 +86,7 @@ def load_close_panel(days=300, end=None) -> pd.DataFrame:
         from pathlib import Path as _P
         for _p in sorted(_P(BARS_DB).parent.glob("bars_incr_*.db"))[-3:]:
             try:
-                _c = sqlite3.connect(f"file:{_p}?mode=ro&immutable=1", uri=True, timeout=3)
+                _c = sqlite3.connect(db_uri(_p), uri=True, timeout=3)
                 _df2 = pd.read_sql(
                     "SELECT date, code, close, volume, high, low FROM daily_bar "
                     "WHERE adjust='qfq' AND date<=? AND close>0", _c, params=(last,))

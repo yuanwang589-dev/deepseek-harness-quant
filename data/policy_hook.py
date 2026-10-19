@@ -22,6 +22,7 @@ if str(BASE) not in sys.path:
 
 OUT = BASE / "output" / "policy_score_latest.json"
 _cache = {"ts": 0.0, "data": None}
+_fail = {"ts": 0.0}          # ★2026-10-18 失败也缓存，避免每次调用都去打开缺失的库
 _TTL = 12 * 3600  # 12h（月度数据，防高频重算 macro.db）
 
 
@@ -37,7 +38,8 @@ def _compute():
         return {"month": r["month"], "score": round(float(r["score"]), 3),
                 "bucket": r["bucket"], "ts": datetime.now().strftime("%Y-%m-%d %H:%M")}
     except Exception as e:
-        print(f"  [policy_hook] 计算失败: {str(e)[:60]}")
+        # ★2026-10-18：原截断 60 字符会把"缺哪个库"这个关键信息切掉，改成保留完整原因
+        print(f"  [policy_hook] 政策面不可算 → 择时退化为中性 50 | {type(e).__name__}: {str(e)[:160]}")
         return None
 
 
@@ -46,6 +48,8 @@ def load() -> dict:
     now = time.time()
     if _cache["data"] is not None and now - _cache["ts"] < _TTL:
         return _cache["data"]
+    if _fail["ts"] and now - _fail["ts"] < _TTL:
+        return {}          # 12h 内已知不可算，直接返回空（不重复开库、不刷屏）
     if OUT.exists() and now - OUT.stat().st_mtime < _TTL:
         try:
             d = json.loads(OUT.read_text(encoding="utf-8"))
@@ -60,6 +64,10 @@ def load() -> dict:
         except Exception:
             pass
         _cache.update({"ts": now, "data": d})
+        _fail["ts"] = 0.0
+    else:
+        # 失败同样进缓存窗口：12h 内不再重试（缺库是结构性缺失，重试无意义且刷屏）
+        _fail["ts"] = now
     return d or {}
 
 

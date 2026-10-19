@@ -117,6 +117,12 @@
         <div id="rt-box" class="mini" style="line-height:2"> 加载中…</div>
       </div>
 
+      <!-- 我的持仓（模拟仓实时全景） -->
+      <div class="v2-card anim-fade-in-up d1" id="portal-holdings-box">
+        <h2> 我的持仓 <span class="tag">模拟仓 · 实时</span></h2>
+        <div id="portal-holdings-body" class="mini" style="line-height:2"> 加载中…</div>
+      </div>
+
       <!-- ★2026-08-14 跨资产轮动防守卡（A股弱市时显示：建议加配黄金/债券/现金） -->
       <div class="v2-card anim-fade-in-up d1" id="global-rot-box" style="display:none"></div>
     </div>
@@ -288,6 +294,11 @@
           dualLine(ma6, ma12) +
           '<div class="tl-legend"><span class="l6"><i></i>MA6 快线</span><span class="l12"><i></i>MA12 慢线</span></div>' +
         '</div>';
+    } else if (tlBox) {
+      // ★2026-10-15 P2 空数据兜底：无 traffic_light 数据时显式提示（原实现停留"加载中"假象）
+      tlBox.innerHTML =
+        '<h2> 择时趋势 <span class="tag">均线金叉6/12 · 趋势强度</span></h2>' +
+        '<div class="mini" style="opacity:.7;padding:18px 0">暂无数据 — 择时趋势尚未生成，运行「每日全链更新」后自动点亮（每日 18:35）</div>';
     }
 
 
@@ -507,6 +518,52 @@
       if (box) box.innerHTML = '<span style="color:var(--gold)">实时行情加载失败</span><span style="opacity:.7"> ' + e + '</span>';
     });
   }
+
+  // ★2026-10-15 门户首页持仓全景（模拟仓实时持仓，复用 /api/live/holdings）
+  function stopPlanTxtPortal(sp) {
+    if (!sp || typeof sp !== 'object') return R._f(sp || '—');
+    var parts = [];
+    if (sp.stop_loss_pct != null) parts.push('硬止损 ' + (sp.stop_loss_pct * 100).toFixed(0) + '%');
+    if (sp.time_stop_weeks != null) parts.push('时间 ' + sp.time_stop_weeks + ' 周');
+    if (sp.max_drawdown_pct != null) parts.push('回撤 ' + (sp.max_drawdown_pct * 100).toFixed(0) + '%');
+    if (sp.trailing_ma != null) parts.push('MA' + sp.trailing_ma);
+    return parts.length ? parts.join(' · ') : '—';
+  }
+  function loadHoldings() {
+    var box = document.getElementById('portal-holdings-body');
+    if (!box) return;
+    LW.api.get('/api/live/holdings').then(function (d) {
+      var pf = (d && d.portfolio) || {};
+      var positions = pf._held && pf._held.length ? pf._held
+                    : (pf.positions || []).filter(function (p) { return p.status === 'holding'; });
+      if (!positions.length) {
+        box.innerHTML = '<span style="opacity:.6">当前空仓（无模拟持仓）</span>';
+        return;
+      }
+      var rows = positions.map(function (p) {
+        var ret = p.ret != null ? p.ret : null;
+        var retCls = ret == null ? '#a1a1aa' : (ret >= 0 ? '#eb5757' : '#27ae60');
+        var retTxt = ret == null ? '—' : (ret >= 0 ? '+' : '') + (ret * 100).toFixed(1) + '%';
+        var tp = (p.take_profit && p.take_profit.target_pct != null) ? '+' + (p.take_profit.target_pct * 100).toFixed(0) + '%' : '—';
+        return '<div style="display:flex;justify-content:space-between;align-items:center;'
+             + 'padding:8px 10px;background:#16161a;border-radius:8px;margin-bottom:6px">'
+             + '<div><b>' + R._f(p.name || p.code) + '</b> <span style="opacity:.6;font-size:11px">'
+             + R._f(p.code) + '</span> <span style="font-size:11px;color:#a1a1aa">'
+             + R._f((R.otypeCN && R.otypeCN[p.otype]) || p.otype) + '</span></div>'
+             + '<div style="text-align:right">'
+             + '<div><span style="font-weight:700;color:' + retCls + ';font-variant-numeric:tabular-nums">' + retTxt + '</span></div>'
+             + '<div style="font-size:11px;opacity:.7">止盈 ' + tp + ' · 止损 ' + stopPlanTxtPortal(p.stop_plan || p.stop) + '</div>'
+             + '</div></div>';
+      }).join('');
+      box.innerHTML = '<div style="font-size:11px;opacity:.6;margin-bottom:6px">持仓 ' + positions.length
+                    + ' / ' + (pf.max_positions || 5) + ' · 红涨绿跌</div>' + rows;
+    }).catch(function (e) {
+      box.innerHTML = '<span style="color:var(--gold)">持仓加载失败</span><span style="opacity:.7"> ' + e + '</span>';
+    });
+  }
+  loadHoldings();
+  setInterval(loadHoldings, 60000);
+
   loadRealtime();
   setInterval(loadRealtime, 60000);
 

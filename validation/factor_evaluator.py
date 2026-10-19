@@ -308,6 +308,20 @@ def evaluate_all(limit=None, factor_names=None, mv_map=None):
             print(f"  IC {ic_res['rank_ic_mean']:.4f} ICIR {ic_res['icir']:.3f} "
                   f"胜率 {ic_res['ic_win_rate']:.1%} 单调 {layer.get('monotonicity')} "
                   f"多空t {layer.get('ls_t')} 换手 {turnover:.3f}")
+    # ★2026-10-18 补"有池无序列"：月末快照落 factor_ic_series（横截面通道，
+    # 见 factors/pool/ic_store.py）。落库失败不影响评估报告——数据归数据，报告归报告。
+    try:
+        from factors.pool.ic_store import connect as _ic_connect, save_snapshot as _ic_snap
+        _con = _ic_connect()
+        _ym = datetime.now().strftime("%Y-%m")
+        for _name, _r in results.items():
+            _ic = _r.get("ic") or {}
+            if _ic.get("rank_ic_mean") is not None:
+                _ic_snap(_con, _name, _ym, _ic["rank_ic_mean"], _ic.get("icir"),
+                         source="cross_sectional")
+        _con.close()
+    except Exception as _e:
+        print(f"[ic_store] 快照落库失败（不影响报告）：{type(_e).__name__}: {_e}")
     write_eval_report(results)
     return results
 

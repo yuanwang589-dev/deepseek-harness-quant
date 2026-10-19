@@ -41,8 +41,9 @@ import numpy as np
 import pandas as pd
 
 from factors.opportunities.backtest_winrate import _add_months, _holding_stats
+from data.io_utils import read_json, read_text
 
-BARS_DB = r"data\cache\bars.db"
+BARS_DB = str(BASE / "data" / "cache" / "bars.db")   # ★2026-10-15 P1-A 绝对路径（原相对依赖 cwd）
 LOGS = BASE / "logs"
 OUT_FILE = LOGS / f"pitch_v2_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"   # ★动态时间戳文件名（安全层同名二次写被锁，2026-08-09 改）；读取方用 glob 取最新
 
@@ -311,7 +312,7 @@ def build(pool_path: Path = None) -> tuple:
         _bc = sorted(_gl.glob(r"data/factorpool/output/pitch_priority_badges_*.json"),
                      key=_os.path.getmtime)
         if _bc:
-            _bd = json.loads(open(_bc[-1], encoding="utf-8").read())
+            _bd = read_json(_bc[-1])
             _badge_map = {b.get("otype"): b for b in (_bd.get("badges") or [])}
     except Exception:
         pass

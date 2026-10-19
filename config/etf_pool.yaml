@@ -1,0 +1,49 @@
+# ETF 候选池（★动态化铁律：增删 ETF = 改本文件，不改代码）
+# 加载：etf/etf_map.py 读取（存在则替代内置默认池；缺省内置兜底不崩溃）
+# 字段：code（6 位代码）/ name / category（宽基|风格|行业|跨境|商品|债券）
+pool:
+  - { code: "510300", name: "沪深300ETF", category: "宽基" }
+  - { code: "510500", name: "中证500ETF", category: "宽基" }
+  - { code: "512100", name: "中证1000ETF", category: "宽基" }
+  - { code: "510050", name: "上证50ETF", category: "宽基" }
+  - { code: "159915", name: "创业板ETF", category: "宽基" }
+  - { code: "588000", name: "科创50ETF", category: "宽基" }
+  - { code: "510180", name: "上证180ETF", category: "宽基" }
+  - { code: "159901", name: "深100ETF", category: "宽基" }
+  - { code: "510880", name: "红利ETF", category: "风格" }
+  - { code: "512890", name: "红利低波ETF", category: "风格" }
+  - { code: "159905", name: "深红利ETF", category: "风格" }
+  - { code: "515080", name: "中证红利ETF", category: "风格" }
+  - { code: "510330", name: "华夏300ETF", category: "宽基" }
+  - { code: "159949", name: "创业板50ETF", category: "宽基" }
+  - { code: "512330", name: "信息ETF", category: "行业" }
+  - { code: "512480", name: "半导体ETF", category: "行业" }
+  - { code: "515030", name: "新能源车ETF", category: "行业" }
+  - { code: "512690", name: "酒ETF", category: "行业" }
+  - { code: "159928", name: "消费ETF", category: "行业" }
+  - { code: "512010", name: "医药ETF", category: "行业" }
+  - { code: "512170", name: "医疗ETF", category: "行业" }
+  - { code: "512800", name: "银行ETF", category: "行业" }
+  - { code: "512200", name: "房地产ETF", category: "行业" }
+  - { code: "515220", name: "煤炭ETF", category: "行业" }
+  - { code: "512660", name: "军工ETF", category: "行业" }
+  - { code: "512720", name: "计算机ETF", category: "行业" }
+  - { code: "512880", name: "证券ETF", category: "行业" }
+  - { code: "515790", name: "光伏ETF", category: "行业" }
+  - { code: "512760", name: "芯片ETF", category: "行业" }
+  - { code: "159995", name: "芯片ETF华夏", category: "行业" }
+  - { code: "515000", name: "科技ETF", category: "行业" }
+  - { code: "516160", name: "新能源ETF", category: "行业" }
+  - { code: "512000", name: "券商ETF", category: "行业" }
+  - { code: "515880", name: "通信ETF", category: "行业" }
+  - { code: "513100", name: "纳指ETF", category: "跨境" }
+  - { code: "513500", name: "标普500ETF", category: "跨境" }
+  - { code: "513050", name: "中概互联ETF", category: "跨境" }
+  - { code: "159941", name: "纳指100ETF", category: "跨境" }
+  - { code: "513180", name: "恒生科技ETF", category: "跨境" }
+  - { code: "518880", name: "黄金ETF", category: "商品" }
+  - { code: "518800", name: "黄金ETF华夏", category: "商品" }
+  - { code: "511010", name: "国债ETF", category: "债券" }
+  - { code: "511260", name: "十年国债ETF", category: "债券" }
+  - { code: "511380", name: "可转债ETF", category: "债券" }
+  - { code: "510230", name: "金融ETF", category: "行业" }

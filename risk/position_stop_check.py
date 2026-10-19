@@ -119,9 +119,17 @@ def check_position(pos: dict, ref_date: str) -> dict:
 
     signals = []
     plan = {}
+    atr_value = None
     if otype:
         from risk.type_stop_rules import type_stop_plan
         plan = type_stop_plan(otype, score or 70)
+    # ★portfolio 配合项：持仓显式带 stop_plan 则覆盖类型默认（用户保值偏好/审批写入）
+    if isinstance(pos.get("stop_plan"), dict):
+        for _k in ("stop_loss_pct", "time_stop_weeks", "time_stop_min_gain",
+                   "max_drawdown_pct", "trailing_ma", "pivot_check_pct",
+                   "atr_stop_mult", "logic_fail_rules"):
+            if _k in pos["stop_plan"] and pos["stop_plan"][_k] is not None:
+                plan[_k] = pos["stop_plan"][_k]
 
     # 未知类型兜底（持仓无 otype 且反查不到）
     if not otype:
@@ -180,6 +188,28 @@ def check_position(pos: dict, ref_date: str) -> dict:
                 signals.append({"rule": "移动止损", "level": "SELL", "priority": 4,
                                 "detail": f"收盘 {cur_price:.2f} < MA{tma} {ma:.2f}（入场后）",
                                 "action": "卖出"})
+    # ④b ATR 宽止损（reversal 类型：ATR 3× 替代固定% —— 研究员 M2 矩阵）
+    #   ★2026-10-18 接线：atr_stop_mult 此前只在 type_stop_rules 定义、从未被读取，
+    #     导致反转类持仓实际无止损（test_gaps.test_atr_stop_implemented 长期红）。
+    atr_mult = plan.get("atr_stop_mult")
+    if atr_mult and entry_price:
+        atr_value = _atr(bars)
+        if np.isfinite(atr_value) and atr_value > 0:
+            atr_line = entry_price - atr_mult * atr_value
+            if cur_price <= atr_line:
+                signals.append({"rule": "ATR止损", "level": "SELL", "priority": 2,
+                                "detail": f"收盘 {cur_price:.2f} ≤ 入场 {entry_price:.2f} - "
+                                          f"{atr_mult:g}×ATR({atr_value:.2f}) = {atr_line:.2f}",
+                                "action": "卖出（宽止损防猎杀）"})
+            elif cur_price <= entry_price - atr_mult * 0.6 * atr_value:
+                signals.append({"rule": "ATR警戒", "level": "WATCH", "priority": 2,
+                                "detail": f"距 ATR 止损线 {(cur_price / atr_line - 1) * 100:+.1f}%"
+                                          f"（收盘跌破 {atr_line:.2f} 即卖）",
+                                "action": "观察，收盘跌破即卖"})
+        else:
+            signals.append({"rule": "ATR不可算", "level": "WARN",
+                            "detail": f"{code} 有效行情不足 15 根，ATR 止损未生效",
+                            "action": "人工复核"})
     # ⑤ 最大回撤保护线
     mdd = plan.get("max_drawdown_pct")
     if mdd and drawdown is not None and drawdown <= -mdd:
@@ -205,6 +235,7 @@ def check_position(pos: dict, ref_date: str) -> dict:
             "hold_days": hold_days, "drawdown": round(drawdown, 4) if drawdown is not None else None,
             "plan": {k: plan.get(k) for k in ("stop_loss_pct", "time_stop_weeks", "trailing_ma",
                                                "max_drawdown_pct", "atr_stop_mult")},
+            "atr_value": round(atr_value, 4) if atr_value is not None and np.isfinite(atr_value) else None,
             "signals": signals, "ref_date": ref_date}
 
 

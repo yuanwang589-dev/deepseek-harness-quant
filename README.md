@@ -1,5 +1,7 @@
 # DeepSeek HARNESS Quant
 
+[![CI](https://github.com/yuanwang589-dev/deepseek-harness-quant/actions/workflows/ci.yml/badge.svg)](https://github.com/yuanwang589-dev/deepseek-harness-quant/actions/workflows/ci.yml)
+
 自然语言驱动的 A 股量化系统。低频。主观决策 + 写死引擎 + 数据裁决。
 
 AI 不预测个股。这是硬约束，不是选项。
@@ -62,7 +64,8 @@ python launcher.py
 
 ## 因子
 
-123+ 因子，全部 A 股本地实证（PIT / T+1 / 分年度）。九步入池，17+ 项证伪留档。
+因子池已登记 **54 个**（`factor_pool.db`）；其中面板可算 **6 个**、名义强因子表 **27 个**。
+数量以 `docs/资产盘点.md` 与 `tests/test_doc_claims.py` 的实测基线为准——文档数字由测试守卫，不是宣传口径。
 
 | 维度 | 代表 | 实证 |
 |---|---|---|
@@ -109,6 +112,26 @@ DSHQuant-v1.0.9-Release.zip          # 解压即用，含 HARNESS 运行时
 
 运行要求：Python 3.10+（源码）/ 无（exe）。HARNESS 控制台需 Node.js 18+（可选）。
 
+## 5 分钟验证
+
+改完代码或数据后，照 `docs/验收手册.md` 敲这三条即可判断有没有改坏：
+
+```bash
+python -m ruff check .                         # 静态检查，期望 0 告警（约 1s）
+python -m unittest discover -s tests -q        # 全量回归，期望 OK（约 60s）
+python data/health_check.py --json             # 一键巡检（数据时效 / 服务 / 库健康）
+python data/enable_wal.py                      # 确认 17 库均为 WAL（幂等，可随时跑）
+```
+
+> 受限环境（`schtasks` 被安全策略拦截）下 `health_check.py` 会抛 `PermissionError`，
+> 此时用一键跑通技能里的 `doctor.py check` 代替。
+
+开发规范与提交前检查见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+验收手册还包含：数据完整性、并发读写压测、API 冒烟、PIT 口径抽查。
+CI（`.github/workflows/ci.yml`）只跑不依赖数据资产的子集——数据不进 git，
+依赖数据的用例必须本地跑，这是刻意设计，不是偷懒。
+
 ## 数据
 
 数据由用户自行获取。系统不分发数据。
@@ -123,6 +146,6 @@ MIT。仅供研究学习。不构成投资建议。
 
 ## 文档
 
-[资产盘点](docs/资产盘点.md) · [架构说明](docs/架构.md) · [一键部署](docs/一键部署.md) · [快速开始](docs/快速开始.md) · [HARNESS 接入](docs/HARNESS接入.md) · [数据说明](docs/数据说明.md) · [分钟数据接入](docs/分钟数据接入说明.md)
+[资产盘点](docs/资产盘点.md) · [架构说明](docs/架构.md) · [一键部署](docs/一键部署.md) · [快速开始](docs/快速开始.md) · [HARNESS 接入](docs/HARNESS接入.md) · [数据说明](docs/数据说明.md) · [分钟数据接入](docs/分钟数据接入说明.md) · [开源借鉴调研](docs/开源借鉴调研.md)
 
 更新机制：`scripts/update.py`（manifest 驱动，用户配置保护，应用前自动备份）。

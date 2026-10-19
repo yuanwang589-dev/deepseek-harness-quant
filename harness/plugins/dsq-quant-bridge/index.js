@@ -17,6 +17,7 @@ module.exports = {
     const sessionQuery = ctx.get('sessionQuery')
     const subprocess = ctx.get('subprocess')
     const sessions = ctx.get('sessions')
+    const agents = ctx.get('agents')          // ★进程内投递 chat2 用（对齐 v1.0.8 桥接）
     const fsSvc = ctx.get('fs')
     const llm = ctx.get('llm')
     const agentDefaultModel = ctx.get('agentDefaultModel')
@@ -165,17 +166,26 @@ module.exports = {
       }
       return ''
     }
-    function roleOf(e) {
+    // ★修复：会话事件有两种形态——消息本体，或 {type:'user/message', data:{message:{...}}}。
+    //   原实现只认前者，导致 /quantapi/recent 对真实会话也返回空消息列表（聊天面板永远空白）。
+    function unwrapMessage(e) {
       if (!e) return null
       const d = e.data || e
-      if (d.role === 'user' || d.role === 'assistant') return d.role
+      if (d && d.message && d.message.role) return d.message
+      if (d && d.role) return d
+      return null
+    }
+    function roleOf(e) {
+      if (!e) return null
+      const m = unwrapMessage(e)
+      if (m && (m.role === 'user' || m.role === 'assistant')) return m.role
       if (e.type === 'user/message') return 'user'
       if (e.type === 'assistant/message') return 'assistant'
       return null
     }
     function textOf(e) {
-      if (!e) return ''
-      return msgText(e.data || e)
+      const m = unwrapMessage(e)
+      return m ? msgText(m) : ''
     }
     function isInjected(text) {
       const t = String(text || '')
@@ -197,6 +207,31 @@ module.exports = {
     function isLive(id) {
       const liveIds = sessions ? sessions.list().map(function (s) { return s.id }) : []
       return liveIds.indexOf(id) >= 0
+    }
+    // ★chat2 进程内投递需要拿到"活着的" Agent 句柄（与 v1.0.8 桥接同源）
+    function liveRootIds() {
+      if (!agents) return []
+      try { return (agents.roots ? agents.roots() : []).map(function (a) { return String(a.id) }) } catch (e) { return [] }
+    }
+    function defaultAgentId() {
+      const ids = liveRootIds()
+      return ids.length ? ids[0] : null
+    }
+    function resolveAgent(id) {
+      if (!agents) return null
+      const want = String(id == null ? '' : id)
+      if (!want) return null
+      try {
+        if (typeof agents.get === 'function') {
+          const a = agents.get(want)
+          if (a) return a
+        }
+        const roots = agents.roots ? agents.roots() : []
+        for (let i = 0; i < roots.length; i++) {
+          if (String(roots[i].id) === want) return roots[i]
+        }
+      } catch (e) {}
+      return null
     }
     function isCoreLocked(title) {
       return String(title || '').indexOf(CORE_WORD) >= 0
@@ -323,14 +358,34 @@ module.exports = {
               const sid = body.sessionId
               if (!text) return sendJson(res, 400, { ok: false, error: 'need text' })
               if (!sid) return sendJson(res, 400, { ok: false, error: 'need sessionId' })
-              if (!subprocess) return sendJson(res, 503, { ok: false, error: 'subprocess 不可用' })
-              subprocess.spawn({
-                argv: [NODE, DSH_BIN, '-y', '@deepseek-ai/dsh', '--profile', 'headless', '--resume', String(sid), text],
-                cwd: DSH_HOME,
-                stdio: { stdin: 'inherit', stdout: 'pipe', stderr: 'pipe' },
-                graceMs: 600000,
-              })
-              return sendJson(res, 200, { ok: true, accepted: true })
+              // ★修复：原实现 subprocess.spawn 的 argv 是 [NODE, DSH_BIN, '-y', '@deepseek-ai/dsh', ...]，
+              //   即 "node npx -y ..."（node 打不开名为 npx 的脚本），且 cwd 指向没有 node_modules 的 DSH_HOME，
+              //   必然静默失败却仍返回 accepted:true（前端只会看到"已送达·等回复…"然后超时）。
+              //   改为与 v1.0.8 桥接一致的进程内投递：agent.followup(UserMessage)。
+              const agent = resolveAgent(sid)
+              if (!agent) {
+                return sendJson(res, 409, {
+                  ok: false,
+                  error: '该会话当前不在运行（agent 未激活）—— 请先在 http://127.0.0.1:3080 打开它，再回到本页发送',
+                  sessionId: String(sid),
+                  rootIds: liveRootIds(),
+                })
+              }
+              // UserMessage 形状对齐 @deepseek-ai/dsh-llm 的 createUserMessage：需带 id/role/content/source
+              const message = {
+                id: require('crypto').randomUUID(),
+                role: 'user',
+                content: [{ type: 'text', text: text }],
+                source: { kind: 'user' },
+              }
+              try {
+                if (typeof agent.followup === 'function') agent.followup(message)
+                else if (typeof agent.steer === 'function') agent.steer(message)
+                else return sendJson(res, 500, { ok: false, error: 'agent 无 followup/steer' })
+              } catch (e) {
+                return sendJson(res, 500, { ok: false, error: '投递失败: ' + String((e && e.message) || e) })
+              }
+              return sendJson(res, 200, { ok: true, accepted: true, sessionId: String(agent.id) })
             }
             if (req.method === 'POST' && pathname === '/quantapi/delete') {
               const body = await readBody(req)

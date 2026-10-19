@@ -79,6 +79,24 @@ def release_single_instance_lock():
 LOG_FILE = BASE / "logs" / "bulk_load.log"
 PROGRESS_FILE = BASE / "logs" / "bulk_load_progress.txt"
 START_DATE = "2019-01-01"      # P0.5 因子验证只需 2020 起 + 250 日 RPS 缓冲；2010-2018 后续补拉
+
+
+def latest_market_date():
+    """★2026-10-15 断点续传修复：用库内最新交易日作为 end。
+    原先 end=None → today；而 bar_meta.end_date 只到上一交易日，
+    covers() 判 end_date(t-1) >= today(t) 为假 → 已下载股票被全部重拉。
+    （同款 bug 见 data/bulk_loader_akshare.py / data/fetcher_akshare.py 修复说明）"""
+    import sqlite3
+    db = BASE / "data" / "cache" / "bars.db"
+    if not db.exists():
+        return time.strftime("%Y-%m-%d")
+    try:
+        con = sqlite3.connect(str(db))
+        d = con.execute("SELECT MAX(date) FROM daily_bar").fetchone()[0]
+        con.close()
+        return d or time.strftime("%Y-%m-%d")
+    except Exception:
+        return time.strftime("%Y-%m-%d")
 CHECKPOINT_EVERY = 50
 BATCH_LOG_EVERY = 500
 DEFAULT_WORKERS = 2            # 多进程并行。★Baostock 免费服务对并发连接限流（WinError 10057/10002007），4 进程实测失败率 94%，2 进程+重试最稳（2026-08-06 实测）
@@ -130,9 +148,19 @@ def _worker(code: str):
     cache = DailyCache()
     max_retry = 5
     last_err = None
+    end = latest_market_date()
+    # ★2026-10-15 断点续传修复：cache.covers() 要求 meta.start_date <= start，
+    #   但首个交易日(2019-01-02)晚于请求 start(2019-01-01) → covers 恒为 False →
+    #   续传时已下载股票被全部重拉。改为只判"末日期是否已到最新交易日"。
+    try:
+        _meta = cache.get_meta(code, "qfq")
+        if _meta and _meta.get("end_date") and _meta["end_date"] >= end:
+            return (code, "ok", None)
+    except Exception:
+        pass
     for attempt in range(max_retry):
         try:
-            df = ensure_daily(code, START_DATE, None, "qfq", cache=cache)
+            df = ensure_daily(code, START_DATE, end, "qfq", cache=cache)
             if df is None or df.empty:
                 return (code, "empty", None)
             return (code, "ok", None)

@@ -5,6 +5,7 @@
 baostock>=0.8.9            # 行情主源（稳）
 akshare>=1.15.0            # 覆盖源（业绩快报/机构调研等）
 tushare>=1.4.0             # 财报主源（ann_date → Point-in-Time，需 token）
+py7zr>=0.20                # 分钟 7z 增量解包（convert_7z_to_parquet 硬依赖）
 
 # ---- 回测与绩效 ----
 backtrader>=1.9.78         # 主回测引擎（实测通过）
@@ -14,6 +15,7 @@ quantstats>=0.0.81         # 绩效指标（实测通过）
 # ---- 数据处理 ----
 numpy>=1.26
 pandas>=2.2
+pyarrow>=14.0              # parquet 引擎（traffic_light/global_rotation/五福轮动必需；缺失时 read_parquet 直接报错）2026-10-15 实测 26.0.0
 pyyaml>=6.0                # 读取 config/params.yaml
 
 # ---- 可选 ----

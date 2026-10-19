@@ -20,6 +20,7 @@ import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
+from data.io_utils import read_json, read_text
 
 BASE = Path(__file__).resolve().parent.parent
 CACHE = Path(r"data/cache")
@@ -40,7 +41,7 @@ def build_inventory(con):
     con.execute("DELETE FROM asset_inventory")
     if not aud:
         return 0
-    d = json.load(open(aud[-1], encoding="utf-8"))
+    d = read_json(aud[-1])
     ts = d["ts"]
     n = 0
     # 文件级

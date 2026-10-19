@@ -43,34 +43,45 @@ sys.path.insert(0, str(BASE))
 from data.fetcher_tushare import _pro, _call
 from data.cache import DailyCache
 
-BARS_DB = r"data\cache\bars.db"
+BARS_DB = str(BASE / "data" / "cache" / "bars.db")   # ★2026-10-15 P1-A 绝对路径（原相对依赖 cwd）
 
 
 def latest_trade_date(pro=None) -> str:
     """服务器最新交易日（YYYYMMDD）；服务器盘后数据未出时返回空
     ★2026-08-14 修复：用单只股票轻量探测（ts_code 1 行，~0.5s）替代全市场 daily 查询——
-      原全市场查询在 代理服务器 间歇超时下被误判为"盘后数据未出"→ 整链跳过 → 走 baostock 慢兜底。"""
+      原全市场查询在 代理服务器 间歇超时下被误判为"盘后数据未出"→ 整链跳过 → 走 baostock 慢兜底。
+    ★2026-10-15 适配 120 积分档：trade_cal 被限频(1次/小时) → 拉取失败时本地生成
+      近 25 个自然日的工作日候选，仍用 000001.SZ 单只 daily 探测（daily 在 120 档可用）。"""
     pro = pro or _pro()
+    dates = []
     try:
-        df = _call(pro.trade_cal, exchange="SSE", start_date="20260701",
-                   end_date=time.strftime("%Y%m%d"), is_open="1")
-        if df is None or df.empty:
-            return ""
-        dates = sorted(df["cal_date"].astype(str).tolist())
-        if not dates:
-            return ""
-        # 从最近往回找：单只股票轻量探测（000001.SZ 平安银行，1 行即代表该日已就绪）
-        latest = dates[-1]
-        for d in reversed(dates):
-            try:
-                _one = _call(pro.daily, ts_code="000001.SZ", trade_date=d)
-                if _one is not None and len(_one) > 0:
-                    return d
-            except Exception:
-                continue
-        return ""
+        # ★2026-10-15：单次直调不走 _call（120 积分档 trade_cal 限 1次/小时，重试无意义）
+        df = pro.trade_cal(exchange="SSE", start_date="20260701",
+                           end_date=time.strftime("%Y%m%d"), is_open="1")
+        if df is not None and not df.empty:
+            dates = sorted(df["cal_date"].astype(str).tolist())
     except Exception:
+        pass
+    if not dates:
+        # trade_cal 限频/失败 → 本地工作日候选（周末/节假日由单只探测自然跳过）
+        import datetime as _dt2
+        d, cand = _dt2.date.today(), []
+        for _ in range(25):
+            if d.weekday() < 5:
+                cand.append(d.strftime("%Y%m%d"))
+            d -= _dt2.timedelta(days=1)
+        dates = sorted(cand)
+    if not dates:
         return ""
+    # 从最近往回找：单只股票轻量探测（000001.SZ 平安银行，1 行即代表该日已就绪）
+    for d in reversed(dates[-12:]):
+        try:
+            _one = _call(pro.daily, ts_code="000001.SZ", trade_date=d)
+            if _one is not None and len(_one) > 0:
+                return d
+        except Exception:
+            continue
+    return ""
 
 
 def fetch_day(pro, trade_date: str):

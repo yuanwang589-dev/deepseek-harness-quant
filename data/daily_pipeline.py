@@ -112,25 +112,49 @@ def health_check():
     return dup == 0 and bs == 0
 
 
+def _acquire_lock():
+    """拿管道互斥锁 → (是否继续执行, 需在结束时释放的锁 Path 或 None)
+
+    ★2026-10-18 修锁泄漏：原实现把 `_lock.write_text()` 与「周末跳过」写在同一函数里，
+      周末 return、异常 return 两条路径都不 unlink 锁文件 → 残留锁会让后续 2 小时内的
+      运行误判"另一管道在跑"而静默跳过（本机 10-18 16:02 那次就是这样留下锁的）。
+      现改为 main() 用 try/finally 统一释放，任何退出路径都不会漏。
+    """
+    _lock = BASE / "data" / "logs" / "daily_pipeline.lock"
+    _lock.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if _lock.exists() and (time.time() - _lock.stat().st_mtime) < 7200:
+            log("⚠ 另一管道（dev_auto/手动更新）正在运行中（锁未过期）→ 本轮跳过，避免并发写冲突")
+            return False, None
+        _lock.write_text(str(time.time()), encoding="utf-8")
+        return True, _lock
+    except Exception as _e:
+        # 写不了锁就无锁运行（保持原有"继续执行"语义），但不持有锁 → 结束时不得 unlink，
+        # 否则会误删别人正在用的锁。
+        log(f"锁检查异常（无锁继续执行）: {_e}")
+        return True, None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--minute-dir", type=str, default=DEFAULT_MINUTE_DIR)
     ap.add_argument("--skip-scan", action="store_true", help="跳过机会扫描/Pitch")
     args = ap.parse_args()
 
-    # ★#359 互斥锁：防与 dev_auto（18:00/22:00 每 4h）并发写同一批产物（daily_signal/pitch_v2 等）
-    #   锁文件存在且未过期（<2h）说明另一管道在跑 → 本管道跳过（避免 18:30 与 18:00 dev_auto 重叠打架）
-    import os as _os
-    _lock = BASE / "data" / "logs" / "daily_pipeline.lock"
-    _lock.parent.mkdir(parents=True, exist_ok=True)
+    ok, _lock = _acquire_lock()
+    if not ok:
+        return
     try:
-        if _lock.exists() and (time.time() - _lock.stat().st_mtime) < 7200:
-            log("⚠ 另一管道（dev_auto/手动更新）正在运行中（锁未过期）→ 本轮跳过，避免并发写冲突")
-            return
-        _lock.write_text(str(time.time()), encoding="utf-8")
-    except Exception as _e:
-        log(f"锁检查异常（继续执行）: {_e}")
+        _body(args)
+    finally:
+        if _lock is not None:
+            try:
+                _lock.unlink(missing_ok=True)
+            except Exception:
+                pass
 
+
+def _body(args):
     # ★2026-08-14 非交易日跳过：周末无新行情，分钟/日线/因子池/扫描全幂等但纯浪费算力
     #   （尤其因子池评分补跑 30+ 分钟），直接跳过；周一自动恢复。节假日（工作日）幂等无害，不拦。
     import datetime as _dt
@@ -232,10 +256,7 @@ def main():
     except Exception as e:
         log(f"  管道验证失败: {str(e)[:80]}")
     log("=== 每日数据管道完成 ===")
-    try:
-        _lock.unlink(missing_ok=True)
-    except Exception:
-        pass
+    # 锁由 main() 的 finally 统一释放（见 _acquire_lock 注释）
 
 
 if __name__ == "__main__":

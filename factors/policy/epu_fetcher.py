@@ -40,9 +40,10 @@ _CTX = None
 def _ctx():
     global _CTX
     if _CTX is None:
+        # ★2026-10-19 H-4 修复：使用默认安全上下文，校验证书链与主机名。
+        #   原 check_hostname=False + verify_mode=CERT_NONE 会让 HTTPS 流量可被中间人伪造，
+        #   政策择时信号经此抓取，存在被篡改风险。
         _CTX = ssl.create_default_context()
-        _CTX.check_hostname = False
-        _CTX.verify_mode = ssl.CERT_NONE
     return _CTX
 
 

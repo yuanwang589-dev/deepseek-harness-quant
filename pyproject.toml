@@ -1,0 +1,32 @@
+# 仅放工具配置，不引入打包/安装语义（本项目用 PyInstaller 分发，不做 pip install）。
+# 参考 GitHub 开源项目的常见做法：配置进仓库、CI 与本地用同一份规则。
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-exclude = [
+    "harness",
+    "node_modules",
+    "dist",
+    "backups",
+    "_demo_backup",
+    "ui_v2",
+    "deck/archive_old",
+    "__pycache__",
+]
+
+[tool.ruff.lint]
+# 起步策略：只拦"一定会炸"的规则，基线 0 告警，再逐步收紧。
+# 不写大面积 ignore 名单——那是把告警藏起来，不是修掉。
+#   E9  = 语法/IO 级错误（E902 等）
+#   F63 = 无效比较（is 字面量等）
+#   F7  = 语法级问题（F701 break 外、F811 重定义等）
+#   F82 = 未定义名（F821 NameError 的静态证据）
+# 下一步可依次加：["I"] 导入排序 → ["E4","E7"] 空白 → ["F"] 全量 pyflakes。
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "data", "deck", "factors", "risk", "strategy",
+    "backtest", "etf", "pattern", "validation",
+]

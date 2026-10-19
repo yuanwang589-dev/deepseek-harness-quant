@@ -43,21 +43,48 @@ COLORS = {"greedy": "green", "wait": "yellow", "panic": "red"}
 
 
 def _ensure_parquet():
+    # ★2026-10-15 加固：① 缓存超 7 天重拉（bars.db 无指数时这是唯一 2019+ 数据源）
+    #   ② 空文件视为无效（baostock 登录/查询静默失败会写出 0 行 → 下游 IndexError）
+    #   ③ baostock 失败 → akshare 兜底
+    import time as _t
     if PARQUET.exists():
-        return
-    import baostock as bs
-    bs.login()
-    rs = bs.query_history_k_data_plus(
-        "sh.000300", "date,close", start_date="2005-01-01", end_date="2026-12-31",
-        frequency="d", adjustflag="3")
-    rows = []
-    while rs.error_code == "0" and rs.next():
-        rows.append(rs.get_row_data())
-    bs.logout()
-    df = pd.DataFrame(rows, columns=["date", "close"])
-    df["date"] = pd.to_datetime(df["date"])
-    df["close"] = df["close"].astype(float)
-    df = df.set_index("date")
+        try:
+            if pd.read_parquet(PARQUET).shape[0] > 0 and _t.time() - PARQUET.stat().st_mtime < 7 * 86400:
+                return
+        except Exception:
+            pass
+    df = None
+    try:
+        import baostock as bs
+        lg = bs.login()
+        if getattr(lg, "error_code", "0") != "0" or getattr(lg, "error_msg", ""):
+            raise RuntimeError(f"baostock 登录失败: {getattr(lg, 'error_msg', '')[:60]}")
+        rs = bs.query_history_k_data_plus(
+            "sh.000300", "date,close", start_date="2005-01-01", end_date="2026-12-31",
+            frequency="d", adjustflag="3")
+        rows = []
+        while rs.error_code == "0" and rs.next():
+            rows.append(rs.get_row_data())
+        bs.logout()
+        if rows:
+            df = pd.DataFrame(rows, columns=["date", "close"])
+            df["date"] = pd.to_datetime(df["date"])
+            df["close"] = df["close"].astype(float)
+            df = df.set_index("date")
+    except Exception:
+        df = None
+    if df is None or df.empty:
+        import os as _os
+        _os.environ["NO_PROXY"] = "*"   # ★2026-10-15：系统代理拒连外部行情源 → 强制直连
+        _os.environ["no_proxy"] = "*"
+        # ★2026-10-15：eastmoney clist 接口本机被拒 → 改用新浪指数源（实测 2002→最新 6008 行）
+        import akshare as ak
+        h = ak.stock_zh_index_daily(symbol="sh000300")
+        if h is None or h.empty:
+            raise RuntimeError("沪深300 数据源（baostock/akshare-sina）均无数据")
+        df = pd.DataFrame({"date": pd.to_datetime(h["date"]),
+                           "close": h["close"].astype(float)}).set_index("date")
+    df = df.dropna().sort_index()
     PARQUET.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(PARQUET)
 
@@ -85,6 +112,12 @@ def load_monthly() -> pd.Series:
     if rows:
         d = pd.Series({pd.Timestamp(r[0]): float(r[1]) for r in rows}).sort_index()
         parts.append(d.resample("ME").last())
+    elif PARQUET.exists():
+        # ★2026-10-15 修复：bars.db 无指数行（bulk_loader 只下股票）→ 回退用 baostock 缓存
+        #   的 2019+ 段（原逻辑直接漏掉 2019+ → 近月窗口空序列 → IndexError 崩溃）
+        post = pd.read_parquet(PARQUET)["close"]
+        post = post[post.index >= pd.Timestamp("2019-01-01")].resample("ME").last()
+        parts.append(post)
     monthly = pd.concat(parts)
     monthly = monthly[~monthly.index.duplicated(keep="last")].sort_index()
     return monthly.astype(float)

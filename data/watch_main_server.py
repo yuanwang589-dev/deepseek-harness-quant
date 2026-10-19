@@ -45,7 +45,8 @@ def probe():
         import yaml
         cfg = yaml.safe_load((BASE / "config" / "params.yaml").read_text(encoding="utf-8"))["data"]
         p = ts.pro_api(cfg["tushare_token"])
-        p._DataApi__http_url = cfg.get("tushare_api_url", "https://api.tushare.pro")
+        # ★2026-10-15 修复：空串兜底 + 官方可用网关 waditu dataapi（同 fetcher_tushare.py）
+        p._DataApi__http_url = cfg.get("tushare_api_url") or "https://api.waditu.com/dataapi"
         d = p.daily(trade_date=time.strftime("%Y%m%d"))
         return d is not None and len(d) > 0
     except Exception:

@@ -1,0 +1,56 @@
+name: CI
+
+# 为什么只跑子集：data/cache 的 17 个库共 2.6GB，不进 git（数据来自第三方，禁止再分发）。
+# 因此 CI 只跑「不依赖数据资产」的用例；依赖数据的用例（数据资产/账本/文档数字守卫）
+# 由本地 `docs/验收手册.md` 的全量回归负责。
+# 子集选择原则：宁可少跑，不可假绿——不写 continue-on-error，不吞失败。
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # 静态检查：只拦"一定会炸"的规则（配置见 pyproject.toml）。
+  # 基线为 0 告警，所以这里红了就是本次改动引入的，不是历史债。
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ruff
+        run: pip install "ruff>=0.17"
+
+      - name: Ruff (E9,F63,F7,F82)
+        run: ruff check . --output-format=github
+
+  offline-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas pyarrow pyyaml
+
+      - name: Syntax check (all .py, skip node_modules)
+        run: python -m compileall -q . -x '(node_modules|__pycache__|\.venv)'
+
+      - name: Offline unit tests (no data assets required)
+        run: |
+          python -m unittest -v \
+            tests.test_wecom_push \
+            tests.test_gaps.TestLogicGaps \
+            tests.test_gaps.TestBoardLimitRules \
+            tests.test_doc_claims.TestDocHasNoDisprovenClaims \
+            tests.test_doc_claims.TestDocDisclosesKnownGaps

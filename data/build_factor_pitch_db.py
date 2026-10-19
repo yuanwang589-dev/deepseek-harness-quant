@@ -22,6 +22,7 @@ import sqlite3
 import sys
 from collections import defaultdict
 from pathlib import Path
+from data.io_utils import read_json, read_text
 
 BASE = Path(__file__).resolve().parent.parent
 LOGS = BASE / "logs"
@@ -41,7 +42,7 @@ def load_pitch_factors_map() -> dict:
     m = {}
     for f in _pitch_files():
         try:
-            d = json.load(open(f, encoding="utf-8"))
+            d = read_json(f)
             ts = str(d.get("ts") or os.path.basename(f))
             for p in (d.get("pitch") or []):
                 code = p.get("code")
@@ -65,7 +66,7 @@ def load_decisions_factors() -> dict:
     m = {}
     for f in sorted(glob.glob(str(LOGS / "deck_decisions_*.json")), key=os.path.getmtime):
         try:
-            for r in json.load(open(f, encoding="utf-8")):
+            for r in read_json(f):
                 if isinstance(r, dict) and r.get("action") == "buy":
                     pm = r.get("pitch_meta") or {}
                     if pm.get("factors"):

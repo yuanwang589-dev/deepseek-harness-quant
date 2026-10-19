@@ -77,7 +77,8 @@ def _latest_close_of(code: str):
         import sqlite3
         import glob as _glob
         from pathlib import Path as _P
-        paths = ["data/cache/bars.db"]
+        # ★2026-10-15 修复：绝对路径（as_uri() 不接受相对路径，原写法静默失败）
+        paths = [str(BASE / "data" / "cache" / "bars.db")]
         try:
             from data.cache import CACHE_DIR
             paths += [str(p) for p in sorted(CACHE_DIR.glob("bars_incr_*.db"))[-3:]]
@@ -86,7 +87,8 @@ def _latest_close_of(code: str):
         best = None
         for _p in paths:
             try:
-                _uri = _P(_p).as_uri() + "?mode=ro&immutable=1"
+                from data.cache import db_uri as _db_uri
+                _uri = _db_uri(_p)
                 con = sqlite3.connect(_uri, uri=True, timeout=3)
                 row = con.execute(
                     "SELECT close, date FROM daily_bar WHERE code=? ORDER BY date DESC LIMIT 1",

@@ -39,10 +39,62 @@ def _resolve_cache_dir() -> Path:
 
 CACHE_DIR = _resolve_cache_dir()
 DEFAULT_DB = CACHE_DIR / "bars.db"
+
+
+def _recently_written(p: Path, stale_secs: float = 300.0) -> bool:
+    """库文件是否"可能正在被写"。
+
+    ★2026-10-18 T3.2：`immutable=1` 是向 SQLite 承诺"文件永不变化"——跳过锁表直接读。
+    写入进程改页后，读视图会错乱并报 `database disk image is malformed`
+    （部署记录坑 1：不是数据损坏，PRAGMA integrity_check 返回 ok，停掉看板即恢复）。
+    因此只有在库确实静止时才允许 immutable：mtime 超过 stale_secs、
+    无 -wal/-journal 边车、且无 .writing 写锁标记。
+    """
+    try:
+        if time.time() - p.stat().st_mtime < stale_secs:
+            return True
+        for suffix in ("-wal", "-journal"):
+            side = p.with_name(p.name + suffix)
+            if side.exists() and side.stat().st_size > 0:
+                return True
+        if (p.parent / ".writing").exists():
+            return True
+    except OSError:
+        return True          # 状态不可读时按"正在写"处理（安全优先于快）
+    return False
+
+
+def db_uri(p, immutable: bool = None, stale_secs: float = 300.0) -> str:
+    """★2026-10-15 P1-A 全项目 SQLite 只读 URI 单出口。
+    相对路径按项目根（DSHQuant/）解析为主、CACHE_DIR 兜底（as_uri() 不接受相对路径，
+    原各处散写 `Path(p).as_uri()+"?mode=ro&immutable=1"` 时相对路径抛 ValueError 被
+    try/except 吞掉 → "行情面板为空" 假成功根因）。所有只读连库一律走本函数。
+
+    ★2026-10-18 T3.2 智能降级：immutable=None（默认）时自动判定——
+    库在 stale_secs（默认 300s）内被写过、或存在非空 -wal/-journal、或有 .writing
+    写锁标记 → 不加 immutable=1（普通只读，安全）；否则保留 immutable=1（快路径）。
+    显式传 immutable=True/False 可覆盖（冻结的归档库可强制 True）。
+    """
+    p = Path(p)
+    if not p.is_absolute():
+        cand = _ROOT / p
+        if not cand.exists() and (CACHE_DIR / p).exists():
+            cand = CACHE_DIR / p
+        p = cand
+    p = p.resolve()
+    if immutable is None:
+        immutable = not _recently_written(p, stale_secs)
+    uri = f"{p.as_uri()}?mode=ro"
+    if immutable:
+        uri += "&immutable=1"
+    return uri
+
+
 # ★2026-08-10 双库绕行：bars.db 被环境写保护锁定（SQLite readonly，与新文件名可写共存）
 #   → 增量写入走 INC_DB（bars_incr.db，同 schema），读取时合并主库+增量库（增量优先）。
 #   背景：扫描/回测只读不受影响；每日增量管道写 incr 库后读取方自动见最新数据。
 INC_DB = CACHE_DIR / "bars_incr.db"
+_ROOT = Path(__file__).resolve().parent.parent   # 项目根（DSHQuant/），db_uri 相对路径基准
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS daily_bar (
@@ -56,6 +108,9 @@ CREATE TABLE IF NOT EXISTS daily_bar (
     PRIMARY KEY (code, date, adjust)
 );
 CREATE INDEX IF NOT EXISTS idx_daily_bar ON daily_bar (code, adjust, date);
+-- ★2026-10-15 提速：按日扫全市场（load_panel/load_st_codes 的 date>=? / date IN 查询）
+--   原仅 (code,adjust,date) 索引对按 code 查有效，按 date 全表扫 846 万行 ≈ 3s/次
+CREATE INDEX IF NOT EXISTS idx_daily_bar_date ON daily_bar (adjust, date);
 
 CREATE TABLE IF NOT EXISTS bar_meta (
     code       TEXT NOT NULL,
@@ -278,7 +333,7 @@ class DailyCache:
     def _ro_uri(p) -> str:
         """只读 immutable URI（★主库 3.7GB 普通连接等锁 20s → immutable 0.01s；
         已登记文件被环境锁只读时普通连接会等满 timeout）"""
-        return f"{Path(p).as_uri()}?mode=ro&immutable=1"
+        return db_uri(p)
 
     # ---------- 读取（唯一读取入口）----------
     def latest_trade_date(self):

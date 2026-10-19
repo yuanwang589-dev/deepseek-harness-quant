@@ -1,0 +1,29 @@
+# config/wecom.yaml — 企业微信群机器人推送配置（方案①：零端口暴露）
+#
+# 用法：
+#   1. 企业微信「内部群聊」→ 右上角「…」/三个点 → 「消息推送」（原「群机器人」，
+#      v4.1.41 起改名）→ 添加 → 点开创建好的「消息推送」→ 复制 Webhook 地址
+#      （仅创建人可见；仅内部群聊支持；群开启「仅群主管理」时只有群主能添加）
+#   2. 把本文件复制为 config/wecom.yaml（去掉 .example 后缀），填入 webhook
+#   3. 验证与预览：
+#        python scripts/wecom_push.py --selftest
+#        python scripts/wecom_push.py --type all --dry-run
+#        python scripts/wecom_push.py --type all
+#
+# 注意：config/wecom.yaml 含密钥，已列入 .gitignore，请勿提交到版本库。
+
+webhook: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=在这里填入你的机器人key"
+
+# 可选：deck 地址（默认本机，一般不用改）
+deck: "http://127.0.0.1:8787"
+
+# 可选：消息类型（默认 markdown_v2）
+#   markdown_v2 —— 支持真列表（可嵌套）与多级引用，手机端最好看；不支持字体颜色。
+#                  需客户端 ≥4.1.36（安卓 ≥4.1.38），更低版本会退化成纯文本。
+#   markdown    —— 旧版，支持 3 种字体颜色，但不支持列表/缩进/表格。
+format: "markdown_v2"
+
+# 可选：模拟账户名（data/cache/paper.db 里的 account）
+#   金额盈亏（净值/本金/现金）取自该账户的真实股数；留空/不写 = 自动取最近创建的账户。
+#   该账户由 scripts/sim_live_1w.py 写入（默认本金 1 万、3 只等权整手）。
+paper_account: ""

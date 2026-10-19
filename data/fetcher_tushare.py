@@ -40,7 +40,9 @@ def _pro():
         import tushare as ts
         cfg = _load_cfg()
         p = ts.pro_api(cfg["tushare_token"])
-        p._DataApi__http_url = cfg.get("tushare_api_url", "https://api.tushare.pro")
+        # ★2026-10-15 修复：① 空串兜底 ② 官方可用网关为 waditu dataapi（SDK 拼 {url}/{api_name}，
+        #   实测 api.tushare.pro/{api_name} 路径对该账户返回空数据/404，dataapi 路径正常）
+        p._DataApi__http_url = cfg.get("tushare_api_url") or "https://api.waditu.com/dataapi"
         try:
             p._DataApi__timeout = 10
         except Exception:
@@ -68,6 +70,9 @@ def _call(fn, *args, max_retry=5, **kwargs):
         except Exception as e:
             last_err = str(e)
             if "频率" in last_err or "每分钟" in last_err:
+                # ★2026-10-15：小时级限频（1次/小时）重试无意义 → 立即抛出，交由调用方降级
+                if "次/小时" in last_err:
+                    raise
                 print(f"  [Tushare 限频] {last_err[:80]} → 等待 30s 重试")
                 time.sleep(30.0)
                 continue

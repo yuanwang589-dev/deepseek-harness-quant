@@ -13,6 +13,7 @@
   list_archives()  → 列出所有存档；load_archive(path) → 读回 JSON。
 """
 import json
+import re
 import time
 from pathlib import Path
 
@@ -176,9 +177,15 @@ def save_latest(key: str, returns: pd.Series, params: dict = None, metrics: dict
                 benchmark: pd.Series = None, category: str = "策略", factors: list = None,
                 verdict: str = None, out_dir: Path = None) -> dict:
     """写/覆盖「当前最新」存档（固定名 latest_{key}，同参数重跑覆盖旧值）。
-    配合 archive()（历史时间戳）实现「新的覆盖旧的 + 旧的进历史」。"""
+    配合 archive()（历史时间戳）实现「新的覆盖旧的 + 旧的进历史」。
+    ★2026-10-19 安全修复：key 会成为 out_dir 下的文件名（latest_{key}.json/.html）。
+       入口 bt_runner 已做白名单消毒+策略白名单，此处再加一道纵深防御——
+       强制 key 只能是 [A-Za-z0-9_.-]，且解析后必须落在 out_dir 内。"""
     out_dir = Path(out_dir) if out_dir else ARCHIVE_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
+    # 纵深防御：key 白名单，杜绝 ../ / 斜杠 / UNC 前缀
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,200}", str(key)):
+        raise ValueError(f"非法存档 key: {key!r}（只允许字母数字 _ . -）")
     r = pd.Series(returns).astype(float).dropna()
     metrics = metrics or compute_metrics(r)
     title = params.get("name", key) if params else key

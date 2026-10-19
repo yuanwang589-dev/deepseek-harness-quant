@@ -29,6 +29,7 @@
 """
 import glob
 import json
+import ast
 import os
 import sqlite3
 import sys
@@ -38,7 +39,7 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent.parent   # factors/opportunities/ → deepseek-harness-quant
 sys.path.insert(0, str(BASE))
 
-BARS_DB = Path(r"data/cache/bars.db")
+BARS_DB = BASE / "data" / "cache" / "bars.db"   # ★2026-10-15 P1-A 绝对路径（原相对依赖 cwd）
 FWD_HORIZONS = (1, 5, 20, 60)
 
 
@@ -340,7 +341,7 @@ def append_machine_top01(n_top: int = 5) -> dict:
         return pool
     # top N：信号值排序取前 n_top（key 是 "(date, code)" 字符串）
     top = sorted(src.items(), key=lambda x: -x[1])[:n_top]
-    codes = [eval(k)[1] for k, v in top]
+    codes = [ast.literal_eval(k)[1] for k, v in top]
     entry_date = eh.get("date") or datetime.now().strftime("%Y-%m-%d")
     # ★#354 机器客观：机器池 = 最新交易日"当天最强 top0.1%"，旧批次先清（不累积）
     #   （原只追加不清旧 → 机器池越积越多，混入历史批次，"当天机器选了谁"不可读）
@@ -424,7 +425,7 @@ def append_machine_top01(n_top: int = 5) -> dict:
                           (code, entry_date)).fetchone()
         pool["entries"].append({
             "code": code, "name": nm, "otype": ot or "machine_top01",
-            "score": float(top[[i for i, (k, _) in enumerate(top) if eval(k)[1] == code][0]][1]),
+            "score": float(top[[i for i, (k, _) in enumerate(top) if ast.literal_eval(k)[1] == code][0]][1]),
             "risk_level": rk or "", "beneish": "",
             "stop_plan": sp or {}, "pool_type": "machine_top01",
             "decided": "", "entry_date": entry_date,

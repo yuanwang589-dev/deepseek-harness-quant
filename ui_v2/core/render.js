@@ -8,11 +8,20 @@
 (function (win) {
   'use strict';
 
+  // HTML 转义（防存储型 XSS：数据字段拼进 innerHTML 前必须转义）
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
   function _f(v, d) {
     if (v === null || v === undefined) return d !== undefined ? d : '—';
     if (typeof v === 'number' && isNaN(v)) return d !== undefined ? d : '—';
     if (v === '') return d !== undefined ? d : '—';
-    return v;
+    // ★2026-10-19 M-1 修复：字符串值统一转义，避免 code/name/note 等字段触发 XSS
+    return typeof v === 'string' ? esc(v) : v;
   }
 
   // 小数  百分数（0.07  '7%'）；null  '—'

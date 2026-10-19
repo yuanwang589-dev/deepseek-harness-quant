@@ -1,0 +1,21 @@
+# 回测策略外部注册表（★动态化铁律：新增/调整策略 = 改本文件，不改代码）
+# 加载：backtest/bt_runner.py 启动时合并进内置注册表（同名覆盖内置）。
+# 策略类型：
+#   instant: true  → 即时回测（评分方式二选一）
+#       factor_list: 声明式因子组合（factors/factor_engine.py FACTOR_FUNCS 动态合成，sign=+1 正向 / -1 反转）
+#       scorer: 内置评分函数名（tech3 / script1 / turn_low）
+#   instant: false → 批处理（如 factor_all），运行按钮禁用
+extra:
+  lowvol_defense:
+    name: 低波防守单因子
+    category: 策略
+    instant: true
+    desc: "声明式策略示例：lowvol_60 反转单因子（外部配置注册，零代码）"
+    factors: ["lowvol_60"]
+    factor_list:
+      - name: lowvol_60
+        sign: -1
+    defaults:
+      topn: 10
+      stocks: 300
+    rebalance: M

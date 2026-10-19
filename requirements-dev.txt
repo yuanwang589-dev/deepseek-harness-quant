@@ -1,0 +1,4 @@
+# 开发期依赖（运行期依赖见 requirements.txt）
+# 安装：../.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+ruff>=0.17
+pre-commit>=3.7

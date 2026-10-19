@@ -61,8 +61,6 @@ for i, ym in enumerate(months[:-1]):
 
 def run(top_n=20, band=None):
     """band=None → 无择时；否则 MA6/12 死区档位"""
-    if band is None:
-        cash_map = {ts.strftime("%Y-%m"): 0.0 for ts in cash.index} if False else None
     cash = ratio.map(lambda r: 0.0 if (pd.isna(r) or r > band) else (1.0 if r < -band else 0.5)) if band is not None else ratio.map(lambda r: 0.0)
     cash_map = {ts.strftime("%Y-%m"): float(cash[ts]) for ts in cash.index}
     nav, nav_series, mkt_series = 1.0, [], []

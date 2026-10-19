@@ -25,6 +25,7 @@
 import json
 import sqlite3
 import sys
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -43,8 +44,26 @@ class FactorRegistry:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init()
 
+    @contextmanager
+    def _conn(self):
+        """连接上下文：**退出即关闭**。
+
+        ★2026-10-15 修复：原来各方法都写 `with sqlite3.connect(...) as con:`，
+        但那**不是**关闭连接的上下文管理器——它是**事务**上下文，退出只
+        commit/rollback，连接与文件句柄一直留着。后果：
+          - 本类 11 个方法每次都漏一个连接（句柄泄漏）
+          - Windows 上库文件被占用，无法删除/改名（测试里 TemporaryDirectory
+            清理直接 WinError 32）
+        """
+        con = sqlite3.connect(str(self.db_path), timeout=10)
+        try:
+            yield con
+            con.commit()
+        finally:
+            con.close()
+
     def _init(self):
-        with sqlite3.connect(str(self.db_path)) as con:
+        with self._conn() as con:
             con.execute("""CREATE TABLE IF NOT EXISTS factors (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT UNIQUE NOT NULL,
@@ -72,7 +91,7 @@ class FactorRegistry:
                  direction=1, note="") -> bool:
         """注册新因子（已存在则更新元数据，不动 status）→ True 新建 / False 已存在"""
         assert kind in KINDS, f"kind 必须 ∈ {KINDS}"
-        with sqlite3.connect(str(self.db_path)) as con:
+        with self._conn() as con:
             cur = con.execute("SELECT COUNT(*) FROM factors WHERE name=?", (name,))
             exists = cur.fetchone()[0] > 0
             if not exists:
@@ -83,8 +102,12 @@ class FactorRegistry:
                      datetime.now().strftime("%Y-%m-%d %H:%M:%S"), note))
                 con.commit()
             else:
-                con.execute("UPDATE factors SET family=?,kind=?,source=?,freq=?,direction=? WHERE name=?",
-                            (family, kind, source, freq, direction, name))
+                # ★2026-10-15：补上 note。原来只更新 family/kind/source/freq/direction，
+                #   note 永远停留在首次插入的版本 —— 于是「已存在则更新元数据」名不副实，
+                #   重新登记时描述改动（如合并来源、补数据缺口说明）写不进去。
+                con.execute(
+                    "UPDATE factors SET family=?,kind=?,source=?,freq=?,direction=?,note=? WHERE name=?",
+                    (family, kind, source, freq, direction, note, name))
                 con.commit()
             return not exists
 
@@ -93,7 +116,7 @@ class FactorRegistry:
         """更新状态/评分/评估详情（lifecycle 主入口）
         locked=True 时锁定人工裁决：自动评估只更新 score/detail，不再改 status"""
         assert status in STATUSES, f"status 必须 ∈ {STATUSES}"
-        with sqlite3.connect(str(self.db_path)) as con:
+        with self._conn() as con:
             if score is not None:
                 con.execute("UPDATE factors SET status=?, score=?, last_eval_at=?, last_eval_detail=? WHERE name=?",
                             (status, score, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -108,7 +131,7 @@ class FactorRegistry:
 
     def update_score(self, name, score, status=None, detail: dict = None):
         """评估后回写（status 缺省保持现状；locked 因子的人工状态优先，不自动改 status）"""
-        with sqlite3.connect(str(self.db_path)) as con:
+        with self._conn() as con:
             locked = con.execute("SELECT locked FROM factors WHERE name=?", (name,)).fetchone()
             locked = bool(locked and locked[0])
             eff_status = status if not locked else None   # 锁定因子：人工状态不被自动覆盖
@@ -123,13 +146,13 @@ class FactorRegistry:
             con.commit()
 
     def remove(self, name):
-        with sqlite3.connect(str(self.db_path)) as con:
+        with self._conn() as con:
             con.execute("DELETE FROM factors WHERE name=?", (name,))
             con.commit()
 
     # ---------- 读 ----------
     def get(self, name) -> dict | None:
-        with sqlite3.connect(str(self.db_path)) as con:
+        with self._conn() as con:
             con.row_factory = sqlite3.Row
             r = con.execute("SELECT * FROM factors WHERE name=?", (name,)).fetchone()
         if not r:
@@ -150,7 +173,7 @@ class FactorRegistry:
         if cond:
             sql += " WHERE " + " AND ".join(cond)
         sql += " ORDER BY status, score DESC"
-        with sqlite3.connect(str(self.db_path)) as con:
+        with self._conn() as con:
             con.row_factory = sqlite3.Row
             rows = con.execute(sql, args).fetchall()
         out = []
@@ -161,7 +184,7 @@ class FactorRegistry:
         return out
 
     def stats(self) -> dict:
-        with sqlite3.connect(str(self.db_path)) as con:
+        with self._conn() as con:
             rows = con.execute("SELECT status, COUNT(*) FROM factors GROUP BY status").fetchall()
             kinds = con.execute("SELECT kind, COUNT(*) FROM factors GROUP BY kind").fetchall()
         return {"by_status": dict(rows), "by_kind": dict(kinds),

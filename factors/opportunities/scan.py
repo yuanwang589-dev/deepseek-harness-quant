@@ -45,11 +45,16 @@ from factors.opportunities.score import (opportunity_score, gains_score, prob_sc
                                          size_tier_of, strong_strength, classify_pitch_sub,
                                          EXPRESS_MIN_FAMILY, CONSENSUS_MIN_FAMILY,
                                          EXPRESS_PER_LINE, CONSENSUS_PER_LINE)
+from data.cache import db_uri   # ★2026-10-15 P1-A：SQLite 只读 URI 单出口（防相对路径 as_uri 静默失败）
+from data.io_utils import read_json, read_text
 
-BARS_DB = r"data\cache\bars.db"
-FIN_DB = r"data\cache\finance.db"
-QD_DB = r"data\cache\finance_quality.db"
-BASIC_DB = r"data\cache\stock_basic.db"
+# ★2026-10-15 修复：改绝对路径——load_panel 等处用 Path.as_uri() 拼 SQLite 只读 URI，
+#   相对路径抛 ValueError("relative path can't be expressed as a file URI") 被逐库
+#   try/except 吞掉 → "行情面板为空"（部署机实测命中）
+BARS_DB = str(BASE / "data" / "cache" / "bars.db")
+FIN_DB = str(BASE / "data" / "cache" / "finance.db")
+QD_DB = str(BASE / "data" / "cache" / "finance_quality.db")
+BASIC_DB = str(BASE / "data" / "cache" / "stock_basic.db")
 OUT = BASE / "logs" / f"opp_pool_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"   # 每次运行唯一文件名（安全层限制同名文件只能写一次）
 # 兼容读取：pitch_v2.py 用 get_latest_pool() 取最新
 
@@ -141,12 +146,81 @@ def load_basic() -> pd.DataFrame:
     return df.set_index("code")
 
 
+def _min_date_for(ndays: int, end: str = None) -> str:
+    """★2026-10-15 提速：估算 ndays 个交易日前的自然日下限（用于 SQL 下界裁剪）。
+    按 A 股年均 ~244 交易日 + 节假日缓冲，ndays 交易日 ≈ ceil(ndays*1.6) 自然日。
+    下界只需足够靠前（宁可多取不可少取），故用宽松系数 1.7。"""
+    import datetime as _dt
+    _end = _dt.date.fromisoformat(end) if end else _dt.date.today()
+    _lo = _end - _dt.timedelta(days=int(ndays * 1.7) + 15)
+    return _lo.strftime("%Y-%m-%d")
+
+
+# ★2026-10-15 提速：模块级面板缓存。bars 数据每日只更新一次，扫描结果在数据未变时
+#   完全复用——避免每次扫描都重读 846 万行 SQL + pivot 宽表（原 load_panel ~20s）。
+#   版本键 = bars.db + 最近 3 增量库的 mtime（与 DailyCache._LTD_CACHE 同思路）。
+_panel_cache = {"ver": None, "end": None, "days": None, "px": None, "vx": None}
+
+
+def _panel_version() -> tuple:
+    import os as _os
+    try:
+        from data.cache import CACHE_DIR as _CD
+        paths = [BARS_DB] + [str(p) for p in sorted(_CD.glob("bars_incr_*.db"))[-3:]]
+        return tuple((p, _os.path.getmtime(p)) for p in paths if _os.path.exists(p))
+    except Exception:
+        return None
+
+
+def _panel_parquet_path() -> Path:
+    return BASE / "data" / "cache" / "_panel_cache.parquet"
+
+
+def _try_load_parquet_panel(_ver, end, days):
+    """跨进程面板缓存：读磁盘 parquet（数据未变时秒回，worker 子进程也受益）。
+    命中返回 (px, vx)，否则返回 (None, None)。"""
+    try:
+        import pandas as _pd
+        _pq = _panel_parquet_path()
+        if not _pq.exists():
+            return None, None
+        _meta = _pd.read_parquet(_pq)
+        # 元数据存为单独的列名约定：第一列是版本哨兵
+        if "__ver__" not in _meta.columns:
+            return None, None
+        _r = _meta.iloc[0]
+        if str(_r["__ver__"]) != str(_ver) or str(_r["__end__"]) != (end or "") \
+                or int(_r["__days__"]) != int(days):
+            return None, None
+        # 版本匹配：读宽表（__ver__ 列去掉后即 px；vx 单独文件）
+        _px = _meta.drop(columns=["__ver__", "__end__", "__days__"], errors="ignore")
+        _vx_path = _pq.with_name("_panel_cache_vx.parquet")
+        if not _vx_path.exists():
+            return None, None
+        _vx = _pd.read_parquet(_vx_path)
+        if _px.empty:
+            return None, None
+        return _px, _vx
+    except Exception:
+        return None, None
+
+
 def load_panel(end: str = None, days: int = 300):
     """日线面板（收盘价 + 成交量）→ (px, vx)；空返回 (None, None)
     end 只做上限过滤；起点固定 2020-01-01（保证 300 日窗口充足）
     ★2026-08-10 双库合并：bars.db 被环境写保护 → 增量写入 bars_incr_*.db；
       此处读取时合并（主库历史 + 增量库最新），保证增量数据对扫描可见
+    ★2026-10-15 提速：模块级缓存（数据未变直接复用上次 pivot 结果，20s→0s）
     """
+    _ver = _panel_version()
+    if (_panel_cache["ver"] == _ver and _panel_cache["end"] == end
+            and _panel_cache["days"] == days and _panel_cache["px"] is not None):
+        return _panel_cache["px"], _panel_cache["vx"]
+    # 跨进程磁盘缓存（worker 子进程、deck 重启后也能秒回）
+    _px0, _vx0 = _try_load_parquet_panel(_ver, end, days)
+    if _px0 is not None:
+        _panel_cache.update(ver=_ver, end=end, days=days, px=_px0, vx=_vx0)
+        return _px0, _vx0
     rows = []
     from data.cache import CACHE_DIR as _CD
     from pathlib import Path as _P
@@ -154,14 +228,17 @@ def load_panel(end: str = None, days: int = 300):
     #   每库等锁 5-20s → load_panel 10min+ 无输出）。增量语义：最新库已含全部增量，3 个兜底足够。
     inc_files = sorted(_CD.glob("bars_incr_*.db"))[-3:]
     dbs = [BARS_DB] + [str(p) for p in inc_files]
+    # ★2026-10-15 提速：只取最近 days+30 个交易日（约 400 天），不再扫 2020 至今全部历史。
+    #   原 SQL date>='2020-01-01' 拉 6 年数百万行只 tail(days)，是 load_panel 20s 的主因。
+    lo_date = _min_date_for(days + 30)
     for db in dbs:
         try:
-            uri = f"{_P(db).as_uri()}?mode=ro&immutable=1"   # immutable 免等锁（0.01s vs 20s）
+            uri = db_uri(db)   # immutable 免等锁（0.01s vs 20s）；P1-A 单出口
             con = sqlite3.connect(uri, uri=True, timeout=3)
             r2 = con.execute(
                 "SELECT code, date, close, volume FROM daily_bar WHERE adjust='qfq' "
-                "AND code NOT LIKE 'sh.%' AND code NOT LIKE 'sz.%' AND date >= '2020-01-01'",
-                ()).fetchall()
+                "AND code NOT LIKE 'sh.%' AND code NOT LIKE 'sz.%' AND date >= ?",
+                (lo_date,)).fetchall()
             con.close()
             rows.extend(r2)
         except Exception:
@@ -175,7 +252,22 @@ def load_panel(end: str = None, days: int = 300):
     if end:
         px = px[px.index <= end]
         vx = vx[vx.index <= end]
-    return px.tail(days), vx.tail(days)
+    _px, _vx = px.tail(days), vx.tail(days)
+    _panel_cache["ver"], _panel_cache["end"], _panel_cache["days"] = _ver, end, days
+    _panel_cache["px"], _panel_cache["vx"] = _px, _vx
+    # 写磁盘缓存（含版本哨兵列，供跨进程命中）
+    try:
+        import pandas as _pd
+        _pq = _panel_parquet_path()
+        _save = _px.copy()
+        _save.insert(0, "__ver__", str(_ver))
+        _save.insert(1, "__end__", end or "")
+        _save.insert(2, "__days__", int(days))
+        _save.to_parquet(_pq)
+        _vx.to_parquet(_pq.with_name("_panel_cache_vx.parquet"))
+    except Exception:
+        pass
+    return _px, _vx
 
 
 def load_fundamentals(end: str = None) -> pd.DataFrame:
@@ -226,7 +318,7 @@ def load_st_codes() -> set:
     ★2026-08-12 #136 修复：① 普通连接改 immutable 只读（防等锁）② is_st 异常检测+回溯——
     08-11 Tushare 增量写入丢 is_st 列（当天仅 4 只 vs 正常 ~200 只）→ ST 过滤静默失效；
     若最新日 is_st=1 数量 <50（异常），回溯最近 10 个交易日取第一个正常日（≥50）名单"""
-    con = sqlite3.connect(f"file:{BARS_DB}?mode=ro&immutable=1", uri=True, timeout=3)
+    con = sqlite3.connect(db_uri(BARS_DB), uri=True, timeout=3)
     try:
         # 双库合并探测最新交易日（#135 原则，复用 cache.py 已实现）
         try:
@@ -235,19 +327,22 @@ def load_st_codes() -> set:
         except Exception:
             _mx = None
         _mx = _mx or con.execute("SELECT MAX(date) FROM daily_bar").fetchone()[0]
-        # 回溯：最近 10 个交易日找 is_st 正常日
+        # ★2026-10-15 提速：一次 SQL 取回最近 10 个交易日的 is_st 计数 + 名单，
+        #   替代逐日 COUNT（原每步全表扫 900 万行 ×11 次 ≈ 8s）
         _days = [r[0] for r in con.execute(
             "SELECT DISTINCT date FROM daily_bar WHERE date<=? ORDER BY date DESC LIMIT 10", (_mx,)).fetchall()]
-        _mx_n = con.execute("SELECT COUNT(*) FROM daily_bar WHERE date=? AND is_st=1", (_mx,)).fetchone()[0]
+        _cnts = dict(con.execute(
+            "SELECT date, COUNT(*) FROM daily_bar WHERE date IN (%s) AND is_st=1 GROUP BY date"
+            % ",".join("?" * len(_days)), _days).fetchall())
         for _d in _days:
-            _n = con.execute("SELECT COUNT(*) FROM daily_bar WHERE date=? AND is_st=1", (_d,)).fetchone()[0]
+            _n = _cnts.get(_d, 0)
             if _n >= 50:   # 正常 ST 规模 ~200 只，<50 视为该日 is_st 列异常（增量丢列）
                 st = {r[0] for r in con.execute(
                     "SELECT code FROM daily_bar WHERE date=? AND is_st=1", (_d,)).fetchall()}
                 if _d != _mx:
                     import logging
                     logging.getLogger("scan").warning(
-                        f"is_st 最新日 {_mx} 异常（仅 {_mx_n} 只，正常 ~200）→ 回溯使用 {_d} ST 名单（{len(st)} 只）")
+                        f"is_st 最新日 {_mx} 异常（仅 {_cnts.get(_mx, 0)} 只，正常 ~200）→ 回溯使用 {_d} ST 名单（{len(st)} 只）")
                 return st
         return set()
     finally:
@@ -403,7 +498,7 @@ def load_pitch_badges() -> dict:
         _mt = _os.path.getmtime(_f)
         if _pitch_badge_cache["data"] is not None and _pitch_badge_cache["mt"] == _mt:
             return _pitch_badge_cache["data"]
-        _raw = json.loads(open(_f, encoding="utf-8").read())
+        _raw = read_json(_f)
         _out = {}
         for _b in (_raw.get("badges") or []):
             if _b.get("otype"):
@@ -435,7 +530,7 @@ def _load_timing_score() -> tuple:
                      key=_os.path.getmtime)
         if not _fs:
             return (None, None)
-        _d = json.loads(open(_fs[-1], encoding="utf-8").read())
+        _d = read_json(_fs[-1])
         return (_d.get("score"), _d.get("level", ""))
     except Exception:
         return (None, None)
@@ -560,7 +655,7 @@ def load_event_flags(codes: set, end: str = None) -> dict:
     out = {}
     try:
         from pathlib import Path as _P
-        uri = f"{_P(BARS_DB).as_uri()}?mode=ro&immutable=1"
+        uri = db_uri(BARS_DB)
         con = sqlite3.connect(uri, uri=True, timeout=3)
         # 先取 bars 最近交易日（★双库合并：主库 + 增量库最大值）
         mx = con.execute("SELECT MAX(date) FROM daily_bar").fetchone()[0]
@@ -783,7 +878,7 @@ def load_risk_multiplier() -> dict:
         best, best_n = None, -1
         for p in files:
             try:
-                d = json.load(open(p, encoding="utf-8"))
+                d = read_json(p)
                 facs = d.get("factors", {})
                 n = len(facs)
                 if n > best_n and n > 0:
@@ -794,7 +889,7 @@ def load_risk_multiplier() -> dict:
                 continue
         if best is None:
             return _risk_mult_cache["data"]
-        d = json.load(open(best, encoding="utf-8"))
+        d = read_json(best)
         _risk_mult_cache["data"] = {f: v["eff"] for f, v in d.get("factors", {}).items() if isinstance(v, dict) and "eff" in v}
     except Exception:
         pass
@@ -820,7 +915,7 @@ def _style_weights() -> dict:
         files = sorted(ui_dir.glob("factor_style_rotation_*.json"), key=lambda p: p.stat().st_mtime)
         if not files:
             return _STYLE_W_CACHE["weights"]
-        d = json.load(open(files[-1], encoding="utf-8"))
+        d = read_json(files[-1])
         cur = d.get("current_style") or ""
         w = (d.get("weights") or {}).get(cur) or {}
         out = {}
@@ -1356,16 +1451,15 @@ def _amount_20d_yi(codes: set) -> dict:
     out = {}
     try:
         import sqlite3 as _sq
-        from pathlib import Path as _P
-        import glob as _gl
         # 主库 + 最近 3 个增量库（immutable 只读，与 portfolio._latest_close_of 同款）
-        _dbs = ["data/cache/bars.db"] + \
-               sorted(_gl.glob("data/cache/bars_incr_*.db"))[-3:]
+        # ★2026-10-15 P1-A：绝对路径（原相对 glob 依赖 cwd）
+        _cache_d = BASE / "data" / "cache"
+        _dbs = [_cache_d / "bars.db"] + sorted(_cache_d.glob("bars_incr_*.db"))[-3:]
         # 收集每 code 的 (date, amount_元) —— 增量库后写覆盖主库同日期
         _by_code = {c: {} for c in codes}
         for _db in _dbs:
             try:
-                _uri = _P(_db).as_uri() + "?mode=ro&immutable=1"
+                _uri = db_uri(_db)
                 _c = _sq.connect(_uri, uri=True, timeout=4)
                 _ph = ",".join("?" * len(codes))
                 for _r in _c.execute(

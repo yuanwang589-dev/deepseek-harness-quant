@@ -91,17 +91,14 @@ def main():
     start_harness(base)                 # HARNESS（可选，:3080）
     threading.Thread(target=_open_browsers, daemon=True).start()
 
-    from deck.deck_server import Handler, PORT
-    from http.server import ThreadingHTTPServer
-
-    print(f"[QuantDeck] 量化系统已启动: http://127.0.0.1:{PORT}  （Ctrl+C 退出）")
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        srv.server_close()
+    # ★2026-10-15 直接调用 deck_server.main()，不再自己拼 ThreadingHTTPServer。
+    #   原实现（from deck.deck_server import Handler; srv = ThreadingHTTPServer(...)）
+    #   绕过了 DeckServer 的全部加固：守护线程、未捕获异常回 500（客户端不再挂到超时）、
+    #   listen backlog 64、双开自检（Windows SO_REUSEADDR 会被第二个进程绑同一端口，
+    #   造成"新进程空跑、旧进程继续服务"的端口劫持）、SIGTERM 优雅退出、后台快照预热。
+    #   一键启动是用户的主入口——入口不带加固，加固就只对 `python deck/deck_server.py` 生效。
+    from deck.deck_server import main as _deck_main
+    _deck_main()
 
 
 if __name__ == "__main__":

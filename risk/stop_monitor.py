@@ -31,7 +31,7 @@ BASE = Path(__file__).resolve().parent.parent   # risk/ → deepseek-harness-qua
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
-BARS_DB = r"data/cache/bars.db"
+BARS_DB = str(BASE / "data" / "cache" / "bars.db")   # ★2026-10-15 P1-A 绝对路径（原相对依赖 cwd）
 FIN_TS_DB = r"data/cache/finance_ts.db"
 
 
@@ -121,6 +121,15 @@ def _check_one(e: dict, plan: dict) -> dict:
                     "ma20_at_entry": round(ma20_at_entry, 2) if ma20_at_entry else None})
 
     status = "NORMAL"
+    # ①-bis 硬止损（显式 stop_loss_pct，portfolio 配合项 / 模拟仓保值覆盖）
+    sl = plan.get("stop_loss_pct")
+    if sl and entry_close:
+        _sl_line = entry_close * (1 - sl)
+        if last <= _sl_line:
+            alerts.append({"rule": f"硬止损（-{sl*100:.0f}%）",
+                           "detail": f"现价 {last:.2f} ≤ 止损线 {_sl_line:.2f}",
+                           "action": "离场"})
+            status = "TRIGGERED"
     # ① 回撤保护线（vs 入池价）
     dd_protect = plan.get("max_drawdown_pct")
     if dd_protect and entry_close:
@@ -181,14 +190,53 @@ def _check_one(e: dict, plan: dict) -> dict:
 
 
 def run() -> Path:
-    """监测 pitch_track 入池股 + 真实持仓 → 输出触发清单"""
-    pt = _latest(sorted(glob.glob(str(BASE / "logs" / "pitch_track_pool_*.json"))))
-    entries = [e for e in pt.get("entries", []) if e.get("entry_close")]
+    """监测 pitch_track 入池股 + 模拟仓真实持仓（portfolio）→ 输出触发清单"""
     from risk.type_stop_rules import type_stop_plan
+    from datetime import date as _date
+
+    # ① pitch_track 远期池
+    pt = _latest(sorted(glob.glob(str(BASE / "logs" / "pitch_track_pool_*.json"))))
+    merged = {}
+    for e in pt.get("entries", []):
+        if e.get("entry_close") and e.get("code"):
+            merged[e["code"]] = e
+
+    # ② 模拟仓真实持仓（最新 portfolio_*.json；同 strategy.portfolio._load 口径）
+    for pf in sorted(glob.glob(str(BASE / "logs" / "portfolio_*.json")),
+                    key=lambda x: Path(x).stat().st_mtime):
+        try:
+            d = json.loads(Path(pf).read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for p in d.get("positions", []):
+            if p.get("status") not in ("holding", "over_limit"):
+                continue
+            code = p.get("code")
+            if not code or not p.get("entry_price"):
+                continue
+            ep = float(p["entry_price"])
+            try:
+                _age = (_date.today() - _date.fromisoformat(str(p.get("entry_date")))).days
+            except Exception:
+                _age = 0
+            merged[code] = {                      # 模拟仓优先（真实持仓，含显式 stop_plan）
+                "code": code, "name": p.get("name", code),
+                "otype": p.get("otype") or "quality_gap",
+                "entry_close": ep, "entry_date": p.get("entry_date", ""),
+                "age_days": _age,
+                "stop_plan": p.get("stop_plan"),  # portfolio 配合项：保值覆盖在此生效
+            }
 
     results = []
-    for e in entries:
-        plan = type_stop_plan(e.get("otype", "value"), e.get("score"))
+    for e in merged.values():
+        plan = type_stop_plan(e.get("otype", "value"), e.get("score") or 70)
+        sp = e.get("stop_plan")
+        if isinstance(sp, dict):                 # 显式 stop_plan 覆盖类型默认
+            for _k in ("stop_loss_pct", "time_stop_weeks", "time_stop_min_gain",
+                       "max_drawdown_pct", "trailing_ma", "pivot_check_pct",
+                       "atr_stop_mult", "logic_fail_rules"):
+                if _k in sp and sp[_k] is not None:
+                    plan[_k] = sp[_k]
         results.append(_check_one(e, plan))
 
     n_trig = sum(1 for r in results if r["status"] == "TRIGGERED")

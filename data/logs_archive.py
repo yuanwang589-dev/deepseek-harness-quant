@@ -23,7 +23,12 @@ import shutil
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
-TRASH = Path("<home>/Desktop/垃圾桶")
+# ★2026-10-15 修复：原 TRASH 指向未替换的 <home> 占位符（字面量，mkdir 会在 cwd 下建 "<home>" 且永远无法真正归档），
+#   mkdir 会在 cwd 下创建字面量 "<home>" 目录且永远无法真正归档 → 归档步骤长期静默失败。
+#   改为：默认项目内 logs/archive（安全、无外部依赖、可审计）；
+#   如需沿用桌面"垃圾桶"习惯，用环境变量 DSHQ_TRASH_DIR 或 --trash 覆盖。
+TRASH_DEFAULT = BASE / "logs" / "archive"
+TRASH = TRASH_DEFAULT
 TS = re.compile(r"^(.+)_(\d{8}_\d{6})\.(json|md|csv)$")
 # 各模式独立保留数（未列出的走 --keep 默认）
 KEEP_OVERRIDE = {
@@ -71,7 +76,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", type=int, default=5)
     ap.add_argument("--dry", action="store_true")
+    ap.add_argument("--trash", default=None,
+                    help="归档目标目录（默认 logs/archive；也可用环境变量 DSHQ_TRASH_DIR 覆盖）")
     args = ap.parse_args()
+    # 解析归档目标（--trash / 环境变量 优先，否则项目内 logs/archive）
+    _trash = os.environ.get("DSHQ_TRASH_DIR") or (args.trash if getattr(args, "trash", None) else None)
+    TRASH = Path(_trash).resolve() if _trash else TRASH_DEFAULT
     total = {"removed": 0, "kept": 0, "failed": 0, "bytes_freed": 0}
     for sub in ("logs", "output"):
         d = BASE / sub

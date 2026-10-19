@@ -1,0 +1,35 @@
+# 提交前自动检查（可选但推荐）
+#
+#   ../.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+#   ../.venv/Scripts/pre-commit.exe install
+#
+# 设计原则：只做"检查"，不自动改文件——批量 --fix 会在首次提交时制造巨大 diff，
+# 反而掩盖真实改动。需要格式化时手动执行：
+#   ../.venv/Scripts/ruff.exe check . --select I --fix
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.1
+    hooks:
+      - id: ruff
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-yaml
+        # ★2026-10-19 排除 Cordis agent 配置：它们用 js-yaml 的 `!!js` 标签嵌入
+        #   原始 JavaScript 表达式（如 `disabled: !!js process.platform !== 'win32'`），
+        #   这是 Cordis 框架的合法语法，但 PyYAML（check-yaml 用的解析器）无法构造
+        #   该标签 → 报 "could not determine a constructor for the tag js"。
+        #   注意：这是**钩子与项目资产的语言不兼容**，不是文件损坏，
+        #   所以正确做法是排除而非改写资产（改写会破坏 Cordis 运行时语义）。
+        exclude: |
+          (?x)^(
+            assets/presets/.*\.cordis\.yml
+            | harness/home/profiles/headless/cordis\.patch\.yml
+          )$
+      - id: check-toml
+      - id: check-merge-conflict
+      # 数据资产 2.6GB 不进 git，这条是最后一道闸
+      - id: check-added-large-files
+        args: ["--maxkb=2048"]

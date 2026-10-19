@@ -14,6 +14,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from data.io_utils import read_json, read_text
 
 BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
@@ -59,8 +60,8 @@ def _read(pattern: str, subdir: str = "logs") -> dict:
 def _bars_version() -> float:
     """数据源版本 = bars.db + 增量库的最新 mtime（★0.01s；MAX(date) 全表扫 900 万行要 1s+）"""
     try:
-        import glob as _g
-        fs = [r"data\cache\bars.db"] + _g.glob(r"data\cache\bars_incr_*.db")
+        fs = [BASE / "data" / "cache" / "bars.db"] + \
+             list((BASE / "data" / "cache").glob("bars_incr_*.db"))   # ★P1-A 绝对路径
         mt = [os.path.getmtime(f) for f in fs if os.path.exists(f)]
         return max(mt) if mt else 0.0
     except Exception:
@@ -100,11 +101,11 @@ def live_forward(force: bool = False) -> dict:
         try:
             import sqlite3 as _sq2
             from pathlib import Path as _P3
-            for _p in (["data/cache/bars.db"] +
-                       [str(p) for p in sorted(_P3("data/cache").glob("bars_incr_*.db"))[-3:]]):
+            from data.cache import db_uri as _db_uri
+            for _p in ([BASE / "data" / "cache" / "bars.db"] +
+                       [p for p in sorted((BASE / "data" / "cache").glob("bars_incr_*.db"))[-3:]]):
                 try:
-                    con = _sq2.connect(_P3(_p).as_uri() + "?mode=ro&immutable=1",
-                                       uri=True, timeout=3)
+                    con = _sq2.connect(_db_uri(_p), uri=True, timeout=3)
                     _m = con.execute("SELECT MAX(date) FROM daily_bar").fetchone()[0]
                     con.close()
                     if _m and (_m > (mx or "")):
@@ -530,6 +531,16 @@ def portfolio_pnl() -> dict:
         _rt = None
     _quotes = (_rt or {}).get("quotes") if (_rt or {}).get("ok") else None
     _rt_active = bool(_quotes) and (_rt or {}).get("market_open") is True
+    # ★2026-10-15 全市场快照未就绪（后台刷新中/失败）→ 轻量按需报价兜底：
+    #   新浪 list 接口一次拉持仓代码（<1s），避免 holdings 为几只现价同步等 22s 全市场快照
+    if not _quotes:
+        try:
+            _lq = _light_quotes([p.get("code") for p in positions if p.get("code")])
+        except Exception:
+            _lq = {}
+        if _lq:
+            _quotes = _lq
+            _rt_active = True
     rows, total_cost, total_val = [], 0.0, 0.0
     for p in positions:
         code = p.get("code", "")
@@ -872,6 +883,42 @@ def live_alerts() -> dict:
     return _out
 
 
+_bars_rows_cache = {"key": None, "n": None}
+
+
+def _bars_qfq_rows():
+    """bars.db 全市场 qfq 行数（排除沪深300指数本身）。★2026-10-18 审查修复。
+
+    原写法 `SELECT COUNT(*) ... WHERE adjust='qfq' AND code != 'SH.000300'` 的查询计划是
+    `SEARCH daily_bar USING INDEX idx_daily_bar_date (adjust=?)`：索引只过滤 adjust，
+    再对 847 万行逐行回表取 code 比较 → 实测 72s（独立进程冷启 102s）。
+    该接口被 /help 页直接调用，请求线程占满期间浏览器 ERR_CONNECTION_RESET、
+    watchdog 判死重启 → 全站 30~60s 不可用（2026-10-18 实测复现 2 次）。
+
+    改为强制覆盖索引 idx_daily_bar(code, adjust, date)：`SCAN ... USING COVERING INDEX`，
+    不回表，实测 1.21s，结果与原写法逐位一致（8477451）。再按 bars.db mtime+size
+    做进程内缓存——该数字一天只变一次，稳态 0ms。
+    """
+    try:
+        import sqlite3 as _sq
+        from data.cache import db_uri
+        _p = BASE / "data" / "cache" / "bars.db"
+        _st = _p.stat()
+        _key = (int(_st.st_mtime), _st.st_size)
+        if _bars_rows_cache["key"] == _key:
+            return _bars_rows_cache["n"]
+        _c = _sq.connect(db_uri(_p), uri=True, timeout=3)
+        try:
+            n = _c.execute("SELECT COUNT(*) FROM daily_bar INDEXED BY idx_daily_bar "
+                           "WHERE adjust='qfq' AND code != 'SH.000300'").fetchone()[0]
+        finally:
+            _c.close()
+        _bars_rows_cache.update({"key": _key, "n": n})
+        return n
+    except Exception:
+        return None
+
+
 def live_funnel() -> dict:
     """★2026-08-11 百轮#42：决策漏斗——机会池 → Pitch 候选 → 已审批（"为什么只推这几个"）
     ★百轮#71 升级：加淘汰原因统计（分数未达门槛 vs 达标但名额/子分类受限）+ Pitch 类型分布"""
@@ -928,15 +975,9 @@ def live_funnel() -> dict:
             pass
     pitch_total = pitch_n + tech_n
     # ★2026-08-15 全流程漏斗扩展（说明页动态决策流）：源头 → 硬过滤 → 机会池 → Pitch → 待审批 → 持仓 → 远期池
-    #   1) 源头：bars.db 全市场行数（qfq）
-    bars_rows = None
-    try:
-        import sqlite3 as _sq
-        _c = _sq.connect("file:data/cache/bars.db?mode=ro&immutable=1", uri=True, timeout=3)
-        bars_rows = _c.execute("SELECT COUNT(*) FROM daily_bar WHERE adjust='qfq' AND code != 'SH.000300'").fetchone()[0]
-        _c.close()
-    except Exception:
-        pass
+    #   1) 源头：bars.db 全市场行数（qfq）—— 走 _bars_qfq_rows()（覆盖索引 + mtime 缓存，
+    #      原内联 COUNT(*) 全表回表 72~102s，会把整个看板拖死，见该函数 docstring）
+    bars_rows = _bars_qfq_rows()
     #   2) 硬过滤通过（daily_signal n_passed）
     n_passed = None
     _ds = _latest("daily_signal_*.json", "output")
@@ -989,7 +1030,7 @@ def live_funnel() -> dict:
             _mf = sorted(_gf.glob(r"data\factorpool\output\factor_manifest_*.json"),
                          key=_os.path.getmtime)
         if _mf:
-            _md = json.load(open(_mf[-1], encoding="utf-8"))
+            _md = read_json(_mf[-1])
             _lst = _md.get("factors") if isinstance(_md.get("factors"), list) else _md.get("manifest")
             if _lst is None and isinstance(_md, dict):
                 _lst = [k for k in _md if k not in ("date", "n_factors", "health_date", "note")]
@@ -1074,27 +1115,39 @@ def portfolio_perf() -> dict:
             return {"ok": True, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "n_pos": 0, "series": [], "stats": {}, "note": "无持仓"}
         # ★#69 双库合并（主库 + 最近 3 个增量库 immutable）
+        # ★2026-10-15 P1-A：路径收敛——绝对路径 + db_uri 单出口（原相对 glob 依赖 cwd）
         def _dbs():
-            import glob as _g
-            dbs = ["data/cache/bars.db"]
-            inc = sorted(_g.glob("data/cache/bars_incr_*.db"))[-3:]
+            dbs = [BASE / "data" / "cache" / "bars.db"]
+            inc = sorted((BASE / "data" / "cache").glob("bars_incr_*.db"))[-3:]
             return dbs + inc
         def _ro(p):
-            return f"{_P(p).as_uri()}?mode=ro&immutable=1"
+            from data.cache import db_uri
+            return db_uri(p)
         def _fetch(code, ed, adjust="qfq"):
             out = {}
             for db in _dbs():
+                # ★2026-10-15：close 移入 finally。
+                #   原写法 close() 在 try 内，一旦 execute()/fetchall() 抛异常
+                #   （库被并发写、磁盘瞬时不可读、库损坏），连接立即泄漏。
+                #   deck 是 7×24 多线程常驻，泄漏累积到句柄上限后的症状是
+                #   「莫名 database is locked / 打不开文件」，且**没有任何报错指向这里**。
+                con = None
                 try:
                     con = sqlite3.connect(_ro(db), uri=True, timeout=3)
                     rows = con.execute(
                         "SELECT date, close FROM daily_bar WHERE code=? AND date>=? AND adjust=? ORDER BY date",
                         (code, ed, adjust)).fetchall()
-                    con.close()
-                    for dt, cl in rows:
-                        if cl is not None:
-                            out[dt] = float(cl)   # 增量库覆盖主库（同 key 后写覆盖）
                 except Exception:
                     continue
+                finally:
+                    if con is not None:
+                        try:
+                            con.close()
+                        except Exception:
+                            pass
+                for dt, cl in rows:
+                    if cl is not None:
+                        out[dt] = float(cl)   # 增量库覆盖主库（同 key 后写覆盖）
             return out
         daily = {p.get("code", ""): _fetch(p.get("code", ""), p.get("entry_date") or "2000-01-01")
                  for p in positions}
@@ -1391,20 +1444,26 @@ def live_calendar() -> dict:
     from pathlib import Path as _P
     # 交易日历（★#102 双库合并——主库写保护后新交易日只在增量库，单读主库会漏最新日）
     try:
-        import glob as _g2
         from pathlib import Path as _P2
+        from data.cache import db_uri as _db_uri2
         _dayset = set()
-        _db_paths = ["data/cache/bars.db"] + [
-            str(p) for p in sorted(_P2("data/cache").glob("bars_incr_*.db"))[-3:]]
+        _db_paths = [BASE / "data" / "cache" / "bars.db"] + [
+            p for p in sorted((BASE / "data" / "cache").glob("bars_incr_*.db"))[-3:]]
         for _p in _db_paths:
+            # ★2026-10-15：close 移入 finally（原写法异常即泄漏连接，见本文件 _fetch 同款注释）
+            con = None
             try:
-                con = sqlite3.connect(_P2(_p).as_uri() + "?mode=ro&immutable=1",
-                                      uri=True, timeout=3)
+                con = sqlite3.connect(_db_uri2(_p), uri=True, timeout=3)
                 _dayset.update(r[0] for r in con.execute(
                     "SELECT DISTINCT date FROM daily_bar").fetchall())
-                con.close()
             except Exception:
                 continue
+            finally:
+                if con is not None:
+                    try:
+                        con.close()
+                    except Exception:
+                        pass
         days = sorted(_dayset)
     except Exception:
         days = []
@@ -3085,7 +3144,13 @@ def live_data_assets() -> dict:
             out["lineage"].append(dict(zip(_cl, r)))
         _con.close()
     except Exception as e:
+        # ★2026-10-18 审查修复：原来只写 error 字段、ok 恒为 True，前端据 ok 判定
+        #   "加载成功"，于是 4 个板块（因子实战库/整合库表/资产清单/数据链路）全部
+        #   渲染成"无表数据/无资产清单"，把"库根本没建"伪装成"有库但没数据"。
+        #   这里如实标记失败并给可执行提示（unified.db 由 data/build_unified_db.py 生成）。
+        out["ok"] = False
         out["error"] = str(e)[:120]
+        out["hint"] = "unified.db 未建成 → 运行 python data/build_unified_db.py（Tushare 三表 PIT 建库）"
     _data_assets_cache.update({"ts": _now, "data": out})
     return out
 
@@ -3098,16 +3163,18 @@ def live_data_assets() -> dict:
 _rt_cache = {"ts": 0.0, "data": None, "err": None}
 
 
-def live_realtime() -> dict:
-    """盘中实时行情快照：涨跌家数/涨停数/成交额/涨跌幅分布/领涨领跌。
-    数据源：新浪实时快照（akshare stock_zh_a_spot，60s 缓存）。
-    非交易时段（周末/盘前/盘后）返回最近一次快照 + market_open=False。"""
-    global _rt_cache
+# ★2026-10-15 全市场快照非阻塞化（根因：akshare stock_zh_a_spot 分 70 页拉 5575 只 ≈ 22s，
+#   原先在请求线程里同步拉取 → /api/live/holdings 阻塞 22s，且 GIL 饿死整个 HTTP 服务，
+#   期间所有页面/接口连接被拒（实测全站 000）。现改为后台守护线程拉取写缓存，
+#   请求路径只读缓存；缓存未就绪 → 立即返回并触发后台刷新，请求路径零阻塞。
+_rt_refreshing = False
+
+
+def _rt_fetch_and_cache() -> dict:
+    """实际拉取全市场快照并写缓存（重：~22s/70 页）——仅由后台线程调用，不进请求路径。"""
+    global _rt_refreshing
     import time as _t
     now = _t.time()
-    # 60s 缓存命中
-    if _rt_cache["data"] is not None and now - _rt_cache["ts"] < 60:
-        return _rt_cache["data"]
     out = {"ok": True, "market_open": True,
            "ts": datetime.now().strftime("%H:%M:%S"),
            "source": "sina_realtime"}
@@ -3186,10 +3253,102 @@ def live_realtime() -> dict:
             out = {"ok": False, "market_open": False,
                    "ts": datetime.now().strftime("%H:%M:%S"),
                    "error": str(e)[:120]}
+    finally:
+        _rt_refreshing = False
     return out
 
 
+def _rt_kick_bg():
+    """非阻塞触发一次后台刷新（无在途刷新时才启动；守护线程，不阻塞请求路径）"""
+    global _rt_refreshing
+    import threading as _th
+    if _rt_refreshing:
+        return
+    _rt_refreshing = True
+
+    def _worker():
+        try:
+            _rt_fetch_and_cache()
+        except Exception:
+            pass
+    _th.Thread(target=_worker, daemon=True).start()
+
+
+def live_realtime() -> dict:
+    """盘中实时行情快照：涨跌家数/涨停数/成交额/涨跌幅分布/领涨领跌。
+    数据源：新浪实时快照（akshare stock_zh_a_spot，60s 缓存）。
+    ★2026-10-15 非阻塞化：全市场快照（~22s/70 页）移至后台守护线程；
+       本函数只读缓存——未就绪时立即返回（陈旧快照 or 回落提示）并触发后台刷新，
+       请求路径零阻塞（修复 holdings 阻塞 22s + GIL 饿死全站问题）。"""
+    import time as _t
+    now = _t.time()
+    # 60s 缓存命中
+    if _rt_cache["data"] is not None and now - _rt_cache["ts"] < 60:
+        return _rt_cache["data"]
+    _rt_kick_bg()
+    if _rt_cache["data"] is not None:
+        out = dict(_rt_cache["data"])
+        out["stale"] = True
+        out["stale_ts"] = datetime.now().strftime("%H:%M:%S")
+        return out
+    return {"ok": False, "market_open": False,
+            "ts": datetime.now().strftime("%H:%M:%S"),
+            "error": "全市场快照后台刷新中（首次约 25s 后就绪）"}
+
+
 # ══════════════════════════════════════════════════════════════════
+def _light_quotes(codes: list) -> dict:
+    """★2026-10-15 轻量按需报价：新浪 list 接口一次拉取少量代码（持仓/自选用）。
+    全市场快照（stock_zh_a_spot，~22s/70 页）未就绪时，为几只持仓现价走此快路径——
+    一次 HTTP 请求 <1s，绝不触发全市场拉取。
+    返回 {std_code: {"price": float, "pct": float|None}}；任何失败返回 {}。"""
+    if not codes:
+        return {}
+    try:
+        import socket as _sk
+        import urllib.request as _uq
+        _sk.setdefaulttimeout(8)
+        syms = []
+        for c in codes:
+            c = str(c)
+            if "." not in c:
+                continue
+            num, ex = c.split(".", 1)
+            pre = "sh" if ex.upper() == "SH" else "sz"
+            syms.append(pre + num)
+        if not syms:
+            return {}
+        url = "https://hq.sinajs.cn/list=" + ",".join(syms[:40])
+        req = _uq.Request(url, headers={"Referer": "https://finance.sina.com.cn"})
+        raw = _uq.urlopen(req, timeout=8).read().decode("gbk", errors="ignore")
+        out = {}
+        for line in raw.strip().splitlines():
+            line = line.strip()
+            if "=" not in line:
+                continue
+            var, _, val = line.partition("=")
+            sym = var.strip().replace("var ", "").replace("hq_str_", "").strip().lower()
+            if len(sym) < 8 or sym[:2] not in ("sh", "sz"):
+                continue
+            f = val.strip().strip('";\n ').split(",")
+            # 新浪格式：名称,今开,昨收,最新价,最高,最低,...
+            if len(f) < 4:
+                continue
+            try:
+                price = float(f[3]) if f[3] else None
+                pre_close = float(f[2]) if f[2] else None
+            except ValueError:
+                continue
+            if not price or price <= 0:
+                continue
+            std = sym[2:] + "." + sym[:2].upper()
+            pct = round((price / pre_close - 1) * 100, 2) if pre_close else None
+            out[std] = {"price": round(price, 3), "pct": pct}
+        return out
+    except Exception:
+        return {}
+
+
 # ★2026-08-14 API 接口状态探测（用户需求："再做一个API接口状态的信息块"）
 # 并发 HTTP 自探测全部 /api 端点：每个端点 200/耗时/错误 → 门户"API 接口状态"块
 # 60s 缓存（与 realtime 同级）；失败端点保留上次状态 + 标注

@@ -6,8 +6,9 @@ strategy/paper_account.py — S1 模拟盘模块（短板补齐）
 回测与未来实盘共用同一套下单/持仓接口（单一路径，防"模拟一套实盘一套"）。
 
 设计要点：
-- 撮合规则（A股近似）：T+1 卖出限制、涨跌停无法成交（±10%/ST±5% 简化用 10%）、
-  成交价=当日收盘价（低频季度调仓下收盘撮合足够，滑点已由成本模型覆盖）
+- 撮合规则（A股近似，账本层强制 P0-1）：T+1 卖出限制、涨跌停无法成交（按板块 ±10%/±20%/±30%）、
+  100股整数手、单笔不超过当日成交量；成交价=当日收盘价。
+  （bars.db 缺 preclose/volume/is_st 时对应校验软跳过并打日志，不阻断）
 - 风险检查：下单前挂接 RiskAgent（可复用 risk/risk_agent.py）
 - 数据持久化：tables = accounts / positions / orders / equity_curve
 - 幂等：同一 (account, date, code, action) 不重复记录
@@ -26,7 +27,63 @@ PAPER_DB = Path(__file__).resolve().parent.parent / "data" / "cache" / "paper.db
 
 COMMISSION = 0.00026      # 佣金万2.6
 STAMP_TAX = 0.0005        # 印花税（卖出）
-LIMIT_PCT = 0.10          # 涨跌停幅度（简化，含ST近似）
+# ─────────────────────────────────────────────────────────────────────
+# ★2026-10-15 涨跌停幅度：改为按板块区分（原实现只有两个常量，与板块无关）
+#
+# 原缺陷：
+#   LIMIT_PCT = 0.10（非ST）/ ST_LIMIT_PCT = 0.05，`lim = ST_LIMIT_PCT if is_st else LIMIT_PCT`
+#   只看 is_st、完全不看股票代码 → 造成两类误判拒单：
+#     · 创业板(300/301)、科创板(688/689) 涨跌幅在 10%~20% 之间的正常交易，
+#       被当成主板 ±10% 的涨跌停而拒绝成交（这两板真实限幅是 ±20%）；
+#     · ST 股涨跌幅在 5%~10% 之间被当成 ±5% 拒单（现行规则 ST 已并入主板 ±10%）。
+#   后果：模拟盘在这两类标的上**凭空少掉可成交的机会**，且没有任何日志提示原因。
+#
+# A股现行限幅（据 docs/免责声明.md 与本项目既有审查记录，2026-07-06 起 ST 新规）：
+#   主板(60xxxx / 000xxx / 001xxx / 002xxx)  ±10%
+#   创业板(300/301)                           ±20%
+#   科创板(688/689)                           ±20%
+#   北交所(430/830/870/920)                   ±30%
+#   ST：自 2026-07-06 起与所在板块同幅（主板 ST ±10%、创业板/科创板 ST ±20%），
+#       不再单独用 ±5% 的老规则。
+# ─────────────────────────────────────────────────────────────────────
+LIMIT_PCT_DEFAULT = 0.10     # 主板
+LIMIT_PCT_GEM = 0.20         # 创业板
+LIMIT_PCT_STAR = 0.20        # 科创板
+LIMIT_PCT_BSE = 0.30         # 北交所
+
+
+def _limit_pct(code: str, is_st: bool = False) -> float:
+    """按股票代码返回涨跌停幅度。
+
+    is_st 参数保留仅为兼容既有调用方签名：自 2026-07-06 起 ST 与所在板块同幅，
+    不再单独设限。若未来监管规则再次分化，在此按 is_st 加分支即可（改一处）。
+    """
+    c = str(code or "").split(".")[0]
+    if c.startswith(("300", "301")):
+        return LIMIT_PCT_GEM
+    if c.startswith(("688", "689")):
+        return LIMIT_PCT_STAR
+    if c.startswith(("43", "83", "87", "92")):
+        return LIMIT_PCT_BSE
+    return LIMIT_PCT_DEFAULT
+MAX_BUY_VOLUME_RATIO = 1.0  # 单笔买入不得超过当日成交量比例（硬下限：不能买超全天成交量）
+
+BARS_DB = str(Path(__file__).resolve().parent.parent / "data" / "cache" / "bars.db")
+
+
+def _bar_info(code, date):
+    """查 bars.db 取 (preclose, volume, is_st)；缺失/异常软失败返回 (None, None, None)。"""
+    try:
+        con = sqlite3.connect(f"file:{BARS_DB}?mode=ro&immutable=1", uri=True, timeout=3)
+        r = con.execute(
+            "SELECT preclose, volume, is_st FROM daily_bar WHERE code=? AND date=? AND adjust='qfq' LIMIT 1",
+            (code, date)).fetchone()
+        con.close()
+        if r:
+            return r[0], r[1], (r[2] == 1 or r[2] is True)
+    except Exception:
+        pass
+    return None, None, None
 
 
 class PaperAccount:
@@ -84,14 +141,36 @@ class PaperAccount:
         con.close()
 
     # ---------- 下单 ----------
-    def buy(self, code: str, qty: int, date: str, close: float, reason: str = "") -> dict:
-        """买入：收盘价撮合，佣金+印花税(卖)"""
+    def buy(self, code: str, qty: int, date: str, close: float, reason: str = "",
+            prev_close=None, day_volume=None, is_st=None) -> dict:
+        """买入：收盘价撮合，佣金+印花税(卖)
+        账本层强制(P0-1)：① 必须100股整数手；② 涨停拒买；③ 单笔不超过当日成交量。
+        prev_close/day_volume/is_st 可显式传入覆盖；否则自动从 bars.db 读取（缺失则软跳过校验）。
+        """
         if qty <= 0 or close <= 0:
             return {"ok": False, "msg": "参数非法"}
+        if qty % 100 != 0:
+            return {"ok": False, "msg": f"非100股整数手(qty={qty})"}
+        # 涨跌停 / 成交量 校验（bars.db 自取或调用方 override）
+        if prev_close is None or day_volume is None or is_st is None:
+            _pc, _dv, _st = _bar_info(code, date)
+            if prev_close is None:
+                prev_close = _pc
+            if day_volume is None:
+                day_volume = _dv
+            if is_st is None:
+                is_st = _st
+        if prev_close is not None:
+            lim = _limit_pct(code, is_st)
+            limit_up = round(prev_close * (1 + lim), 4)
+            if close >= limit_up - 1e-6:
+                return {"ok": False, "msg": f"涨停({limit_up})无法买入"}
+        if day_volume is not None and qty > day_volume * MAX_BUY_VOLUME_RATIO:
+            return {"ok": False, "msg": f"买入量{qty}超过当日成交量{int(day_volume)}"}
         fee = close * qty * COMMISSION
         cost = close * qty + fee
         if cost > self.cash:
-            qty = int(self.cash / (close * (1 + COMMISSION)))
+            qty = (int(self.cash / (close * (1 + COMMISSION))) // 100) * 100
             if qty <= 0:
                 return {"ok": False, "msg": "现金不足"}
             cost = close * qty + close * qty * COMMISSION
@@ -122,14 +201,34 @@ class PaperAccount:
         con.close()
         return {"ok": True, "qty": qty, "cost": cost, "fee": fee}
 
-    def sell(self, code: str, qty: int, date: str, close: float, reason: str = "") -> dict:
-        """卖出：收盘价撮合，佣金+印花税"""
+    def sell(self, code: str, qty: int, date: str, close: float, reason: str = "",
+             prev_close=None, is_st=None) -> dict:
+        """卖出：收盘价撮合，佣金+印花税
+        账本层强制(P0-1)：① T+1（当日买入不可卖）；② 跌停拒卖。
+        """
         con = self._conn()
-        cur = con.execute("SELECT qty FROM positions WHERE account=? AND code=?",
+        cur = con.execute("SELECT qty, entry_date FROM positions WHERE account=? AND code=?",
                           (self.name, code)).fetchone()
         if cur is None or cur[0] < qty:
             con.close()
             return {"ok": False, "msg": "持仓不足"}
+        # P0-1 账本层 T+1：当日买入不可卖
+        if cur[1] == date:
+            con.close()
+            return {"ok": False, "msg": "T+1限制：当日买入不可卖出"}
+        # 涨跌停校验（bars.db 自取或 override）
+        if prev_close is None or is_st is None:
+            _pc, _dv, _st = _bar_info(code, date)
+            if prev_close is None:
+                prev_close = _pc
+            if is_st is None:
+                is_st = _st
+        if prev_close is not None:
+            lim = _limit_pct(code, is_st)
+            limit_down = round(prev_close * (1 - lim), 4)
+            if close <= limit_down + 1e-6:
+                con.close()
+                return {"ok": False, "msg": f"跌停({limit_down})无法卖出"}
         dup = con.execute(
             "SELECT 1 FROM orders WHERE account=? AND date=? AND code=? AND action='SELL'",
             (self.name, date, code)).fetchone()
@@ -152,7 +251,8 @@ class PaperAccount:
         con.close()
         return {"ok": True, "proceeds": proceeds, "fee": fee}
 
-    def sell_all(self, code: str, date: str, close: float, reason: str = "") -> dict:
+    def sell_all(self, code: str, date: str, close: float, reason: str = "",
+                 prev_close=None, is_st=None) -> dict:
         """清仓某标的"""
         con = self._conn()
         cur = con.execute("SELECT qty FROM positions WHERE account=? AND code=?",
@@ -160,7 +260,8 @@ class PaperAccount:
         con.close()
         if cur is None or cur[0] <= 0:
             return {"ok": False, "msg": "无持仓"}
-        return self.sell(code, cur[0], date, close, reason)
+        return self.sell(code, cur[0], date, close, reason,
+                         prev_close=prev_close, is_st=is_st)
 
     # ---------- 净值 ----------
     def mark_to_market(self, prices: dict, date: str) -> float:

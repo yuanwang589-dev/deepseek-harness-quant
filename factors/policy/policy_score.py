@@ -30,7 +30,11 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-MACRO_DB = Path(r"data\cache\macro.db")
+# ★2026-10-18 修相对路径：原 MACRO_DB = Path(r"data\cache\macro.db") 依赖 cwd，
+#   一旦从别的目录调用（计划任务 / deck / run_task）就 sqlite3 "unable to open database file"，
+#   policy_hook 静默失败 → 择时里政策面永远退化成 50（中性）。改为 BASE 绝对路径。
+MACRO_DB = BASE / "data" / "cache" / "macro.db"
+BARS_DB = BASE / "data" / "cache" / "bars.db"
 EPU_DB = BASE / "data" / "cache" / "policy" / "epu.db"
 
 WEIGHTS = {"epu": -0.35, "epu_chg3m": -0.20, "sf_yoy": 0.30, "spread": 0.15}
@@ -39,6 +43,12 @@ WEIGHTS = {"epu": -0.35, "epu_chg3m": -0.20, "sf_yoy": 0.30, "spread": 0.15}
 def load_panel() -> pd.DataFrame:
     """构造政策面板（月度）：month, epu, epu_chg_3m, sf_yoy_growth, spread"""
     # EPU
+    # ★2026-10-18：库缺失时给明确原因，不要抛 sqlite 的 "unable to open database file"
+    #   （本机构建中 data/cache/policy/epu.db 就不存在 → 政策面恒退化中性，必须让人看见）
+    if not EPU_DB.exists():
+        raise FileNotFoundError(f"EPU 库缺失: {EPU_DB}")
+    if not MACRO_DB.exists():
+        raise FileNotFoundError(f"宏观库缺失: {MACRO_DB}")
     con = sqlite3.connect(str(EPU_DB))
     epu = pd.read_sql_query("SELECT month, epu FROM epu_monthly", con)
     con.close()
@@ -102,7 +112,7 @@ def backtest(panel: pd.DataFrame):
     """评分 → 次月收益检验（需市场收益，独立构造）"""
     import sqlite3 as sq
 
-    con = sq.connect(r"data/cache/bars.db")
+    con = sq.connect(str(BARS_DB))
     bars = pd.read_sql(
         "SELECT date, code, close, is_st FROM daily_bar WHERE adjust='qfq' AND date>='2015-01-01' AND is_st=0",
         con,

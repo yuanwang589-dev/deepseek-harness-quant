@@ -90,6 +90,11 @@ def fetch_daily(code, start="2010-01-01", end=None, adjust="qfq", retries=2):
                                              "close", "preclose", "volume", "amount",
                                              "turn", "pct_chg", "is_st"])
             df = df.rename(columns={"turnover": "turn"})
+            # ★2026-10-15 修复（akshare 备源路径）：新浪返回 date 为 datetime.date，
+            #   而 DailyCache.put_daily 的 bar_meta 累计覆盖逻辑会拿库内"字符串日期"
+            #   与 df 日期做 min/max 比较 → TypeError: '<' not supported between
+            #   'datetime.date' and 'str'。统一转 'YYYY-MM-DD' 字符串（与 baostock 源一致）。
+            df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
             df["code"] = code.upper()
             # 自算 preclose / pct_chg（首行无昨收 → NaN）
             df["preclose"] = df["close"].shift(1)
