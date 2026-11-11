@@ -123,6 +123,6 @@ MIT。仅供研究学习。不构成投资建议。
 
 ## 文档
 
-[资产盘点](docs/资产盘点.md) · [架构说明](docs/架构.md) · [一键部署](docs/一键部署.md) · [快速开始](docs/快速开始.md) · [HARNESS 接入](docs/HARNESS接入.md) · [数据说明](docs/数据说明.md) · [分钟数据接入](docs/分钟数据接入说明.md)
+[资产盘点](docs/资产盘点.md) · [**本机部署与缺口**](docs/本机部署与缺口.md) · [架构说明](docs/架构.md) · [一键部署](docs/一键部署.md) · [快速开始](docs/快速开始.md) · [HARNESS 接入](docs/HARNESS接入.md) · [数据说明](docs/数据说明.md) · [分钟数据接入](docs/分钟数据接入说明.md)
 
 更新机制：`scripts/update.py`（manifest 驱动，用户配置保护，应用前自动备份）。
