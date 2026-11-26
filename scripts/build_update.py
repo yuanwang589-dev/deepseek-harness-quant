@@ -29,7 +29,7 @@ ALLOW_ROOTS = (
     "harness/home/profiles/web/plugins", "harness/home/skills",
 )
 ALLOW_FILES = (
-    "launcher.py", "main.py", "dev_auto.py", "README.md", "LICENSE",
+    "launcher.py", "main.py", "dev_auto.py", "dsh_log.py", "README.md", "LICENSE",
     "CHANGELOG.md", "VERSION", ".gitignore", "AGENTS.md",
     "harness/install.cmd", "requirements.txt",
 )

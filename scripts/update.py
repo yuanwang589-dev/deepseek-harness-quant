@@ -17,7 +17,7 @@
   data/*.py data/demo/build_demo_db.py config/*.example
   harness/home/profiles/web/cordis.patch.yml harness/home/profiles/web/cordis.yml
   harness/home/profiles/web/plugins/ harness/home/skills/
-  harness/install.cmd launcher.py main.py dev_auto.py
+  harness/install.cmd launcher.py main.py dev_auto.py dsh_log.py
   README.md LICENSE CHANGELOG.md VERSION .gitignore docs/ AGENTS.md
 
 保护清单（永不覆盖）：
@@ -43,7 +43,7 @@ ALLOW_ROOTS = (
     "harness/home/profiles/web/plugins", "harness/home/skills",
 )
 ALLOW_FILES = (
-    "launcher.py", "main.py", "dev_auto.py", "README.md", "LICENSE",
+    "launcher.py", "main.py", "dev_auto.py", "dsh_log.py", "README.md", "LICENSE",
     "CHANGELOG.md", "VERSION", ".gitignore", "AGENTS.md",
     "harness/install.cmd", "requirements.txt",
 )
