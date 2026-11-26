@@ -14,6 +14,17 @@
   python data/bulk_loader.py --start 3000   # 从第 N 只开始（分片）
   python data/bulk_loader.py --status       # 查看进度
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import sys
 import time
@@ -73,8 +84,8 @@ def release_single_instance_lock():
             pid_str = LOCK_FILE.read_text(encoding="utf-8").strip()
             if pid_str == str(os.getpid()):
                 LOCK_FILE.unlink()
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "data/bulk_loader.py:76 release_single_instance_lock")
 
 LOG_FILE = BASE / "logs" / "bulk_load.log"
 PROGRESS_FILE = BASE / "logs" / "bulk_load_progress.txt"
@@ -155,8 +166,8 @@ def _append_failed(code: str, reason: str):
     try:
         with open(FAILED_CSV, "a", encoding="utf-8") as f:
             f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S},{code},{reason}\n")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "data/bulk_loader.py:158 _append_failed")
 
 
 def main():

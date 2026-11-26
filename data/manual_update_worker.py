@@ -9,6 +9,17 @@
 
 流程：7z→parquet → [网络预检] 日线增量 → 健康巡检 → 竞价信号 → 机会扫描 → Pitch → 看板刷新
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import json
 import os
 import subprocess
@@ -115,8 +126,8 @@ def run(ts: str):
             print(f"  日线增量(Tushare): {(r.stdout or '').strip().splitlines()[-1] if (r.stdout or '').strip() else '无输出'}")
         except subprocess.TimeoutExpired:
             print("  ⚠ Tushare 日线增量超时")
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/manual_update_worker.py:118 run")
         if tushare_ok:
             summary.append("日线增量: Tushare 秒级完成")
         else:

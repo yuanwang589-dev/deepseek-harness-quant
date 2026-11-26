@@ -20,6 +20,17 @@ strategy/base_pool.py — ★合格底座池（2026-08-07，用户定调：量�
 用法：python strategy/base_pool.py
 输出：output/base_pool.json {date, n, stats, codes[], detail}
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import json
 import sqlite3
 import sys
@@ -76,8 +87,8 @@ def build() -> dict:
         ipo = {str(r[0]).upper(): r[1] for r in con.execute(
             "SELECT code, ipo_date FROM stock_basic WHERE ipo_date IS NOT NULL").fetchall()}
         con.close()
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "strategy/base_pool.py:79 build")
     # H4 市值
     mv = {}
     mf = CACHE / "circ_mv_map_full.csv"
@@ -86,8 +97,8 @@ def build() -> dict:
         try:
             m = pd.read_csv(mf, encoding="utf-8-sig")
             mv = {str(r.ts_code).upper(): float(r.circ_mv) / 10000 for r in m.itertuples()}
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "strategy/base_pool.py:89 build")
 
     # 基本面（最新完整报告期 + 前 3 期单季净利）
     fin = sqlite3.connect(str(CACHE / "finance.db"))

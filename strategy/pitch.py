@@ -21,6 +21,17 @@ strategy/pitch.py — ★Pitch 引擎（2026-08-07，用户定调：优中选优
 输出：output/pitch_report.md（人读）+ output/pitch_report.json（含审批状态）
 审批：python strategy/pitch.py --approve 600519.SH  /  --reject 600519.SH
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import json
 import sqlite3
@@ -33,10 +44,11 @@ warnings.filterwarnings("ignore")
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 from data.cache import DailyCache
+from data.pit import latest_disclosed_period
 from strategy.ranking_v2 import load_basic
 
 CACHE = Path(r"data/cache")
@@ -44,7 +56,7 @@ OUT_JSON = BASE / "output" / "pitch_report.json"
 OUT_MD = BASE / "output" / "pitch_report.md"
 
 MIN_YOY = 25.0          # 单季净利同比门槛 %
-MIN_ROE_ANN = 0.10      # 年化 ROE 门槛
+MIN_ROE_ANN = 10.0      # 年化 ROE 门槛（百分点，与 finance_report.roe 同口径）
 MIN_FSCORE = 5          # F-Score 门槛（质量）
 DIST_RANGE = (10.0, 40.0)  # 距 52 周高点回撤区间 %（10-40）
 MAX_N = 5
@@ -61,8 +73,14 @@ def _load_pool() -> list:
 def _load_finance():
     """最新期基本面：code6 → {period, roe, yoy, prev_yoy}"""
     con = sqlite3.connect(str(CACHE / "finance.db"))
+    # ★2026-11-10 PIT：只用已过法定披露截止日的期
+    _cut = latest_disclosed_period()
     periods = con.execute(
-        "SELECT period, COUNT(DISTINCT code) FROM finance_report GROUP BY period ORDER BY period DESC").fetchall()
+        "SELECT period, COUNT(DISTINCT code) FROM finance_report WHERE period<=? "
+        "GROUP BY period ORDER BY period DESC", (_cut,)).fetchall()
+    if not periods:
+        con.close()
+        return {}, ""
     latest = periods[0][0]
     for pp, n in periods:
         if n >= 500:
@@ -70,7 +88,8 @@ def _load_finance():
             break
     rows = con.execute(
         """SELECT code, period, roe, sq_net_yoy FROM finance_report
-           WHERE period IN (SELECT DISTINCT period FROM finance_report ORDER BY period DESC LIMIT 2)""").fetchall()
+           WHERE period IN (SELECT DISTINCT period FROM finance_report WHERE period<=?
+                            ORDER BY period DESC LIMIT 2)""", (_cut,)).fetchall()
     con.close()
     out = {}
     for code, period, roe, yoy in rows:
@@ -201,7 +220,7 @@ def build_pitch(n=MAX_N, force=False) -> dict:
         cur = recs[latest]
         yoy = cur.get("yoy")
         roe = cur.get("roe")
-        if yoy is None or float(yoy) * 100 < MIN_YOY:
+        if yoy is None or float(yoy) < MIN_YOY:
             continue
         if roe is None or float(roe) < MIN_ROE_ANN:
             continue
@@ -209,10 +228,10 @@ def build_pitch(n=MAX_N, force=False) -> dict:
         prev_yoy = max((float(r.get("yoy") or 0) for r in prev), default=0)
         if prev_yoy <= 0:
             continue
-        cand.append({"code6": c6, "yoy": float(yoy) * 100, "roe": float(roe) * 100,
+        cand.append({"code6": c6, "yoy": float(yoy), "roe": float(roe),
                      "prev_yoy": prev_yoy})
     if not cand:
-        return {"error": f"底座池 {len(pool)} 只中无候选通过成长+质量门槛（yoy≥{MIN_YOY}% & ROE≥{MIN_ROE_ANN*100:.0f}%）", "picks": []}
+        return {"error": f"底座池 {len(pool)} 只中无候选通过成长+质量门槛（yoy≥{MIN_YOY}% & ROE≥{MIN_ROE_ANN:.0f}%）", "picks": []}
     # 技术状态 + F-Score
     codes = [c6 + (".SH" if c6[:2] in ("60", "68") else ".SZ") for c6 in [x["code6"] for x in cand]]
     tech = _tech(codes)
@@ -342,8 +361,8 @@ def main():
                     ensure_ascii=False, indent=1), encoding="utf-8")
                 OUT_MD.write_text("# Pitch 报告\n\n**防守档：只减不加，暂停 pitch。**\n", encoding="utf-8")
                 return 0
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "strategy/pitch.py:353 main")
     d = build_pitch(n=args.n, force=args.force)
     OUT_JSON.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
     write_md(d)

@@ -10,6 +10,17 @@
   - 防猎杀：避开整数位/共识位 + 1-3% 缓冲 + 收盘触发
 
 用法：
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
   from risk.type_stop_rules import type_stop_plan
   plan = type_stop_plan("breakout", score=74.5)
   → {"stop_loss_pct": 0.10, "pivot_check": 0.08, "logic_fail_rules": [...], "desc": "..."}
@@ -175,6 +186,7 @@ def type_stop_plan(otype: str, score: float = None) -> dict:
         "atr_stop_mult": cfg.get("atr_stop_mult"),      # ★实证修正：reversal 用 ATR 宽止损替代固定%
         "trailing_ma": cfg.get("trailing_ma"),
         "max_drawdown_pct": cfg["max_drawdown_pct"],
+        "high_drawdown_exit": cfg.get("high_drawdown_exit"),   # ★高点回撤（配置默认，fill_stop_plan 补）
         "fake_exit_levels": cfg.get("fake_exit_levels", []),   # ★研究员：假突破分级退出
         "ma60_gate": cfg.get("ma60_gate", False),              # ★研究员：反转 MA60 判据
         "anti_hunt": cfg.get("anti_hunt", {}),                 # ★研究员：防猎杀
@@ -188,6 +200,13 @@ def type_stop_plan(otype: str, score: float = None) -> dict:
             plan["max_drawdown_pct"] = round(plan["max_drawdown_pct"] * 1.2, 2)
         elif score < 65:
             plan["max_drawdown_pct"] = round(plan["max_drawdown_pct"] * 0.85, 2)
+    # ★2026-11-20 配置默认值兜底：类型方案里显式 None 的字段（原注释「刻意不设」）改由
+    #   config/params.yaml(risk) 提供，让止损引擎与持仓页展示同源、不再「显示 — 且不设防」。
+    try:
+        from risk.risk_config import fill_stop_plan
+        fill_stop_plan(plan)
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "risk/type_stop_rules.py:197 type_stop_plan")
     return plan
 
 

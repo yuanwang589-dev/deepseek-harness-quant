@@ -15,6 +15,17 @@
   python factors/policy/epu_fetcher.py          # 下载 FRED 全量 + 解析本地 H&L xlsx → 入库
   python factors/policy/epu_fetcher.py --check  # 查看库中数据范围
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import os
 import sqlite3
@@ -47,6 +58,21 @@ def _ctx():
 
 
 def _download(url: str, timeout=30) -> bytes:
+    """抓取 URL 内容。
+
+    ★2026-11-02：FRED 会对非浏览器 TLS 指纹（JA3）直接断连/不返回响应——实测同一台机
+      anaconda python 直连 0.29s 成功，而 uv 版 CPython(.venv) 的 urllib/requests 握手
+      成功但读响应超时（TimeoutError / RemoteDisconnected），换 TLS1.2/1.3、加超时重试均无效。
+      → 优先 curl_cffi 伪装 Chrome 指纹（不依赖解释器 SSL 栈），失败再回退 urllib。
+    """
+    try:
+        from curl_cffi import requests as _curl_requests
+
+        r = _curl_requests.get(url, timeout=timeout, impersonate="chrome", verify=False)
+        if r.status_code == 200 and r.content:
+            return r.content
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/policy/epu_fetcher.py:63 _download")
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     return urllib.request.urlopen(req, timeout=timeout, context=_ctx()).read()
 

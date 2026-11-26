@@ -11,6 +11,17 @@
 
 写入：DailyCache.put_daily（主库被锁自动路由 bars_incr_*.db，增量覆盖）；幂等（已有日期跳过）。
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 
 # ★2026-08-13 黑框隐藏（总指挥要求：计划任务/常驻进程不弹黑框，运行完自动关闭不留窗）
@@ -19,8 +30,8 @@ try:
     _h = ctypes.windll.kernel32.GetConsoleWindow()
     if _h:
         ctypes.windll.user32.ShowWindow(_h, 0)
-except Exception:
-    pass
+except Exception as _dsh_exc:
+    _dsh_swallow(_dsh_exc, "data/incremental_daily_tushare.py:22 <module>")
 
 import json
 import sqlite3
@@ -34,16 +45,39 @@ from pathlib import Path
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
+except Exception as _dsh_exc:
+    _dsh_swallow(_dsh_exc, "data/incremental_daily_tushare.py:37 <module>")
 
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
-from data.fetcher_tushare import _pro, _call
-from data.cache import DailyCache
+from data.cache import CACHE_DIR, DailyCache
+from data.fetcher_tushare import _call, _pro
 
-BARS_DB = r"data\cache\bars.db"
+BARS_DB = CACHE_DIR / "bars.db"
+
+
+def _prev_trade_date(trade_date: str):
+    """库内 < trade_date 的最近交易日（主库+增量库合并）——qfq 复权基准。
+
+    ★2026-11-10 修复：原只读主库 MAX(date)，双库模式下主库滞后 → 除权日虚假跳空。"""
+    _d = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
+    dates = []
+    for p in [BARS_DB] + sorted(CACHE_DIR.glob("bars_incr_*.db"))[-3:]:
+        if not Path(p).exists():
+            continue
+        try:
+            con = sqlite3.connect(Path(p).as_uri() + "?mode=ro&immutable=1", uri=True, timeout=3)
+            try:
+                r = con.execute(
+                    "SELECT MAX(date) FROM daily_bar WHERE adjust='qfq' AND date<?", (_d,)).fetchone()
+            finally:
+                con.close()
+            if r and r[0]:
+                dates.append(r[0])
+        except Exception:
+            continue
+    return max(dates) if dates else None
 
 
 def latest_trade_date(pro=None) -> str:
@@ -80,13 +114,7 @@ def fetch_day(pro, trade_date: str):
     ★2026-08-14 并行化：daily/adj_factor×2/daily_basic 4 路并行拉取（代理服务器 单调用 ~9s，
       串行 ~40-114s → 并行 ~12-20s）"""
     # 先取 prev（本地快，供 adj_factor 基准 + 并行拉取用）
-    try:
-        import sqlite3 as _s
-        con = _s.connect(f"file:{BARS_DB}?mode=ro&immutable=1", uri=True, timeout=3)
-        prev = con.execute("SELECT MAX(date) FROM daily_bar WHERE adjust='qfq'").fetchone()[0]
-        con.close()
-    except Exception:
-        prev = None
+    prev = _prev_trade_date(trade_date)
     prev8 = str(prev).replace("-", "") if prev else None
     # 4 路并行：daily + adj_factor(t) + adj_factor(prev) + daily_basic(is_st)
     from concurrent.futures import ThreadPoolExecutor
@@ -159,32 +187,33 @@ def fetch_day(pro, trade_date: str):
         _prev_st = {}
         try:
             import sqlite3 as _s2
-            _cs = [_s2.connect(f"file:{BARS_DB}?mode=ro&immutable=1", uri=True, timeout=3)]
+            _cs = [_s2.connect(BARS_DB.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=3)]
             try:
-                from data.cache import CACHE_DIR as _CD
                 from pathlib import Path as _P2
+
+                from data.cache import CACHE_DIR as _CD
                 for _p in sorted(_P2(_CD).glob("bars_incr_*.db"))[-3:]:
                     try:
                         _cs.append(_s2.connect(f"file:{_p}?mode=ro&immutable=1", uri=True, timeout=3))
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                    except Exception as _dsh_exc:
+                        _dsh_swallow(_dsh_exc, "data/incremental_daily_tushare.py:187 fetch_day")
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "data/incremental_daily_tushare.py:189 fetch_day")
             for _c in _cs:
                 try:
                     for _code, _mxd, _stv in _c.execute(
                             "SELECT code, MAX(date), MAX(is_st) FROM daily_bar WHERE is_st=1 GROUP BY code"):
                         if _stv == 1 and (_code not in _prev_st or _mxd > _prev_st[_code]):
                             _prev_st[_code] = _mxd
-                except Exception:
-                    pass
+                except Exception as _dsh_exc:
+                    _dsh_swallow(_dsh_exc, "data/incremental_daily_tushare.py:197 fetch_day")
                 finally:
                     try:
                         _c.close()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    except Exception as _dsh_exc:
+                        _dsh_swallow(_dsh_exc, "data/incremental_daily_tushare.py:202 fetch_day")
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/incremental_daily_tushare.py:204 fetch_day")
         # 继承前值：该股最后 ST 日期 ≤30 天 → 视为当前 ST（增量丢列一般 1-3 天，30 天窗口防御足够；
         #   摘帽 >30 天的不误拦）
         _cut = set()
@@ -244,22 +273,30 @@ def main():
 
     # 幂等：bars 已覆盖该日 → 跳过（★#143 双库合并探测——主库写保护后增量库含新数据）
     # ★2026-08-12 协同修复：MAX(date) 只有 183 只占位也判"已有" → 加覆盖率门槛（<4000 只视为残缺需重拉）
+    has = None
     try:
-        con = sqlite3.connect(f"file:{BARS_DB}?mode=ro&immutable=1", uri=True, timeout=3)
-        cur = con.execute("SELECT MAX(date) FROM daily_bar WHERE adjust='qfq'").fetchone()
-        has = cur[0] if cur else None
+        # ★2026-11-10 修复：双库合并 + 跨库 code 去重计数（原只查主库 → 增量写入后主库仍残缺，
+        #   每天误判"残缺日"全市场重拉；且各库 COUNT 相加会把重叠 code 计两次）
+        has = cache.latest_trade_date()
         if has:
-            _n = con.execute("SELECT COUNT(DISTINCT code) FROM daily_bar WHERE date=? AND adjust='qfq'",
-                             (has,)).fetchone()[0]
-            if _n < 4000:
-                print(f"[tushare] {has} 仅 {_n} 只（残缺占位）→ 强制重拉 {date}")
+            _codes = set()
+            for _p in [BARS_DB] + sorted(CACHE_DIR.glob("bars_incr_*.db"))[-3:]:
+                if not Path(_p).exists():
+                    continue
+                try:
+                    _c2 = sqlite3.connect(Path(_p).as_uri() + "?mode=ro&immutable=1", uri=True, timeout=3)
+                    try:
+                        for (_cc,) in _c2.execute(
+                                "SELECT DISTINCT code FROM daily_bar WHERE date=? AND adjust='qfq'", (has,)):
+                            if _cc:
+                                _codes.add(_cc)
+                    finally:
+                        _c2.close()
+                except Exception:
+                    continue
+            if len(_codes) < 4000:
+                print(f"[tushare] {has} 仅 {len(_codes)} 只（残缺占位）→ 强制重拉 {date}")
                 has = None
-        con.close()
-        # ★2026-08-12 协同修复：残缺（has=None）时不再用 latest_trade_date 覆盖（双库探测会拉回占位日）
-        if has is not None:
-            _mx = cache.latest_trade_date()
-            if _mx and _mx > has:
-                has = _mx
         covered = has is not None and str(has) >= f"{date[:4]}-{date[4:6]}-{date[6:]}"
     except Exception:
         covered = False
@@ -291,6 +328,6 @@ if __name__ == "__main__":
         try:
             _logf.write_text(_tb.format_exc(), encoding="utf-8")
             print(f"异常已写 {_logf.name}", file=sys.stderr)
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/incremental_daily_tushare.py:320 <module>")
         sys.exit(1)

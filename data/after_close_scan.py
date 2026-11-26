@@ -9,6 +9,17 @@
 ★安全：各步骤幂等（scheduler latest<=done 自动跳过；scan/pitch 覆盖式重写同文件），
   与 18:30 DailyPipeline 可共存（后者补跑会跳过已完成的评分）。
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import subprocess
 import sys
 import time
@@ -25,8 +36,8 @@ def log(msg: str):
     try:
         with open(LOG, "a", encoding="utf-8") as f:
             f.write(line + "\n")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "data/after_close_scan.py:28 log")
 
 
 def run_step(name, cmd, timeout=1800):

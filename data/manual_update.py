@@ -16,6 +16,17 @@
   POST /api/manual_update → start() → {"ok": true/false, ...}
   GET  /api/update_status → status() → {busy, reason, last, log_tail, ...}
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import glob
 import json
 import os
@@ -67,8 +78,8 @@ def _auto_running() -> bool:
                     return True
             except Exception:
                 continue
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "data/manual_update.py:70 _auto_running")
     return False
 
 
@@ -80,8 +91,8 @@ def _latest_state() -> dict:
     if files:
         try:
             return json.loads(Path(files[-1]).read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/manual_update.py:83 _latest_state")
     return {}
 
 
@@ -140,16 +151,16 @@ def status() -> dict:
     if done_files:
         try:
             last = json.loads(Path(done_files[-1]).read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/manual_update.py:143 status")
     # 最近日志尾部（running 任务的日志或最新日志）
     log_tail = []
     logs = sorted(glob.glob(str(LOGS / "manual_update_2*.log")), key=os.path.getmtime)
     if logs:
         try:
             log_tail = Path(logs[-1]).read_text(encoding="utf-8", errors="replace").splitlines()[-20:]
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/manual_update.py:151 status")
     return {
         "busy": busy,
         "reason": reason,

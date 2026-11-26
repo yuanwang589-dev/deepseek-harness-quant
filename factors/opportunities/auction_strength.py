@@ -19,6 +19,17 @@
   python factors/opportunities/auction_strength.py --start 2019-01 --end 2019-01   # 信号计算
   python factors/opportunities/auction_strength.py --status                        # 输出概况
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import glob
 import io
@@ -184,8 +195,8 @@ def main():
                 _mx = max(r.keys()) if r else ""
                 print(f"数据源未更新（日期集合与已有文件相同，最新 {_mx}），跳过写文件")
                 return 0
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/auction_strength.py:187 main")
     # ★2026-08-10 输出时间戳文件名（防环境写保护+保留历史；读取方 glob 取最新）
     out_path = Path(args.out) if args.out else OUT
     if args.out is None:

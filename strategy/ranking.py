@@ -5,6 +5,17 @@
 
 输出：排名榜 DataFrame（含各因子分项 + 综合分 + 状态标签）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import sys
 from pathlib import Path
 
@@ -123,8 +134,8 @@ def rank_market(closes: pd.DataFrame, asof=None, weights=None,
         for f in FUND_SCORE_FACTORS:
             if f in snap.columns:
                 df[f] = df["code"].map(snap[f])
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "strategy/ranking.py:126 rank_market")
     for name, series in details.items():
         df[name] = series.values
     df = df.sort_values("综合分", ascending=False).reset_index(drop=True)

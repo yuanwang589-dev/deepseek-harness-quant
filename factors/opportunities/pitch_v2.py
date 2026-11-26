@@ -27,6 +27,17 @@ logs/pitch_v2_20260809_192738_AIAUTO.json。若需回退，恢复备份即可。
   python factors/opportunities/pitch_v2.py                 # 用最新 opp_pool_*.json
   python factors/opportunities/pitch_v2.py --pool xxx.json # 指定池文件
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import json
 import sqlite3
@@ -313,8 +324,8 @@ def build(pool_path: Path = None) -> tuple:
         if _bc:
             _bd = json.loads(open(_bc[-1], encoding="utf-8").read())
             _badge_map = {b.get("otype"): b for b in (_bd.get("badges") or [])}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/pitch_v2.py:316 build")
 
     out_pitch = []
     for o in pitch:
@@ -414,8 +425,8 @@ def build(pool_path: Path = None) -> tuple:
         n_w = one_word_disclosure(out_pitch)
         if n_w:
             print(f"  [短线因子] 一字板披露 {n_w} 只（当日不可买，T+1 再评估）")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/pitch_v2.py:417 build")
     OUT_FILE.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
     return result, OUT_FILE
 

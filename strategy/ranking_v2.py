@@ -18,6 +18,17 @@
   python strategy/ranking_v2.py                 # 生成 output/ranking_top.json（Top 30）
   python strategy/ranking_v2.py --n 10          # Top 10
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import json
 import sqlite3
@@ -38,6 +49,7 @@ import pandas as pd
 #   （门户“观察池数据不通”）。改走 data.cache.CACHE_DIR（唯一读取接口、配置驱动），
 #   符合项目铁律“数据/路径不写死”。
 from data.cache import CACHE_DIR
+from data.pit import latest_disclosed_period
 
 BARS_DB = CACHE_DIR / "bars.db"
 FIN_DB = CACHE_DIR / "finance.db"
@@ -69,10 +81,10 @@ def load_close_panel(days=300, end=None) -> pd.DataFrame:
                     _c.close()
                     if _m and _m > last:
                         last = _m
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as _dsh_exc:
+                    _dsh_swallow(_dsh_exc, "strategy/ranking_v2.py:73 load_close_panel")
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "strategy/ranking_v2.py:75 load_close_panel")
     # ★2026-10-16 性能修复：原「date<=last」= 读全表（1386 万行）再 pivot 5000+ 列
     #   → 数分钟/超时（三层池长期跑不出产物）。改只取最后 days 个交易日，
     #   结果等价（原逻辑同样读全表 pivot 后再 tail(days)）。
@@ -98,10 +110,10 @@ def load_close_panel(days=300, end=None) -> pd.DataFrame:
                     df = pd.concat([df, _df2], ignore_index=True).drop_duplicates(
                         subset=["date", "code"], keep="last")
                 _c.close()
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "strategy/ranking_v2.py:102 load_close_panel")
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "strategy/ranking_v2.py:104 load_close_panel")
     con.close()
     p = df.pivot_table(index="date", columns="code", values="close")
     v = df.pivot_table(index="date", columns="code", values="volume")
@@ -126,12 +138,14 @@ def load_fundamentals(end=None) -> pd.DataFrame:
       注：本函数仅 strategy 侧 rank() 使用；factors/opportunities/scan.py 另有独立同名
       函数（被 market_env/breakout_monitor/pitch_replay 使用），不在本次修改范围。"""
     con = sqlite3.connect(str(FIN_DB))
+    # ★2026-11-10 PIT：end 时点已过法定披露截止日的最近一期（原 period<=end 会用未披露财报）
+    _cut = latest_disclosed_period(end)
     sql = """SELECT f.code, f.period, f.roe, f.sq_net_yoy, f.revenue, f.net_profit
              FROM finance_report f
              JOIN (SELECT code, MAX(period) p FROM finance_report
                    WHERE period <= ? GROUP BY code) m ON f.code=m.code AND f.period=m.p
              WHERE f.period >= '2018-01-01'"""
-    df = pd.read_sql(sql, con, params=(end or "2099-12-31",))
+    df = pd.read_sql(sql, con, params=(_cut,))
     con.close()
     df = df.drop_duplicates("code")
     df = df.rename(columns={"sq_net_yoy": "nyoy"})

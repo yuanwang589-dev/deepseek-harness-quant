@@ -20,6 +20,17 @@
   python factors/opportunities/stock_check.py 000650
   Deck 路由 GET /api/stock_check?code=000650
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import glob
 import json
@@ -62,8 +73,8 @@ def _load_valuation():
             last = json.loads(Path(snaps[-1]).read_text(encoding="utf-8"))
             if last.get("date") == today and isinstance(last.get("data"), dict):
                 return last["data"]
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:65 _load_valuation")
     try:
         from factors.opportunities import scan as S
         v = S.load_valuation() or {}
@@ -73,8 +84,8 @@ def _load_valuation():
             try:
                 p = BASE / "logs" / f"valuation_snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
                 p.write_text(json.dumps(snap, ensure_ascii=False), encoding="utf-8")
-            except Exception:
-                pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:76 _load_valuation")
     except Exception:
         v = {}
     return v
@@ -85,8 +96,8 @@ def _latest_pool():
     if files:
         try:
             return json.loads(Path(files[-1]).read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:88 _latest_pool")
     return {}
 
 
@@ -95,8 +106,8 @@ def _latest_tech_pitch():
     if files:
         try:
             return json.loads(Path(files[-1]).read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:98 _latest_tech_pitch")
     return {}
 
 
@@ -105,8 +116,8 @@ def _latest_pitch():
     if files:
         try:
             return json.loads(Path(files[-1]).read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:108 _latest_pitch")
     return {}
 
 
@@ -115,8 +126,8 @@ def _latest_pitch_track():
     if files:
         try:
             return json.loads(Path(files[-1]).read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:118 _latest_pitch_track")
     return {}
 
 
@@ -223,8 +234,8 @@ def _build_linkage(code: str) -> dict:
                 _fwd = _e.get("fwd") or {}
                 out["pool_fwd"] = {h: (_fwd.get(h) or {}).get("ret") for h in ("t1", "t5", "t20")}
                 break
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:226 _build_linkage")
     try:
         import glob as _g, json as _j, os as _o
         from pathlib import Path as _P
@@ -239,8 +250,8 @@ def _build_linkage(code: str) -> dict:
                         out["factors"] = _pm.get("factors")
                     if _pm.get("signal_family"):
                         out["signal_family"] = _pm.get("signal_family")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:242 _build_linkage")
     return out
 
 
@@ -268,8 +279,8 @@ def check(code6: str) -> dict:
                 name = str(row.get("name", code6))
                 industry = str(row.get("industry", ""))
                 break
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:271 check")
     code = full_code
 
     # 数据日期（★#143 双库合并探测——主库写保护后增量库含最新日）
@@ -281,8 +292,8 @@ def check(code6: str) -> dict:
         _mx = _DC().latest_trade_date()
         if _mx and _mx > pdate:
             pdate = _mx
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:284 check")
 
     # ---------- ① 机会引擎交叉（用最新机会池，不重算）----------
     pool = _latest_pool()
@@ -406,8 +417,8 @@ def check(code6: str) -> dict:
                 val_score += 4
             elif float(roe) < 0:
                 val_score -= 4
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:409 check")
     val_score = max(-10, min(15, val_score))
     if val_dim["pb"] is None and val_dim["pe"] is None:
         val_dim["mode"] = "无估值数据"
@@ -437,8 +448,8 @@ def check(code6: str) -> dict:
         else:
             risk_dim["level"] = "NO_DATA"
             risk_dim["flags"] = ["质量数据未覆盖"]
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:440 check")
     try:
         from factors.opportunities.pitch_v2 import load_beneish
         m = load_beneish().get(code, {})
@@ -451,8 +462,8 @@ def check(code6: str) -> dict:
                 risk_score += 3
             elif lv == "HIGH":
                 risk_score -= 20
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:454 check")
     try:
         from risk.fake_signal_flags import compute_flags
         con = _ro_conn(BARS_DB)
@@ -466,8 +477,8 @@ def check(code6: str) -> dict:
                 risk_score -= 20
             elif lvl in ("WARN", "警告"):
                 risk_score -= 3
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:469 check")
     risk_score = max(-30, min(30, risk_score))
 
     # ---------- 交叉综合 ----------
@@ -523,8 +534,8 @@ def check(code6: str) -> dict:
         try:
             from risk.type_stop_rules import type_stop_plan
             stop_plan = type_stop_plan(opp["otype"], opp.get("score"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:526 check")
 
     # ★2026-08-11 百轮#44：信号联动（信号族/信号分/无效因子——#35 后 opp 自带）
     signal = None
@@ -547,8 +558,8 @@ def check(code6: str) -> dict:
                 "families": _fams,
                 "factors": {f: round(v.get("rank", 0), 3) for f, v in _sh.items()},
             }
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:550 check")
     # ★2026-08-12 百轮#73：FRC 因子风控状态（#65 落地——该股机会触发因子的 eff 降权/禁用）
     frc = None
     try:
@@ -566,8 +577,8 @@ def check(code6: str) -> dict:
                 _n0 = sum(1 for e in _effs if e["eff"] == 0)
                 _nlt = sum(1 for e in _effs if 0 < e["eff"] < 1)
                 frc = {"n": len(_effs), "n_disabled": _n0, "n_down": _nlt, "factors": _effs[:12]}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:569 check")
     # ★2026-08-11 百轮#44：远期表现（入池后实际收益 T+1/T+5/最新）
     forward = None
     if track_entries:
@@ -594,8 +605,8 @@ def check(code6: str) -> dict:
                     "target": _p.get("target"),
                 }
                 break
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/stock_check.py:597 check")
 
     return {
         "ok": True, "code": code, "code6": code.split(".")[0], "name": name,

@@ -12,6 +12,17 @@
   python risk/position_monitor.py --codes 600519.SH,000001.SZ
   python risk/position_monitor.py --limit 50             # 持仓太多时限制样本
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import json
 import sys
@@ -173,13 +184,13 @@ def main():
                 p_ts = OUT_DIR / f"position_risk_{_t.strftime('%Y%m%d_%H%M%S')}.json"
                 try:
                     p_ts.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-                except Exception:
-                    pass
+                except Exception as _dsh_exc:
+                    _dsh_swallow(_dsh_exc, "risk/position_monitor.py:176 main")
                 try:
                     (OUT_DIR / "position_risk.json").write_text(
                         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-                except Exception:
-                    pass
+                except Exception as _dsh_exc:
+                    _dsh_swallow(_dsh_exc, "risk/position_monitor.py:181 main")
                 print(f"（空仓 → 输出空风控 {p_ts.name}）")
                 return
             codes = load_v3_holdings(date, limit=args.limit)
@@ -193,12 +204,12 @@ def main():
     p_ts = OUT_DIR / f"position_risk_{_t.strftime('%Y%m%d_%H%M%S')}.json"
     try:
         p_ts.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "risk/position_monitor.py:196 main")
     try:
         (OUT_DIR / "position_risk.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "risk/position_monitor.py:200 main")
 
     if "error" in result:
         print("ERROR:", result["error"])

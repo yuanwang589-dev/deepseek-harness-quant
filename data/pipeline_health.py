@@ -10,6 +10,17 @@
   python data/pipeline_health.py            # 探测并落盘
   python data/pipeline_health.py --alerts   # 直接输出告警列表（供 API 调试）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import glob
 import json
@@ -76,8 +87,8 @@ def main():
     try:
         (LOG_DIR / "pipeline_health.json").write_text(
             json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "data/pipeline_health.py:79 main")
     print("✅ 管道健康已落盘: {}".format(p.name))
     for n, r in data["results"].items():
         print("  {}: {} | age {}h".format(n, "✅" if r["ok"] else "❌", r["age_h"]))

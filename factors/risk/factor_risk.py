@@ -13,6 +13,17 @@
 
 数据源：量化代码库思路库/因子池/output/health/health_*.csv（glob 取最新）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import csv
 import glob
 import json
@@ -150,8 +161,8 @@ def build() -> Path:
             _md = _js.load(open(_mfs[-1], encoding="utf-8"))
             lowfreq = {x.get("code") for x in _md.get("factors", [])
                        if x.get("category") == "fundamental_lowfreq"}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/risk/factor_risk.py:153 build")
     strong_all = []
     # ★2026-08-14 组合层负超额实证（因子池 12:15 留言）：lhb_jg_cnt_20 截面 ICIR 1.516 全库前三，
     #   但组合层 -5.63pp / 6/7 负年（中小盘域 Top10% 市值中性、季度调仓、含成本）——
@@ -255,8 +266,8 @@ def build() -> Path:
                     "replace_with": "turnover / turn_std20（F3 同族）" if (_num(_r, "icir120") is not None and _num(_r, "icir120") < 0.5) or (_num(_r, "ic60_short") is not None and _num(_r, "ic60_short") < 0) else "",
                 }
                 break
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/risk/factor_risk.py:258 build")
     out = {
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source_health": files[-1] if (files := sorted(glob.glob(str(HEALTH_DIR / "health_*.csv")))) else "",
@@ -285,8 +296,8 @@ def latest() -> dict:
     if files:
         try:
             return json.loads(Path(files[-1]).read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/risk/factor_risk.py:288 latest")
     return {}
 
 

@@ -16,6 +16,17 @@
   block_rate  = 跌幅榜中风控标记比例（风控层有效性）
   avg_gain_hit / avg_gain_miss = 命中 vs 未命中的平均涨幅（命中是否有 alpha）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import glob
 import json
 import os
@@ -59,8 +70,8 @@ def _latest(pattern, subdir="logs"):
     if files:
         try:
             return json.loads(Path(files[-1]).read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/rank_live.py:62 _latest")
     return {}
 
 
@@ -97,8 +108,8 @@ def _risk_marks():
                     lv = v.get("level") if isinstance(v, dict) else None
                     if lv in ("HIGH", "WATCH"):
                         marks[c] = f"Beneish {lv}"
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "data/rank_live.py:100 _risk_marks")
     # 质量风控（logs/stock_risk_map*.json + output/stock_risk_map.json；results 为 dict）
     try:
         for pat, sub in (("stock_risk_map_v2*.json", "logs"), ("stock_risk_map*.json", "logs"),
@@ -112,8 +123,8 @@ def _risk_marks():
                         if lv in ("BLOCK", "WATCH"):
                             marks[c] = marks.get(c, "") + f" 风控{lv}"
                 break
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "data/rank_live.py:115 _risk_marks")
     return marks
 
 
@@ -222,8 +233,8 @@ def compute(date: str = None) -> dict:
     try:
         (BASE / "deck" / f"rank_live_{ts}.json").write_text(
             json.dumps(out, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "data/rank_live.py:225 compute")
     # ★缓存（数据版本 + 1h）
     _cache.update({"ts": time.time(), "ver": ver, "data": out})
     return out
@@ -259,8 +270,8 @@ def accumulate(result: dict) -> list:
     try:
         out_f = BASE / "logs" / f"rank_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         out_f.write_text(json.dumps(hist, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "data/rank_live.py:262 accumulate")
     return hist[-30:]  # 最近 30 天
 
 

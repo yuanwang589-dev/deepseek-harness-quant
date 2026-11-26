@@ -12,6 +12,17 @@
   python data/daily_pipeline.py
   python data/daily_pipeline.py --minute-dir "D:/.../每日数据" --skip-scan
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 
 # ★2026-08-13 黑框隐藏（总指挥要求：计划任务/常驻进程不弹黑框，运行完自动关闭不留窗）
@@ -20,13 +31,13 @@ try:
     _h = ctypes.windll.kernel32.GetConsoleWindow()
     if _h:
         ctypes.windll.user32.ShowWindow(_h, 0)
-except Exception:
-    pass
+except Exception as _dsh_exc:
+    _dsh_swallow(_dsh_exc, "data/daily_pipeline.py:23 <module>")
 
+import glob
 import subprocess
 import sys
 import time
-import glob
 from datetime import datetime
 from pathlib import Path
 
@@ -85,23 +96,28 @@ def run_step(name, cmd, timeout=3600):
 def health_check():
     """数据健康巡检：重复行/最新日期/覆盖率"""
     import sqlite3
-    con = sqlite3.connect("file:data/cache/bars.db?mode=ro&immutable=1", uri=True, timeout=3)
+
+    from data.cache import CACHE_DIR
+    _main = CACHE_DIR / "bars.db"
+    if not _main.exists():
+        log(f"  [巡检] bars.db 不存在（{_main}）→ 跳过")
+        return True
+    con = sqlite3.connect(_main.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=3)
     dup = con.execute("SELECT COUNT(*) FROM (SELECT code,date,adjust,COUNT(*) c FROM daily_bar GROUP BY code,date,adjust HAVING c>1)").fetchone()[0]
     # ★#143 双库合并探测最新日（08-12 起增量写 bars_incr_*.db，单库会误报旧日）
     latest = con.execute("SELECT MAX(date) FROM daily_bar WHERE adjust='qfq'").fetchone()[0]
     try:
-        from pathlib import Path as _P
-        for _p in sorted(_P("data/cache").glob("bars_incr_*.db"))[-3:]:
+        for _p in sorted(CACHE_DIR.glob("bars_incr_*.db"))[-3:]:
             try:
-                _c = sqlite3.connect(f"file:{_p}?mode=ro&immutable=1", uri=True, timeout=3)
+                _c = sqlite3.connect(_p.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=3)
                 _m = _c.execute("SELECT MAX(date) FROM daily_bar WHERE adjust='qfq'").fetchone()[0]
                 _c.close()
                 if _m and _m > latest:
                     latest = _m
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "data/daily_pipeline.py:106 health_check")
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "data/daily_pipeline.py:108 health_check")
     bs = con.execute("SELECT COUNT(DISTINCT code) FROM daily_bar WHERE date=? AND adjust='qfq' AND (code LIKE 'sh.%' OR code LIKE 'sz.%')", (latest,)).fetchone()[0]
     con.close()
     log(f"  [巡检] bars.db 重复={dup} | 最新={latest}（双库合并） | 残留baostock格式={bs}")
@@ -128,6 +144,9 @@ def main():
             log("⚠ 另一管道（dev_auto/手动更新）正在运行中（锁未过期）→ 本轮跳过，避免并发写冲突")
             return
         _lock.write_text(str(time.time()), encoding="utf-8")
+        # ★2026-11-10：任何退出路径（含周末早退/异常）都清理锁，避免残留导致后续 2h 被跳过
+        import atexit as _atexit
+        _atexit.register(lambda p=_lock: p.unlink(missing_ok=True))
     except Exception as _e:
         log(f"锁检查异常（继续执行）: {_e}")
 
@@ -151,7 +170,8 @@ def main():
             [PY, "-X", "utf8", str(BASE / "data" / "incremental_daily_tushare.py")],
             capture_output=True, text=True, timeout=300, encoding="utf-8", errors="replace",
             stderr=subprocess.STDOUT)
-        _tushare_ok = _rt.returncode == 0 and ("已入库" in (_rt.stdout or ""))
+        _tushare_ok = _rt.returncode == 0 and (
+            "已入库" in (_rt.stdout or "") or "已在库" in (_rt.stdout or ""))
         log(f"日线增量(Tushare): {(_rt.stdout or '').strip().splitlines()[-1] if (_rt.stdout or '').strip() else '无输出'}")
     except subprocess.TimeoutExpired:
         _tushare_ok = False
@@ -181,15 +201,18 @@ def main():
         log("  ⚠ 外包因子池 scheduler 不存在（路径变更？）→ 跳过补跑")
     # 2.8) ★2026-09-02 因子池清单落盘（接 builtin_purify 到 daily_pipeline，外包缺失时走内建）
     run_step("因子池清单", [PY, "-X", "utf8", str(BASE / "data" / "factorpool" / "build_pool.py")], timeout=60)
-    # 2.9) ★2026-09-02 今日信号聚合（7 源 → daily_signal.json，替换 live_holdings 红绿灯 fallback）
-    run_step("今日信号聚合", [PY, "-X", "utf8", str(BASE / "report" / "daily_signal.py")], timeout=60)
+    # 2.9) ★2026-11-10 移除：原此处跑 daily_signal（早于 scan/pitch，聚合的是上一交易日产物）；
+    #   统一由链尾「今日信号（择时/审计）」在全部产物生成后执行一次。
     # 3) 健康巡检
     health_check()
+    # ★2026-11-10 数据审计闸门报告（scan 入口读它；strict=false 时只告警不阻断）
+    run_step("数据审计（闸门报告）", [PY, str(BASE / "risk" / "data_audit.py")], timeout=600)
     # 3.5) ★竞价强度信号（T-3 交付物，2026-08-09 接入：分钟增量入库后自动算近 3 月信号存档）
     #     用途：① 数据积累（每日 9:35 前信号）② ★反信号防守（2026-08-10：scan.py 读最新信号，
     #     strength≥6 机会池减分——60 天时效内真实生效）；★2026-08-10 修复：默认参数只算 2019 年
     #     → 动态算近 3 个月（含 20 日预热）
-    from datetime import datetime as _dt, timedelta as _td
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
     _now = _dt.now()
     _start = (_now - _td(days=95)).strftime("%Y-%m")
     _end = _now.strftime("%Y-%m")
@@ -223,6 +246,8 @@ def main():
             log(f"  实盘止损/止盈扫描跳过（portfolio 无 holding 持仓，当前 {_n_hold} 只）")
     else:
         log("  实盘止损扫描跳过（无 portfolio 时间戳文件，未买入）")
+    # ★2026-11-20 L2 台账自动买卖：无条件执行——持仓被一次性清空时也要能自动买入前 N
+    run_step("台账自动买卖", [PY, "-X", "utf8", str(BASE / "strategy" / "auto_execute.py")], timeout=300)
     # ★2026-08-11 观察池/决策池数据流补全（百轮#1：用户反馈"观察池数据不通"根因——
     #   pool_layers/daily_signal/远期池/突破监控 不在 17:30 管道链 → 页面停留旧数据 08-10）
     run_step("三层池（观察/候选/决策）", [PY, "-X", "utf8", str(BASE / "strategy" / "pool_layers.py"),
@@ -242,8 +267,8 @@ def main():
     log("=== 每日数据管道完成 ===")
     try:
         _lock.unlink(missing_ok=True)
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "data/daily_pipeline.py:259 main")
 
 
 if __name__ == "__main__":

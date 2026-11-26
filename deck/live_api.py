@@ -7,6 +7,17 @@
   /api/live/audit    → 数据审计实时（logs/audit 最新）
   /api/live/pools    → 各池状态汇总（机会/Pitch/科技/止损/待处理计数）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import glob
 import json
 import os
@@ -55,8 +66,8 @@ def _read(pattern: str, subdir: str = "logs") -> dict:
                 _READ_CACHE.clear()
             _READ_CACHE[_key] = (_mt, _data)
             return _data
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:58 _read")
     return {}
 
 
@@ -82,7 +93,7 @@ def live_forward(force: bool = False) -> dict:
             and now - _fwd_cache["ts"] < 3600:
         return _fwd_cache["data"]
     try:
-        from factors.opportunities.pitch_track import update_fwd, summary
+        from factors.opportunities.pitch_track import summary, update_fwd
         pool = update_fwd()
         s = summary()
     except Exception as e:
@@ -115,8 +126,8 @@ def live_forward(force: bool = False) -> dict:
                         mx = _m
                 except Exception:
                     continue
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:118 live_forward")
     out = {
         "ok": True,
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -141,8 +152,8 @@ def live_factors() -> dict:
             out["archive"] = json.loads(arch_f.read_text(encoding="utf-8"))
             out["sources"]["archive"] = time.strftime("%Y-%m-%d %H:%M",
                                                       time.localtime(arch_f.stat().st_mtime))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:144 live_factors")
     # 增强报告
     enh = _read("factor_pool_report_enhanced_*.json", "report")
     if enh:
@@ -195,8 +206,8 @@ def live_factors() -> dict:
             }
             out["sources"]["backtest"] = time.strftime("%Y-%m-%d %H:%M",
                                                        time.localtime(btf.stat().st_mtime))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:198 live_factors")
     return out
 
 
@@ -209,8 +220,8 @@ def live_audit() -> dict:
             d["generated_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(f.stat().st_mtime))
             d["file"] = f.name
             return d
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:212 live_audit")
     return {"ok": False, "error": "审计文件缺失"}
 
 
@@ -229,8 +240,8 @@ def live_opp() -> dict:
                   {p.get("code") for p in d.get("pitch", [])}
         for o in ops:
             o["in_pitch"] = o.get("code") in _pcodes
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:232 live_opp")
     # ★2026-08-12 百轮#103：降权类型标记（实盘裁决体系落池——浏览机会池即知哪些类型降权）
     #   按 otype_name 匹配 down_warn label（短线情绪/价值重估 → 🔻 降权提示中）
     try:
@@ -238,8 +249,8 @@ def live_opp() -> dict:
         for o in ops:
             _otn = o.get("otype_name") or ""
             o["down_type"] = _otn if _otn in _dwl else None
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:241 live_opp")
     cards = {}
     try:
         cf = _latest_file("策略标注卡片*.json", "output")
@@ -250,8 +261,8 @@ def live_opp() -> dict:
             for c in cd:
                 if isinstance(c, dict) and c.get("id"):
                     cards[c["id"]] = c
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:253 live_opp")
     # 双轨标记（复用 stock_check._is_tech：行业白名单 + 创业板/科创板）
     try:
         import sys as _s
@@ -296,17 +307,20 @@ def live_opp() -> dict:
             "n_passed": ds.get("n_passed", "—"),
             "advice": str(ds.get("advice", "—"))[:60],
         }
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:299 live_opp")
     # ★2026-08-11 百轮#46：Pitch 一致性——机会池页展示的 pitch 用 pitch_v2（已过持有期过滤），
     #   与 Pitch 决策台同源（opp_pool.pitch 11 只未过滤 vs pitch_v2 10 只会让两页数字不一致）
-    pitch_show = d.get("pitch", [])
+    import copy as _copy
+    pitch_show = _copy.deepcopy(d.get("pitch", []))
     try:
         _pv = _read("pitch_v2_*.json")
         if _pv and _pv.get("pitch"):
-            pitch_show = _pv.get("pitch")
-    except Exception:
-        pass
+            import copy as _copy
+            pitch_show = _copy.deepcopy(_pv.get("pitch"))   # 补值不改 _read 缓存
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:310 live_opp")
+    fill_pitch_stops(pitch_show)
     # ★2026-08-12 用户需求#180：系统建议标记 + 补位——daily_signal 的 hold_plan（策略决策池 20 只）
     #   与 scan 触发信号（196 只）是两条管线，建议里不在机会池的补进来（📌 建议标记），
     #   用户机会池一屏看全系统建议
@@ -331,8 +345,8 @@ def live_opp() -> dict:
                                 "note": "系统建议（策略决策池）", "industry": ""})
                     _have.add(_c)
                     n_suggested += 1
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:337 live_opp")
     return {
         "ok": True,
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -361,8 +375,8 @@ def live_watch() -> dict:
             for it in d.get(_layer, []):
                 _otn = it.get("otype_name") or it.get("otype") or ""
                 it["down_type"] = _otn if _otn in _dwl else None
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:367 live_watch")
     return {
         "ok": True,
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -377,6 +391,15 @@ def live_watch() -> dict:
     }
 
 
+def _risk_defaults() -> dict:
+    """config/params.yaml → risk 段默认止损/止盈（单一真源 risk/risk_config.py）。"""
+    try:
+        from risk.risk_config import risk_defaults
+        return risk_defaults()
+    except Exception:
+        return {}
+
+
 def live_holdings() -> dict:
     """持有池聚合：组合风控 + 模拟盘双轨 + 今日清单 + 真实持仓 + ★止盈状态（2026-08-11 百轮#4）"""
     pr = _read("position_risk_*.json", "report")   # ★2026-08-11 百轮#11 时间戳版 glob（固定名被锁）
@@ -384,6 +407,7 @@ def live_holdings() -> dict:
     ds = _read("daily_signal_*.json", "output")   # ★2026-08-10 时间戳版 glob
     tp = _read("take_profit_signals_*.json")      # ★2026-08-11 止盈引擎（持仓止盈状态）
     sa = _read("stop_alerts_*.json")              # ★2026-08-11 止损预警（池级监测）
+    ss = _read("stop_signals_*.json")             # ★2026-11-10 持仓级止损信号（原只写不读）
     pf = {}
     try:
         import sys as _s
@@ -391,8 +415,16 @@ def live_holdings() -> dict:
             _s.path.insert(0, str(BASE))
         from strategy.portfolio import _load
         pf = _load()
-    except Exception:
-        pass
+        # ★2026-11-20 风控卡口径：position_risk 可能是旧快照（本次 11-19 的 per_stock 恰好是
+        #   已删除的 14 条 over_limit 代码），按当前真实持仓过滤，避免「风控 14/14」看着没清干净
+        if isinstance(pr, dict) and (pr.get("per_stock") or pr.get("positions")):
+            _held_set = {p.get("code") for p in (pf.get("positions") or [])
+                         if p.get("status") == "holding"}
+            _k = "per_stock" if pr.get("per_stock") is not None else "positions"
+            pr = dict(pr)
+            pr[_k] = [x for x in (pr.get(_k) or []) if x.get("code") in _held_set]
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:415 live_holdings")
     # ★止盈状态挂到持仓条目（按 code 匹配）
     tp_map = {}
     if tp and isinstance(tp.get("positions"), list):
@@ -422,8 +454,56 @@ def live_holdings() -> dict:
             _p["otype_name"] = (_ti or {}).get("label")
             if _ot in _down_set:
                 _p["down_type"] = (_ti or {}).get("label") or _ot
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:446 live_holdings")
+    # ★2026-11-20 止损/止盈展示 = 止损引擎同源值：stop_matrix_v2.json 缺失 → 引擎用
+    #   type_stop_plan（已按 config/params.yaml 兜底）。展示层直接取它，页面所见即引擎判定。
+    #   只写本次响应，不落盘持仓文件。
+    _rd = _risk_defaults()
+    try:
+        from risk.type_stop_rules import type_stop_plan as _tsp
     except Exception:
-        pass
+        _tsp = None
+    for _p in pf.get("positions", []):
+        _sp = _p.get("stop_plan") if isinstance(_p.get("stop_plan"), dict) else {}
+        _eng = {}
+        if _tsp:
+            try:
+                _eng = _tsp(_p.get("otype") or "value", None) or {}
+            except Exception:
+                _eng = {}
+        _filled = False
+        for _k in ("stop_loss_pct", "time_stop_weeks", "max_drawdown_pct",
+                   "high_drawdown_exit", "trailing_ma"):
+            if _sp.get(_k) is None:
+                _v = _eng.get(_k)
+                if _v is None and _rd:
+                    _v = _rd.get(_k)
+                if _v is not None:
+                    _sp[_k] = _v
+                    _filled = True
+        if _filled:
+            _sp["estimated"] = True   # ★按类型/配置补出来的方案（非审批时的专属止损）
+        _p["stop_plan"] = _sp
+        _tp = _p.get("take_profit")
+        if (not isinstance(_tp, dict)) or _tp.get("target_pct") is None:
+            # ★2026-11-20 引擎尚未产出（新买入当日）时，按类型规则兜底——
+            #   不能无条件填 20%，否则 value/quality_gap 会显示「+20%」违背类型目标
+            _rule = {}
+            try:
+                from risk.take_profit_check import tp_rule_for as _tp_rule
+                _rule = _tp_rule(_p.get("otype") or "value") or {}
+            except Exception:
+                _rule = {}
+            _low = _rule.get("target_pct")
+            if _low is None:
+                _low = _rd.get("take_profit_low")
+            if _low is not None:
+                _tp = dict(_tp) if isinstance(_tp, dict) else {}
+                _tp["target_pct"] = _low
+                _tp["pullback_pct"] = _rule.get("pullback_pct")
+                _tp["estimated"] = True    # 引擎未产出，按类型规则推导
+                _p["take_profit"] = _tp
     # ★2026-08-12 百轮后#119：持仓名称/行业补全（portfolio 无 name/industry 字段——
     #   stock_basic 匹配；名称缺失曾导致持仓显示为裸 code）
     try:
@@ -437,8 +517,8 @@ def live_holdings() -> dict:
                     _p["name"] = _r[0] or _c
                     _p["industry"] = _r[1]
         _con.close()
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:509 live_holdings")
     # ★2026-08-11 百轮#38：盈亏总览（持仓有 entry_price 才能算；缺失尝试回填）
     pnl = portfolio_pnl()
     # ★2026-08-12 百轮后#119：行业敞口（持仓行业分布——集中度风险可视化；Pitch 候选分布对照）
@@ -447,8 +527,8 @@ def live_holdings() -> dict:
         for _p in pf.get("positions", []):
             _ind = _p.get("industry") or "未知"
             _ind_expo[_ind] = _ind_expo.get(_ind, 0) + 1
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:519 live_holdings")
     # ★2026-08-11 百轮#40：组合绩效（净值曲线 + 回撤 + 交易统计）
     perf = portfolio_perf()
     # ★2026-08-12 百轮后#124：pnl 由 portfolio_pnl() 独立 _load() 原始文件（name=裸 code）——
@@ -459,8 +539,8 @@ def live_holdings() -> dict:
             _n = _name_map.get(_r.get("code"))
             if _n and _n != _r.get("code"):
                 _r["name"] = _n
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:531 live_holdings")
     # ★#354 数据流通：pnl.rows 的 last_price/ret 回填到 pf.positions——持仓卡直接用现价
     #   （原 pf 原始 JSON 无 last_price 字段，前端持仓卡"现价"永远 —，盈亏/现价不通）
     try:
@@ -474,8 +554,8 @@ def live_holdings() -> dict:
                     _p["ret"] = _pr["ret"]
                 if _pr.get("price_src"):
                     _p["price_src"] = _pr["price_src"]
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:546 live_holdings")
     # ★2026-08-14 持仓页超限透明：over_limit 记录（超 5 只纪律拒绝）与 holding 分离——
     #   前端 KPI 只数 holding，over_limit 单独列"超限待处理"（原混在一起显示 6/5 且无标注）
     _held = [p for p in pf.get("positions", []) if p.get("status") == "holding"]
@@ -491,8 +571,8 @@ def live_holdings() -> dict:
         if isinstance(sa, dict) and isinstance(sa.get("entries"), list):
             sa = dict(sa)
             sa["entries"] = [e for e in sa["entries"] if e.get("code") in _held_codes]
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:563 live_holdings")
     # ★2026-08-25 daily_signal 生成器（report/daily_signal.py）从未入库 → 死源；
     #   fallback 红绿灯 + 仓位档拼最小 regime 信号（前端 regime_label/level/cash_ratio）
     # ★2026-09-02 优先读 daily_signal.json（聚合 7 源）；仅在缺失时才走红绿灯兜底
@@ -533,6 +613,7 @@ def live_holdings() -> dict:
         "perf": perf,         # ★2026-08-11 百轮#40 组合绩效（净值/回撤/交易统计）
         "take_profit": tp,   # ★2026-08-11 止盈信号总览（alerts 触发列表）
         "stop_alerts": sa,   # ★2026-08-11 止损预警（池级监测 triggered/near）
+        "stop_signals": ss,   # ★2026-11-10 持仓级止损信号（position_stop_check 产出）
     }
 
 
@@ -543,28 +624,34 @@ def portfolio_pnl() -> dict:
     if str(BASE) not in _s.path:
         _s.path.insert(0, str(BASE))
     try:
-        from strategy.portfolio import _load, _save, _entry_price_of, _latest_close_of
+        from strategy.portfolio import _entry_price_of, _latest_close_of, _load, _save
         pf = _load()
     except Exception:
         return {"ok": False, "error": "portfolio 加载失败"}
     positions = [p for p in pf.get("positions", [])
                  if p.get("status") == "holding"]
     changed = False
-    # ★2026-08-14 持仓页实时收益：盘中用新浪实时价（live_realtime 60s 缓存，0 成本），
-    #   非交易时段/拉取失败自动回落日线最新收盘——解决"盘中持仓收益恒 0%（用昨日收盘 vs 昨收买入）"
-    _rt = None
-    try:
-        _rt = live_realtime()
-    except Exception:
-        _rt = None
-    _quotes = (_rt or {}).get("quotes") if (_rt or {}).get("ok") else None
-    _rt_active = bool(_quotes) and (_rt or {}).get("market_open") is True
+    # ★2026-11-20 持仓页超时修复：原实现调 live_realtime()（全市场快照，交易时段实测 20~40s）
+    #   → /api/live/holdings > 前端 8s 超时 → AbortError: signal is aborted without reason。
+    #   改为仅对持仓代码走新浪单票快照（3s 超时 + 30s 缓存），失败回落日线最新收盘。
+    _quotes = _hold_quotes([p.get("code") for p in positions])
+    _rt_active = bool(_quotes)
     rows, total_cost, total_val = [], 0.0, 0.0
+    _today = datetime.now().strftime("%Y-%m-%d")
     for p in positions:
         code = p.get("code", "")
         entry = p.get("entry_price")
         if entry is None:
-            entry = _entry_price_of(code, p.get("entry_date", ""))
+            # ★2026-11-20 今日审批买入：优先今日开盘价（T+1 开盘执行口径），
+            #   早于日线当日收盘——否则收盘后跑 pipeline 会用收盘价，与开盘口径不一致
+            _q0 = (_quotes or {}).get(code) or {}
+            if p.get("entry_date") == _today and _q0.get("open"):
+                entry = _q0["open"]
+                p["entry_price_src"] = "open"
+            else:
+                entry = _entry_price_of(code, p.get("entry_date", ""))
+                if entry is not None:
+                    p["entry_price_src"] = "close"
             if entry is not None:
                 p["entry_price"] = entry
                 changed = True
@@ -596,16 +683,21 @@ def portfolio_pnl() -> dict:
     if changed:
         try:
             _save(pf)
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:675 portfolio_pnl")
     total_ret = (total_val / total_cost - 1) if total_cost else None
+    # ★2026-11-20 金额口径：无股数/成本金额时 total_value 是「1 股等权」虚拟值（22.45 元），
+    #   任何消费方按「元/万」展示都是误导 → 直接不返回金额，只保留 total_ret 与 value_basis。
+    _amount_basis = "shares" if any(p.get("cost") for p in positions) else "equal_weight"
+    _has_amount = _amount_basis == "shares"
     return {
         "ok": True,
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "n_holdings": len(rows),
-        "total_cost": round(total_cost, 2) if total_cost else None,
-        "total_value": round(total_val, 2) if total_val else None,
+        "total_cost": round(total_cost, 2) if (_has_amount and total_cost) else None,
+        "total_value": round(total_val, 2) if (_has_amount and total_val) else None,
         "total_ret": round(total_ret, 4) if total_ret is not None else None,
+        "value_basis": _amount_basis,
         "rows": rows,
     }
 
@@ -624,6 +716,86 @@ def live_tech() -> dict:
         "new_codes": d.get("new_codes", []),
         "file": _latest_file("tech_pitch_*.json").name if _latest_file("tech_pitch_*.json") else "",
     }
+
+
+def fill_pitch_stops(items) -> int:
+    """给 pitch 候选的 stop_plan 补类型规则默认值（原地修改），返回补齐的条数。
+    ★2026-11-20 pitch_v2/opp_pool 落盘的是生成时快照（stop_matrix_v2 缺失 → 字段 null），
+    所有消费 pitch 的接口（pitch_v2 / pool / opp）都走这里，保证与止损引擎同源。"""
+    try:
+        from risk.type_stop_rules import type_stop_plan
+    except Exception:
+        return 0
+    n = 0
+    for o in items or []:
+        sp = o.get("stop_plan")
+        if not isinstance(sp, dict):
+            sp = {}
+            o["stop_plan"] = sp
+        try:
+            eng = type_stop_plan(o.get("otype") or "value", o.get("score")) or {}
+        except Exception:
+            continue
+        filled = False
+        for k in ("stop_loss_pct", "time_stop_weeks", "max_drawdown_pct",
+                  "high_drawdown_exit", "trailing_ma"):
+            if sp.get(k) is None and eng.get(k) is not None:
+                sp[k] = eng[k]
+                filled = True
+        if filled:
+            sp["estimated"] = True
+            n += 1
+    return n
+
+
+def auto_execute_status() -> dict:
+    """自动买卖开关状态 + 上次执行摘要（持仓页开关卡片用）"""
+    try:
+        import yaml
+        cfg = (yaml.safe_load((BASE / "config" / "params.yaml").read_text(encoding="utf-8")) or {}).get("auto_execute") or {}
+    except Exception:
+        cfg = {}
+    last = None
+    if _latest_file("auto_execute_*.json", "logs"):
+        d = _read("auto_execute_*.json") or {}
+        last = {"ts": d.get("ts"), "sells": len(d.get("sells") or []),
+                "buys": len(d.get("buys") or []), "errors": len(d.get("errors") or []),
+                "added": (d.get("sync") or {}).get("added") or []}
+    return {"ok": True, "config": cfg, "last": last}
+
+
+def set_auto_execute(enabled: bool) -> dict:
+    """切换 auto_execute.enabled——按行替换，保留 params.yaml 注释与其余配置"""
+    import re
+    p = BASE / "config" / "params.yaml"
+    lines = p.read_text(encoding="utf-8").splitlines()
+    in_sec = False
+    for i, ln in enumerate(lines):
+        if re.match(r"^auto_execute:\s*$", ln):
+            in_sec = True
+            continue
+        if in_sec:
+            if re.match(r"^\S", ln):
+                break
+            if re.match(r"^\s+enabled:\s*", ln):
+                lines[i] = re.sub(r"(enabled:\s*)(true|false)",
+                                  lambda m: m.group(1) + ("true" if enabled else "false"), ln)
+                p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                return {"ok": True, "enabled": bool(enabled)}
+    return {"ok": False, "error": "config 中未找到 auto_execute.enabled"}
+
+
+def live_pitch_v2() -> dict:
+    """Pitch 候选（最新 pitch_v2_*.json）+ stop_plan 按类型规则补缺。
+    ★2026-11-20 落盘快照字段多为 null（stop_matrix_v2 缺失）→ 页面只能显示「触发条件驱动」。
+    这里补值后返回，与止损引擎同源。"""
+    import copy
+    d = copy.deepcopy(_read("pitch_v2_*.json"))
+    if not d:
+        return {"ok": False, "error": "pitch_v2 未生成", "pitch": []}
+    fill_pitch_stops(d.get("pitch") or [])
+    d["ok"] = True
+    return d
 
 
 def live_pools() -> dict:
@@ -649,8 +821,8 @@ def live_pools() -> dict:
                     held_trig += 1
                 elif _e.get("status") == "NEAR":
                     held_near += 1
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:813 live_pools")
     # ★#348 类型分布（top 3 类型 + 数量）——前端动态显示，不写死"价值/重估/质量"这类文字
     def _otype_dist(items, key="otype"):
         from collections import Counter
@@ -709,8 +881,8 @@ def live_alerts() -> dict:
                 alerts.append({"level": "high", "cat": "止盈",
                                "msg": f"{a.get('code')} {a.get('name','')} 触发止盈（{a.get('type','')}）",
                                "code": a.get("code")})
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:873 live_alerts")
     # ★2026-08-16 止损预警条整体删除（已触发/接近，用户要求）
     # 3) 择时不适合
     _tm = _latest("timing_system_*.json", "output")
@@ -723,8 +895,8 @@ def live_alerts() -> dict:
             elif "谨慎" in str(tm.get("level", "")):
                 alerts.append({"level": "mid", "cat": "择时",
                                "msg": f"市场择时谨慎买入（{tm.get('score')} 分）"})
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:887 live_alerts")
     # 4) 组合风控告警
     _pr = _latest("position_risk_*.json", "report")
     if _pr:
@@ -741,8 +913,8 @@ def live_alerts() -> dict:
             if fl.get("deep_drawdown"):
                 alerts.append({"level": "mid", "cat": "风控",
                                "msg": f"{fl.get('deep_drawdown')} 只持仓深回撤（-60日>阈值）"})
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:905 live_alerts")
     # 5) 数据断链（决策链非绿）——★#392 supplier-lag（note 含"内容滞后/供应商"）不算断链（竞价信号供应商缺口非系统故障）
     try:
         chain = live_chain().get("chain", [])
@@ -750,8 +922,8 @@ def live_alerts() -> dict:
             if not n.get("ok") and not ("内容滞后" in (n.get("note") or "") or "供应商" in (n.get("note") or "")):
                 alerts.append({"level": "high", "cat": "数据",
                                "msg": f"{n['name']} 数据断链（{n.get('file') or '无文件'}）"})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:914 live_alerts")
     # 6) 因子池面板质量（★百轮#70：08-11 真发生过——daily CSV 五强 rank 缺失自动回退旧文件）
     try:
         import pandas as _pd
@@ -788,8 +960,8 @@ def live_alerts() -> dict:
             _base = (_P(_sd).parent / _dir) if _dir else _P(_sd)   # risk 在 因子池/risk/（output 的父级）
             if not _g.glob(str(_base / _pat)) and not _g.glob(_sd + "/" + _pat):
                 alerts.append({"level": "mid", "cat": "数据", "msg": f"外包 {_label} 缺失（择时/风控降级 bars 兜底）"})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:952 live_alerts")
     # 7) 日历窗口（H16/H17 实证，★百轮#70）
     try:
         from data.calendar_hook import get_window, upcoming
@@ -801,8 +973,8 @@ def live_alerts() -> dict:
             for _up in upcoming(horizon_days=7):
                 alerts.append({"level": "ok", "cat": "日历",
                                "msg": f"{_up['days_to']} 天后 {_up['label']}（{'+' if _up['bonus']>=0 else ''}{_up['bonus']} 分）"})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:965 live_alerts")
     # 8) FRC 因子风控生效（★百轮#70）
     try:
         # ★2026-08-14 #434：取「因子数最多」而非文件名最新（#268 同款——外包 --only 增量
@@ -829,8 +1001,8 @@ def live_alerts() -> dict:
             if _tot and (_n0 + _nlt) / _tot >= 0.30:
                 alerts.append({"level": "mid", "cat": "风控",
                                "msg": f"FRC 因子风控生效中（{_n0} 禁用/{_nlt} 降权，共 {_tot} 因子）"})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:993 live_alerts")
     # 9) 大小盘分化（H27，★百轮#70）
     try:
         _snfs = sorted(_g.glob("data/factorpool/output/market_snapshot_ext*.json"),
@@ -842,16 +1014,16 @@ def live_alerts() -> dict:
             if _dv is not None and abs(float(_dv)) >= 0.095:
                 alerts.append({"level": "mid", "cat": "风控",
                                "msg": f"大小盘分化 {abs(float(_dv))*100:.0f}pp（等权 {float(_m60)*100:+.1f}%）——结构性行情，注意风格"})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:1006 live_alerts")
     # 10) 强因子直通极强（≥6 家族，机会参考——★百轮#70）
     try:
         _sh = live_strong_hits()
         if _sh.get("ok") and _sh.get("n_extreme"):
             alerts.append({"level": "ok", "cat": "机会",
                            "msg": f"强因子直通极强 {_sh['n_extreme']} 只（≥6 家族独立证据，见机会池💪直通榜）"})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:1014 live_alerts")
     # 11) ★全站健康扫描（2026-08-12 百轮#82：页面/API/一致性——dev_auto 8.59 每 4h 产出）
     try:
         _hs = _latest_file("health_scan_*.json", "report")
@@ -865,8 +1037,8 @@ def live_alerts() -> dict:
             elif _age > 26:
                 alerts.append({"level": "mid", "cat": "系统",
                                "msg": f"健康扫描 {_age}h 未更新（dev_auto 可能异常）"})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:1029 live_alerts")
     # 12) ★类型降权提示（2026-08-12 百轮#89/#93：实盘归因 → 触发建议——数据驱动决策）
     try:
         _vw = live_validation().get("diagnosis") or {}
@@ -874,8 +1046,8 @@ def live_alerts() -> dict:
             _rs = _dw.get("reason", "低于基准")
             alerts.append({"level": "mid", "cat": "类型",
                            "msg": f"⚠️ {_dw.get('text')} {_rs} → 降权提示（Pitch 中该类型审批从严）"})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:1038 live_alerts")
     # ★2026-08-12 十轮#175：管道健康告警（data/pipeline_health.py 落盘——每日信号/机会池等
     #   产物超过阈值未更新 → high 告警，防管道静默中断无人知，如 18:30 exit=143 案例）
     try:
@@ -886,8 +1058,8 @@ def live_alerts() -> dict:
             for _pa in (_ph.get("alerts") or []):
                 alerts.append({"level": _pa.get("level", "mid"), "cat": _pa.get("cat", "管道"),
                                "msg": _pa.get("msg", "")})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:1050 live_alerts")
     alerts.sort(key=lambda x: {"high": 0, "mid": 1, "ok": 2}.get(x.get("level"), 2))
     _out = {
         "ok": True,
@@ -906,8 +1078,8 @@ def live_funnel() -> dict:
     ★百轮#71 升级：加淘汰原因统计（分数未达门槛 vs 达标但名额/子分类受限）+ Pitch 类型分布"""
     import glob as _g
     import os as _os
-    from pathlib import Path as _P
     from collections import Counter as _Cnt
+    from pathlib import Path as _P
     def _latest(pat, sub):
         fs = sorted([_P(p) for p in _g.glob(str(BASE / sub / pat))], key=lambda x: x.stat().st_mtime)
         return fs[-1] if fs else None
@@ -939,22 +1111,22 @@ def live_funnel() -> dict:
                     "quota_desc": "达标但同类型名额满(每类≤5)/子分类上限"}
             _tc = _Cnt((p.get("otype_name") or p.get("otype") or "?") for p in pitch_list)
             pitch_types = [{"name": k, "n": v} for k, v in _tc.most_common()]
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:1103 live_funnel")
     _tp = _latest("tech_pitch_*.json", "logs")
     if _tp:
         try:
             tech_n = len(json.loads(_tp.read_text(encoding="utf-8")).get("entries", []))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:1109 live_funnel")
     _dc = _latest("deck_decisions_*.json", "logs")
     if _dc:
         try:
             decs = json.loads(_dc.read_text(encoding="utf-8"))
             if isinstance(decs, list):
                 approved_n = len({r.get("code") for r in decs if r.get("action") == "buy"})
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:1117 live_funnel")
     pitch_total = pitch_n + tech_n
     # ★2026-08-15 全流程漏斗扩展（说明页动态决策流）：源头 → 硬过滤 → 机会池 → Pitch → 待审批 → 持仓 → 远期池
     #   1) 源头：bars.db 全市场行数（qfq）
@@ -964,16 +1136,16 @@ def live_funnel() -> dict:
         _c = _sq.connect("file:data/cache/bars.db?mode=ro&immutable=1", uri=True, timeout=3)
         bars_rows = _c.execute("SELECT COUNT(*) FROM daily_bar WHERE adjust='qfq' AND code != 'SH.000300'").fetchone()[0]
         _c.close()
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:1128 live_funnel")
     #   2) 硬过滤通过（daily_signal n_passed）
     n_passed = None
     _ds = _latest("daily_signal_*.json", "output")
     if _ds:
         try:
             n_passed = json.loads(_ds.read_text(encoding="utf-8")).get("n_passed")
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:1136 live_funnel")
     #   3) 待审批（pitch_v2 + tech 中未 buy/drop 的）
     _decided = set()
     if _dc:
@@ -981,8 +1153,8 @@ def live_funnel() -> dict:
             _decs = json.loads(_dc.read_text(encoding="utf-8"))
             if isinstance(_decs, list):
                 _decided = {r.get("code") for r in _decs if r.get("action") in ("buy", "drop")}
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:1145 live_funnel")
     n_pending = 0
     for _pat, _sub in (("pitch_v2_*.json", "pitch"), ("tech_pitch_*.json", "entries")):
         _f2 = _latest(_pat, "logs")
@@ -991,8 +1163,8 @@ def live_funnel() -> dict:
         try:
             _dd = json.loads(_f2.read_text(encoding="utf-8"))
             n_pending += sum(1 for p in _dd.get(_sub, []) if p.get("code") not in _decided)
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:1155 live_funnel")
     #   4) 持仓 + 远期池
     n_held = n_forward = None
     try:
@@ -1001,14 +1173,14 @@ def live_funnel() -> dict:
         if _pf:
             _pd = json.loads(_pf.read_text(encoding="utf-8"))
             n_held = sum(1 for p in _pd.get("positions", []) if p.get("status") == "holding")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:1165 live_funnel")
     try:
         _pt = _latest("pitch_track_pool_*.json", "logs")
         if _pt:
             n_forward = len(json.loads(_pt.read_text(encoding="utf-8")).get("entries", []))
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:1171 live_funnel")
     #   5) 因子数（manifest）
     n_factors = None
     try:
@@ -1073,8 +1245,8 @@ def live_turnlow_top(top_n: int = 20) -> dict:
             con = _sq.connect("file:data/cache/stock_basic.db?mode=ro&immutable=1", uri=True)
             names = dict(con.execute("SELECT code, name FROM stock_basic").fetchall())
             con.close()
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:1237 live_turnlow_top")
         items = [{"code": str(row["code"]), "name": names.get(str(row["code"]), ""),
                   "rank": float(row[col])} for _, row in top.iterrows()]
         return {"ok": True, "date": date, "file": os.path.basename(fs[-1]),
@@ -1095,6 +1267,7 @@ def portfolio_perf() -> dict:
     try:
         import sqlite3
         from pathlib import Path as _P
+
         from strategy.portfolio import _load
         pf = _load()
         positions = [p for p in pf.get("positions", [])
@@ -1231,8 +1404,8 @@ def live_actions() -> dict:
                                   "status": st, "level": "high" if st == "TRIGGERED" else "mid",
                                   "msg": msg})
             n_stop = len(stop_list)
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:1396 live_actions")
     # ② 待审批 Pitch（未在 decisions）
     decided = set()
     _dc = _latest("deck_decisions_*.json", "logs")
@@ -1241,8 +1414,8 @@ def live_actions() -> dict:
             decs = json.loads(_dc.read_text(encoding="utf-8"))
             if isinstance(decs, list):
                 decided = {r.get("code") for r in decs if r.get("action") in ("buy", "drop")}
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:1406 live_actions")
     pending = []
     for pat, sub in (("pitch_v2_*.json", "pitch"), ("tech_pitch_*.json", "entries")):
         _f = _latest(pat, "logs")
@@ -1256,8 +1429,8 @@ def live_actions() -> dict:
                     pending.append({"code": p.get("code"), "name": p.get("name"),
                                     "score": p.get("score"), "line": p.get("pitch_line", "long"),
                                     "tier": p.get("tier", "")})
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:1421 live_actions")
     # ③ 新突破（tech_pitch NEW）
     new_tech = []
     _tp = _latest("tech_pitch_*.json", "logs")
@@ -1266,8 +1439,8 @@ def live_actions() -> dict:
             for e in json.loads(_tp.read_text(encoding="utf-8")).get("entries", []):
                 if e.get("is_new"):
                     new_tech.append({"code": e.get("code"), "name": e.get("name"), "score": e.get("score")})
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:1431 live_actions")
     return {"ok": True, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "n_stop": n_stop, "n_pending": len(pending), "n_new": len(new_tech),
             "stop": stop_list, "pending": pending, "new_tech": new_tech}
@@ -1292,8 +1465,8 @@ def live_brief() -> dict:
             items.append({"cat": "择时", "level": "high" if "不适合" in str(tm.get("level", "")) else
                           ("mid" if "谨慎" in str(tm.get("level", "")) else "ok"),
                           "msg": f"市场择时 {tm.get('level')}（{tm.get('score')} 分）"})
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:1457 live_brief")
     # 1.5) 日历窗口（H16/H17 实证，2026-08-11 百轮#65 接入）
     try:
         from data.calendar_hook import get_window, upcoming
@@ -1306,8 +1479,8 @@ def live_brief() -> dict:
             for _up in upcoming(horizon_days=14):
                 items.append({"cat": "日历窗口", "level": "ok",
                               "msg": f"⏳{_up['days_to']} 天后进入 {_up['label']}（{'+' if _up['bonus']>=0 else ''}{_up['bonus']} 分）"})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:1471 live_brief")
     # 1.6) 大小盘分化度（H27，2026-08-11 百轮#65 接入；|divergence|>10pp 降档提示）
     try:
         _snap = None
@@ -1330,8 +1503,8 @@ def live_brief() -> dict:
                 elif dvpp >= 5:
                     items.append({"cat": "大小盘分化", "level": "ok",
                                   "msg": f"分化 {dvpp:.0f}pp（等权 {m60*100:+.1f}%）——结构性行情，注意风格"})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:1495 live_brief")
     # 1.7) 全站健康扫描（★百轮#84：dev_auto 8.59 每 4h 产出，页面/API/一致性）
     try:
         _hs = _latest("health_scan_*.json", "report")
@@ -1343,8 +1516,8 @@ def live_brief() -> dict:
             else:
                 items.append({"cat": "系统健康", "level": "ok",
                               "msg": f"全站健康（{hs.get('pages',{}).get('ok','?')}/{hs.get('pages',{}).get('n','?')} 页 · {hs.get('apis',{}).get('ok','?')}/{hs.get('apis',{}).get('n','?')} API · 一致性{'✅' if hs.get('consistency') else '❌'}）"})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:1508 live_brief")
     # 1.8) T+5 批次就绪（★百轮#84：#80 预研落地——08-14 首批）
     try:
         _v = live_validation()
@@ -1352,8 +1525,8 @@ def live_brief() -> dict:
             _d = _v.get("t5_first_due_days")
             items.append({"cat": "验证进度", "level": "ok",
                           "msg": f"T+5 首批 {_v['t5_first_due']} 就绪" + (f"（还有 {_d} 天，{_v['batches'][0]['n']} 只）" if _d and _d > 0 and _v.get('batches') else "已到期可验证")})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:1517 live_brief")
     # 1.9) 类型降权 + 审批指引（★百轮#94：长短线实盘偏弱类型 → 今日审批从严）
     try:
         _dg = (live_validation().get("diagnosis") or {})
@@ -1371,8 +1544,8 @@ def live_brief() -> dict:
             else:
                 items.append({"cat": "审批指引", "level": "mid",
                               "msg": "当前所有有实盘样本的类型均处降权/观察——宁缺毋滥，仅质量折价等新样本类型可审"})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:1536 live_brief")
     # ★2026-08-16「待审批」提示卡片整体删除（用户要求，与止损条同处理）
     # ★2026-08-16 止损提示条整体删除（含已触发/接近止损，用户要求）
     # 4) 止盈
@@ -1383,8 +1556,8 @@ def live_brief() -> dict:
             for p in json.loads(_tp.read_text(encoding="utf-8")).get("positions", []):
                 if any(s.get("type") in ("target", "pullback", "time") for s in p.get("signals", [])):
                     n_tp += 1
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:1548 live_brief")
     if n_tp:
         items.append({"cat": "止盈", "level": "mid", "msg": f"{n_tp} 只触发止盈信号"})
     # 5) 组合风险
@@ -1402,8 +1575,8 @@ def live_brief() -> dict:
                 risk_msgs.append(f"{fl.get('deep_drawdown')} 只深回撤")
             if risk_msgs:
                 items.append({"cat": "组合风险", "level": "mid", "msg": "、".join(risk_msgs)})
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:1567 live_brief")
     items.sort(key=lambda x: {"high": 0, "mid": 1, "ok": 2}.get(x.get("level"), 2))
     return {"ok": True, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "n": len(items), "n_high": sum(1 for i in items if i["level"] == "high"),
@@ -1517,11 +1690,11 @@ def live_validation() -> dict:
     "历史说有效，实盘验证中"——各类型实际表现相对基准的超/低预期标记
     ★2026-08-12 百轮#80：双 horizon（T+1/T+5）+ T+5 批次就绪预告（首批 08-14 到期）
     ★2026-08-13 #308 加 120s 缓存（键 = pitch_track_pool mtime，消除 live_brief 内 2 次重复计算）"""
+    import datetime as _dt
     import glob as _g
     import os as _os
-    import datetime as _dt
-    from pathlib import Path as _P
     from collections import defaultdict
+    from pathlib import Path as _P
     def _latest(pat, sub):
         fs = sorted([_P(p) for p in _g.glob(str(BASE / sub / pat))], key=lambda x: x.stat().st_mtime)
         return fs[-1] if fs else None
@@ -1554,8 +1727,8 @@ def live_validation() -> dict:
                 v = r.get("1") or {}
                 if v:
                     bench[ot] = {"winrate": v.get("winrate"), "avg_ret": v.get("avg_ret")}
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:1719 live_validation")
     def _horizon_rows(h, hname):
         rows = []
         for ot, vals in sorted(act[h].items()):
@@ -1633,8 +1806,8 @@ def live_validation() -> dict:
             _oppd = json.loads(_latest("opp_pool_*.json", "logs").read_text(encoding="utf-8"))
             for _o in _oppd.get("opportunities", []):
                 _opp_cnt[_o.get("otype") or "?"] += 1
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:1798 live_validation")
         diag = {
             "by_type": [],
             "by_score": [{"band": b, "n": len(v), "avg": round(sum(v) / len(v), 4),
@@ -1687,8 +1860,8 @@ def live_validation() -> dict:
                 "reason": "低于17年基准" if t["bench_avg"] is not None else "实盘胜率偏低",
                 "text": f"{t['label']}({t['n']}只 {t['avg']*100:+.2f}%)",
             } for t in _down_types]
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:1852 live_validation")
     # ★#80 T+5 批次就绪预告（首批 08-14）
     batches = []
     try:
@@ -1712,8 +1885,8 @@ def live_validation() -> dict:
                     })
             batches.append({"entry_date": ed, "n": len(es), "n_t5_done": n_t5_done,
                             "samples": _samples})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:1877 live_validation")
     t5_due = None
     try:
         # 从最早批次算 T+5 到期日（工作日推算——bars 未覆盖未来交易日，索引法会越界）
@@ -1726,8 +1899,8 @@ def live_validation() -> dict:
                 if _cur.weekday() < 5:
                     _cnt += 1
             t5_due = _cur.isoformat()
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:1891 live_validation")
     _res = {"ok": True, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "note": "T+1/T+5 实际 vs 17 年 1 月基准（diff = 实际-基准，n≥3 判超/低预期；T+5 无 17 年日基准，对照 T+1 参考）",
             "rows": _horizon_rows("t1", "T+1"),
@@ -1774,8 +1947,8 @@ try:
             _parts = str(_k).split("|")
             if len(_parts) == 2:
                 _mkt_median_cache[(_parts[0], _parts[1])] = _v
-except Exception:
-    pass
+except Exception as _dsh_exc:
+    _dsh_swallow(_dsh_exc, "deck/live_api.py:1939 <module>")
 # live_validation 缓存（键 = pitch_track_pool mtime，消除 live_brief 内 2 次重复计算）
 _validation_cache = {"ver": None, "ts": 0.0, "data": None}
 
@@ -1786,9 +1959,9 @@ def _batch_review_payload(entries: list) -> dict:
     08-14 首批到期后 t5 自动填充——页面无需改版即可呈现批次质量（alpha vs beta 解读）。"""
     out = {"batches": [], "pool_stats": {}, "note": ""}
     try:
-        from collections import defaultdict, Counter
         import sqlite3 as _sq4
         import statistics as _st4
+        from collections import Counter, defaultdict
         groups = defaultdict(list)
         for e in entries:
             d = str(e.get("entry_date") or "")[:10]
@@ -1816,8 +1989,8 @@ def _batch_review_payload(entries: list) -> dict:
             try:
                 _MKT_CACHE_FILE.write_text(json.dumps({f"{k[0]}|{k[1]}": v for k, v in _mkt_median_cache.items()},
                                                       ensure_ascii=False), encoding="utf-8")
-            except Exception:
-                pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "deck/live_api.py:1981 _mkt_median")
             return _res
         for d0 in sorted(groups):
             ents = groups[d0]
@@ -1927,8 +2100,8 @@ def live_review() -> dict:
             _pool = json.loads(Path(_pfs[-1]).read_text(encoding="utf-8"))
             for e in _pool.get("entries", []):
                 pool_map[e.get("code")] = e
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:2092 live_review")
     rows = []
     # ★2026-08-12 百轮#104：类型当前状态映射（该审批股类型现在是否降权——复盘时知道
     #   "这笔 revalue 买入的类型现处降权提示"——实盘裁决体系延伸到历史视图）
@@ -1937,8 +2110,8 @@ def live_review() -> dict:
     try:
         for _t in ((live_validation().get("diagnosis") or {}).get("by_type") or []):
             _ts_map[_t.get("otype")] = {"label": _t.get("label"), "action": _t.get("action")}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:2102 live_review")
     for b in buys:
         code = b.get("code", "")
         pe = pool_map.get(code, {})
@@ -2000,8 +2173,8 @@ def _minute_node() -> dict:
     try:
         from data.cache import DailyCache
         _latest_td = str(DailyCache().latest_trade_date() or "") or None
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:2165 _minute_node")
     # 内容日期缓存（10min）；★#347 性能：pyarrow 读 parquet statistics 秒级（0.1s），
     #   替代 pandas read_parquet 全读单列（689w/1443w 行 → 3.3s）——门户冷启动 6s 主凶
     _now = time.time()
@@ -2051,8 +2224,8 @@ def _minute_node() -> dict:
             if _i1.exists():
                 _i1cov = _parquet_max_date(_i1)
             _minute_meta_cache.update({"ts": _now, "k5": _k5cov, "i1": _i1cov})
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:2216 _minute_node")
     # 统一日期格式（8 位 YYYYMMDD → YYYY-MM-DD，与 bars.db / DailyCache 对齐比较）
     def _fmt8(s):
         s = str(s or "")
@@ -2094,8 +2267,8 @@ def _extract_content_date(name: str, data) -> str:
             v = data.get(k)
             if isinstance(v, str) and len(v) >= 10:
                 return v[:10]
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:2259 _extract_content_date")
     return ""
 
 
@@ -2118,8 +2291,8 @@ def live_chain() -> dict:
     try:
         from data.cache import DailyCache
         _latest_td = str(DailyCache().latest_trade_date() or "")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:2283 live_chain")
     CHAIN = [
         ("观察池", "output", "pool_layers_*.json"),
         ("新择时", "output", "timing_system_*.json"),
@@ -2157,8 +2330,8 @@ def live_chain() -> dict:
         _cdate = ""
         try:
             _cdate = _extract_content_date(name, json.loads(f.read_text(encoding="utf-8")))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:2322 live_chain")
         if _cdate and _latest_td:
             _ok = _cdate >= _latest_td
         else:
@@ -2180,8 +2353,8 @@ def live_chain() -> dict:
                 else:
                     _nd["note"] = "无降权类型"
                     _nd["down_n"] = 0
-            except Exception:
-                pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "deck/live_api.py:2345 live_chain")
         nodes.append(_nd)
     _out = {"ok": True, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "latest_td": _latest_td, "chain": nodes}
@@ -2256,7 +2429,8 @@ def live_factor_ranking() -> dict:
                     elif k == "live_w": live_w = float(v)
                     elif k == "min_live_samples": min_live = float(v)
                     elif k == "live_strong_boost": boost = float(v)
-                except Exception: pass
+                except Exception as _dsh_exc:
+                    _dsh_swallow(_dsh_exc, "deck/live_api.py:2421 live_factor_ranking")
             # 2. 实战业绩（factor_agg）
             perf = {}
             for r in con.execute("SELECT factor, n_pitch, t1_avg, t5_avg, t5_win FROM factor_agg").fetchall():
@@ -2273,7 +2447,8 @@ def live_factor_ranking() -> dict:
             for r in load_health():
                 try:
                     health[str(r.get("factor") or "")] = float(r.get("icir120") or 0)
-                except Exception: pass
+                except Exception as _dsh_exc:
+                    _dsh_swallow(_dsh_exc, "deck/live_api.py:2438 live_factor_ranking")
         except Exception:
             health = {}
         # 4. ★别名映射（主系统财务/技术因子名 → 外包因子名，如 pe_pct→bp / sq_nyoy→sue / roe→f_score）
@@ -2419,8 +2594,8 @@ def live_factor_ui_pack() -> dict:
         if f:
             try:
                 out[key] = _clean_nan(json.loads(f.read_text(encoding="utf-8")))
-            except Exception:
-                pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "deck/live_api.py:2584 live_factor_ui_pack")
     # ★2026-08-15 数据即时性修复：factor_data_freshness 是因子池清晨快照（反映前一收盘），
     #   傍晚链更新后该文件不重建 → 因子页"健康/清单日期"滞后 1 天。
     #   用实际最新文件覆写 updated/manifest/health_csv 日期（显示真实消费口径，消除观感滞后）。
@@ -2442,8 +2617,8 @@ def live_factor_ui_pack() -> dict:
             fr["health_csv"] = {"coverage": f"{len(_rows)} 因子", "date": _hd}
         if fr:
             out["freshness"] = fr
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:2607 live_factor_ui_pack")
     return out
 
 
@@ -2469,8 +2644,8 @@ def live_rotation_calendar() -> dict:
                 out["style_history"] = [{"date": r.get("date", "")[:7], "dominant": r.get("dominant")}
                                         for r in rows[-24:]]
                 out["current_style"] = rows[-1].get("dominant")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:2634 live_rotation_calendar")
     # 2) factor_style_rotation（当前风格 + boost/trim 权重）
     try:
         fs = sorted(_UI_DATA_DIR.glob("factor_style_rotation_*.json"), key=lambda p: p.stat().st_mtime)
@@ -2479,16 +2654,16 @@ def live_rotation_calendar() -> dict:
             if sr.get("current_style"):
                 out["current_style"] = sr["current_style"]
             out["weights"] = sr.get("weights", {})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:2644 live_rotation_calendar")
     # 3) 日历效应窗口（复用 timing_dash）
     try:
         td = live_timing_dash()
         out["cal_win"] = td.get("cal_win")
         out["cal_month"] = td.get("cal_month") or {}
         out["cal_upcoming"] = td.get("cal_upcoming") or []
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:2652 live_rotation_calendar")
     return out
 
 
@@ -2662,8 +2837,8 @@ def live_timing_dash() -> dict:
                         continue
             if _ths:
                 out["score_hist"] = _ths
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:2827 live_timing_dash")
         try:
             _sd = "data/factorpool/output"
             _ths2 = []
@@ -2676,8 +2851,8 @@ def live_timing_dash() -> dict:
                     continue
             if _ths2:
                 out["temp_hist"] = _ths2
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:2841 live_timing_dash")
         try:
             _sd = "data/factorpool/output"
             _whs = []
@@ -2691,8 +2866,8 @@ def live_timing_dash() -> dict:
                     continue
             if _whs:
                 out["width_hist"] = _whs
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:2856 live_timing_dash")
         try:
             _sd = "data/factorpool/output"
             _chs = []
@@ -2706,8 +2881,8 @@ def live_timing_dash() -> dict:
                     continue
             if _chs:
                 out["crowd_hist"] = _chs
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:2871 live_timing_dash")
         try:
             _sd = "data/factorpool/output"
             _tf = sorted(glob.glob(_sd + "/market_emotion_temp*.json"),
@@ -2716,15 +2891,15 @@ def live_timing_dash() -> dict:
                 _tjj = json.loads(Path(_tf[-1]).read_text(encoding="utf-8"))
                 out["temp_components"] = _tjj.get("components", {})
                 out["temp_zone"] = _tjj.get("zone", "")
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:2881 live_timing_dash")
         # 3) 日历窗口 + 未来预告（H16/H17）
         try:
             from data.calendar_hook import get_window, upcoming
             out["cal_win"] = get_window()
             out["cal_upcoming"] = upcoming(horizon_days=90)
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:2888 live_timing_dash")
         # 4) CAL 月收益（#154：2月+5/11月+5/10月+3/1月4月12月-5）
         try:
             import datetime as _dt
@@ -2745,8 +2920,8 @@ def live_timing_dash() -> dict:
                           1: "1月弱月", 4: "4月弱月", 12: "12月弱月"}.get(_mon, ""),
                 "note": "CAL 月收益日历（2015-2026 实证：2月+4.89%/75% 春季躁动、1月-3.11%/25% 全年第二弱、4月-0.67%/33%、11月+3.9%/73%、10月+2.5%；CAL-4 12月小切大已推翻）" if _mb else "CAL 月收益日历：当前月无显著日历效应（中性）",
             }
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:2910 live_timing_dash")
         # 5) 拥挤度/温度（外包 crowding 最新 + 快照温度）
         try:
             _cf = sorted(glob.glob("data/factorpool/output/crowding_*.json"),
@@ -2758,8 +2933,8 @@ def live_timing_dash() -> dict:
                     "zone": _cd.get("zone"), "n_crowded": _cd.get("n_crowded_stocks"),
                     "date": _cd.get("date"),
                 }
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:2923 live_timing_dash")
         # 6) ★2026-08-13 跨日评分走势（timing_history 每日归档——"择时动起来"数据源）
         try:
             _th = sorted(glob.glob(str(BASE / "logs" / "timing_history_*.json")),
@@ -2769,8 +2944,8 @@ def live_timing_dash() -> dict:
                 out["score_series"] = _thd.get("score_series", [])
                 out["score_days"] = _thd.get("days", [])
                 out["level_series"] = _thd.get("level_series", [])
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:2934 live_timing_dash")
         _td_cache.update({"ts": _now, "data": out, "ver": _ver})
         return out
     except Exception as e:
@@ -2885,8 +3060,8 @@ def live_factor_dash() -> dict:
                         "t1_avg": _r.get("t1_avg"),
                     }
                 out["attribution"] = _attr_map
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:3050 live_factor_dash")
         _fd_cache.update({"ts": _now, "data": out})
         return out
     except Exception as e:
@@ -2909,36 +3084,36 @@ def live_portal_dash() -> dict:
     out = {"ok": True, "schema_version": "1.0", "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     try:
         out["pools"] = live_pools()
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3074 live_portal_dash")
     try:
         out["timing"] = live_timing_dash()
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3078 live_portal_dash")
     try:
         out["chain"] = live_chain()
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3082 live_portal_dash")
     try:
         out["brief"] = live_brief()
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3086 live_portal_dash")
     try:
         # ★2026-08-14 跨资产轮动防守信号（a_share_weak + global_rotation，因子池 P0 落地）
         _gr = BASE / "output" / "global_rotation.json"
         if _gr.exists():
             import json as _jgr
             out["global_rotation"] = _jgr.loads(_gr.read_text(encoding="utf-8"))
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3094 live_portal_dash")
     try:
         # ★2026-08-14 择时红绿灯（贪婪/观望/恐慌，系统性风险三档状态机）
         _tl = BASE / "output" / "traffic_light.json"
         if _tl.exists():
             import json as _jtl
             out["traffic_light"] = _jtl.loads(_tl.read_text(encoding="utf-8"))
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3102 live_portal_dash")
     try:
         # ★#347 数据日（顶层，供门户摘要条"数据日"显示——完整交易日门槛）
         from data.cache import DailyCache
@@ -2974,14 +3149,14 @@ def live_portal_dash() -> dict:
                 else:
                     _sem = f"最新完整交易日 {_td}"
             out["data_semantic"] = _sem
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3139 live_portal_dash")
     try:
         # ★2026-08-14 数据即时性优化：下次计划运行（门户运行状态窗口数据源）
         from deck.system_live import _next_schedule
         out["next_schedule"] = _next_schedule()
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3145 live_portal_dash")
     try:
         # ★#347 API/数据源健康（各关键数据文件新鲜度——门户"当前 API 状态"）
         from deck.system_live import _api_health
@@ -2998,14 +3173,16 @@ def live_portal_dash() -> dict:
                     "implemented": False,
                     "note": "模块未实现（v1.0.9 规划外）",
                 }
-        except Exception:
-            pass
-    except Exception:
-        pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:3163 live_portal_dash")
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3165 live_portal_dash")
     try:
         # ★#289 KPI 历史序列（sparkline 数据源）：从历史文件聚合最近 12 个时点的
         #   机会池 n / Pitch长 n / Pitch短 n（按文件名 mtime 排序取最新 12 个）
-        import glob as _gl, os as _os, json as _js
+        import glob as _gl
+        import json as _js
+        import os as _os
         out["kpi_series"] = {}
         _logs_dir = BASE / "logs"
         _series_map = {
@@ -3021,11 +3198,11 @@ def live_portal_dash() -> dict:
                     _v = _fn(_d)
                     if _v is not None:
                         _ser.append(_v)
-                except Exception:
-                    pass
+                except Exception as _dsh_exc:
+                    _dsh_swallow(_dsh_exc, "deck/live_api.py:3188 live_portal_dash")
             out["kpi_series"][_k] = _ser[-12:]
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3191 live_portal_dash")
     _pd_cache.update({"ts": _now, "data": out})
     return out
 
@@ -3036,6 +3213,30 @@ def live_portal_dash() -> dict:
 # 新因子/新类型自动出现（可塑性设计，免改前端）
 # ══════════════════════════════════════════════════════════════════
 _enums_cache = {"ts": 0, "data": None}
+
+
+def _load_ui_cfg() -> dict:
+    """读取 config/ui.yaml（缺失回退 .example）——导航/文案/会话过滤唯一来源。"""
+    import yaml
+    for name in ("ui.yaml", "ui.yaml.example"):
+        p = BASE / "config" / name
+        if p.exists():
+            try:
+                return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+            except Exception:
+                return {}
+    return {}
+
+
+def live_nav() -> dict:
+    """前端导航 + 文案 + 控制页过滤（AGENTS 铁律：菜单/业务文案不写死在 JS）。"""
+    cfg = _load_ui_cfg()
+    nav = cfg.get("nav") or {}
+    return {"ok": True, "schema_version": "1.0",
+            "main": nav.get("main") or [],
+            "more": nav.get("more") or [],
+            "texts": cfg.get("texts") or {},
+            "control": cfg.get("control") or {}}
 
 
 def live_enums() -> dict:
@@ -3061,40 +3262,44 @@ def live_enums() -> dict:
         # ★2026-08-14 suggest 补位中文名（系统建议补位股，非机会类型，避免前端显示英文 key）
         otypes["suggest"] = "系统建议"
         out["otypes"] = otypes
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3252 live_enums")
     try:
-        from factors.signal_family import CATEGORY_TO_FAMILY, SIGNAL_FAMILY_CN, SIGNAL_FAMILY_COLOR
+        from factors.signal_family import (
+            CATEGORY_TO_FAMILY,
+            SIGNAL_FAMILY_CN,
+            SIGNAL_FAMILY_COLOR,
+        )
         out["families"] = SIGNAL_FAMILY_CN
         out["family_colors"] = SIGNAL_FAMILY_COLOR   # ★#348 族色动态下发（前端不写死颜色）
         cat_cn = {}
         for cat, fam in CATEGORY_TO_FAMILY.items():
             cat_cn[cat] = SIGNAL_FAMILY_CN.get(fam, fam)
         out["categories"] = cat_cn
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3266 live_enums")
     try:
         # ★#348 择时四维（维度中文名 + 权重 + 颜色——前端不写死 DIM_COLORS）
         _dim_w = {"政策": 0.40, "宏观": 0.25, "情绪": 0.20, "宽度": 0.15}
         _dim_colors = {"政策": "#2563eb", "宏观": "#7c3aed", "情绪": "#0891b2", "宽度": "#ea580c"}
         out["timing_dims"] = {k: {"weight": w, "color": _dim_colors.get(k, "#64748b")}
                               for k, w in _dim_w.items()}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3274 live_enums")
     try:
         # ★#348 因子风格颜色（F3 风格状态机 dominant：低波/动量/反转/质量/价值——前端不写死 STYLE_COLORS）
         out["style_colors"] = {"低波": "#16a34a", "动量": "#dc2626", "反转": "#2563eb",
                                "质量": "#8b5cf6", "价值": "#f59e0b"}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3280 live_enums")
     try:
         # ★#351 短线四维打分（tech_pitch_v3 score_breakdown 维度名 + 颜色——前端不写死 sbDims）
         out["tech_dims"] = {"短线表现": {"color": "#2563eb", "weight": 40},
                             "止损安全": {"color": "#16a34a", "weight": 30},
                             "情绪": {"color": "#ea580c", "weight": 20},
                             "龙虎榜": {"color": "#7c3aed", "weight": 10}}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3288 live_enums")
     try:
         # ★2026-08-14 #427 FRC 排雷红旗中文名（r1_cfo_np_low/r4_roe_no_cfo 等 → 中文说明）
         #   前端短线卡原直接渲染英文 id，用户看不懂——动态从 stock_risk_map 提取 id→desc 映射下发
@@ -3107,8 +3312,8 @@ def live_enums() -> dict:
                     _flag_cn[_fid] = _f.get("desc")
         if _flag_cn:
             out["risk_flags"] = _flag_cn
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3302 live_enums")
     _enums_cache.update({"ts": _now, "data": out})
     return out
 
@@ -3136,8 +3341,8 @@ def live_data_assets() -> dict:
             try:
                 n = _cur.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0]
                 out["tables"].append({"name": t, "rows": n})
-            except Exception:
-                pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "deck/live_api.py:3331 live_data_assets")
         _ci = [c[1] for c in _cur.execute("PRAGMA table_info(asset_inventory)").fetchall()]
         for r in _cur.execute("SELECT * FROM asset_inventory").fetchall():
             out["inventory"].append(dict(zip(_ci, r)))
@@ -3159,6 +3364,81 @@ def live_data_assets() -> dict:
 _rt_cache = {"ts": 0.0, "data": None, "err": None}
 
 
+# ★2026-11-20 持仓级实时报价（持仓页专用）：全市场快照交易时段 20~40s，不能进 holdings 请求路径
+_hold_quote_cache = {"ts": 0.0, "key": "", "data": {}}
+
+
+def _sina_symbol(code: str) -> str:
+    """300443.SZ → sz300443；600519.SH → sh600519；920992.BJ → bj920992"""
+    c = str(code or "").strip().upper()
+    if not c:
+        return ""
+    if "." in c:
+        num, ex = c.split(".", 1)
+    else:
+        num, ex = c, ""
+        if num[:1] == "6":
+            ex = "SH"
+        elif num[:2] in ("83", "87", "88", "92", "43"):
+            ex = "BJ"
+        else:
+            ex = "SZ"
+    if not num:
+        return ""
+    return ex.lower() + num
+
+
+def _hold_quotes(codes) -> dict:
+    """持仓级实时报价 {code: {"price": float}}：新浪单票快照批量拉取（3s 超时 + 30s 缓存）。
+    仅用于持仓页盈亏——全市场快照（live_realtime）会把 /api/live/holdings 拖过前端超时。
+    失败返回 {}，调用方回落日线最新收盘。"""
+    import time as _t
+    import urllib.request as _ur
+    _cl = sorted({str(c) for c in (codes or []) if c})
+    if not _cl:
+        return {}
+    _key = ",".join(_cl)
+    _now = _t.time()
+    if _hold_quote_cache["key"] == _key and _now - _hold_quote_cache["ts"] < 30:
+        return _hold_quote_cache["data"]
+    _syms = [s for s in (_sina_symbol(c) for c in _cl) if s]
+    out = {}
+    if _syms:
+        try:
+            _req = _ur.Request(
+                "https://hq.sinajs.cn/list=" + ",".join(_syms),
+                headers={"Referer": "https://finance.sina.com.cn",
+                         "User-Agent": "Mozilla/5.0"})
+            _txt = _ur.urlopen(_req, timeout=3).read().decode("gbk", "ignore")
+            for _seg in _txt.split(";"):
+                if "hq_str_" not in _seg:
+                    continue
+                _sym = _seg.split("hq_str_", 1)[1].split("=", 1)[0].strip()
+                _q = _seg.split('"')
+                if len(_q) < 2 or not _q[1] or len(_sym) < 3:
+                    continue
+                _f = _q[1].split(",")
+                if len(_f) < 4:
+                    continue
+                try:
+                    _open = float(_f[1]) if _f[1] else 0.0   # 字段1 = 今开
+                    _px = float(_f[3])        # 字段3 = 现价（0 表示停牌/未成交）
+                    _prev = float(_f[2]) if _f[2] else 0.0
+                except ValueError:
+                    continue
+                if _px <= 0:
+                    continue
+                out[_sym[2:].upper() + "." + _sym[:2].upper()] = {
+                    "price": _px,
+                    "open": _open if _open > 0 else None,
+                    "pct": round((_px / _prev - 1) * 100, 2) if _prev > 0 else None,
+                }
+        except Exception:
+            out = {}
+    _hold_quote_cache.update({"ts": _now, "key": _key, "data": out})
+    return out
+
+
 def _spot_valid(df) -> bool:
     """实时快照有效性校验：最新价 >0 的比例过低（新浪 920 段占位垃圾全 0）判定为无效源。
     ★2026-09-09 新浪 stock_zh_a_spot 对北交所 920 段解析失败，返回 5559 行全 0 占位。"""
@@ -3172,18 +3452,73 @@ def _spot_valid(df) -> bool:
     return bool(n_up >= max(1, len(df) * 0.5))
 
 
+def _call_timeout(fn, sec):
+    """在 daemon 线程里执行 fn，最多等 sec 秒。
+    ★2026-11-20 akshare 内部 requests 无超时（stock_zh_a_spot_em 分 59 页，实测 ≈130s），
+    socket.setdefaulttimeout 对其不生效 → 必须线程级硬超时，否则接口挂死到客户端超时。"""
+    import threading
+    box = {}
+
+    def _w():
+        try:
+            box["v"] = fn()
+        except Exception as _e:      # noqa: BLE001 —— 原样抛回调用方
+            box["e"] = _e
+
+    _t = threading.Thread(target=_w, daemon=True)
+    _t.start()
+    _t.join(sec)
+    if _t.is_alive():
+        raise TimeoutError(f"实时源超时（>{sec}s）")
+    if "e" in box:
+        raise box["e"]
+    return box.get("v")
+
+
+def _em_spot_paged():
+    """东财 push2 全市场快照（服务端每页上限 100 行 → 并发抓 ~60 页，实测 ≈2s）。
+    ★2026-11-20 替代 akshare stock_zh_a_spot_em：后者串行 59 页 ≈130s，任何合理超时都等不到，
+    等于实时行情永久不可用（旧实现只能靠无限挂起把接口拖死）。返回列名与 akshare 版对齐。"""
+    import json as _json
+    import urllib.request as _ur
+    from concurrent.futures import ThreadPoolExecutor
+    _base = ("https://push2.eastmoney.com/api/qt/clist/get?po=1&np=1&fltt=2&invt=2&fid=f3"
+             "&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048&fields=f2,f3,f6,f12,f14")
+    _head = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
+
+    def _page(pn):
+        _raw = _ur.urlopen(_ur.Request(_base + f"&pn={pn}&pz=100", headers=_head),
+                           timeout=5).read()
+        _d = _json.loads(_raw.decode("utf-8", "ignore")).get("data") or {}
+        return _d.get("total") or 0, _d.get("diff") or []
+
+    total, rows = _page(1)
+    pages = min(120, max(1, (int(total) + 99) // 100))
+    if pages > 1:
+        with ThreadPoolExecutor(max_workers=6) as _ex:
+            for _t, _rows in _ex.map(_page, range(2, pages + 1)):
+                rows.extend(_rows)
+    import pandas as _pd
+    df = _pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df = df.rename(columns={"f12": "代码", "f14": "名称", "f2": "最新价",
+                            "f3": "涨跌幅", "f6": "成交额"})
+    return df[["代码", "名称", "最新价", "涨跌幅", "成交额"]]
+
+
 def _load_real_spot():
-    """多源实时快照：东财(em)优先 → 新浪(sina)备 → 双源均无效返回 (None, None, err)。
-    ★2026-09-09 东财 stock_zh_a_spot_em 当前 RemoteDisconnected（风控断连），新浪返回占位 0 ——
+    """多源实时快照：东财(em，并发分页)优先 → 新浪(sina)备 → 双源均无效返回 (None, None, err)。
     双源降级 + 有效性校验，避免向页面展示全 0 垃圾数据。"""
     import akshare as _ak
-    _tries = [("em", _ak.stock_zh_a_spot_em), ("sina", _ak.stock_zh_a_spot)]
+    _tries = [("em", _em_spot_paged), ("sina", _ak.stock_zh_a_spot)]
     _errs = []
     for _name, _fn in _tries:
         try:
             import socket as _sk
-            _sk.setdefaulttimeout(20)
-            _df = _fn()
+            # ★2026-11-20 20s×2 源 = 最长 40s，远超调用方超时；收紧到 6s（两源合计 ≤12s）
+            _sk.setdefaulttimeout(6)
+            _df = _call_timeout(_fn, 8 if _name == "em" else 5)
             if _spot_valid(_df):
                 return _df, _name, None
             _errs.append(f"{_name}:invalid(占位/空)")
@@ -3281,8 +3616,8 @@ def live_realtime() -> dict:
                 if _pr is not None and not _pd.isna(_pr):
                     _quotes[_std] = {"price": round(float(_pr), 3),
                                      "pct": round(float(_pc), 2) if (_pc is not None and not _pd.isna(_pc)) else None}
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:3606 live_realtime")
         out.update({
             "source": _src,          # ★真实使用的实时源（em/sina），前端可标注
             "n_stocks": int(len(df)),
@@ -3297,15 +3632,18 @@ def live_realtime() -> dict:
         _rt_cache.update({"ts": now, "data": out, "err": None})
     except Exception as e:
         # 拉取失败：有缓存则返回最近（标注陈旧），无则 error
+        # ★2026-11-20 失败也记时间戳：原实现失败不写 ts → 每次调用都重拉 40s（超时雪崩）
         _rt_cache["err"] = str(e)[:120]
         if _rt_cache["data"] is not None:
             out = dict(_rt_cache["data"])
             out["stale"] = True
             out["stale_ts"] = datetime.now().strftime("%H:%M:%S")
+            _rt_cache["ts"] = now
         else:
             out = {"ok": False, "market_open": False,
                    "ts": datetime.now().strftime("%H:%M:%S"),
                    "error": str(e)[:120]}
+            _rt_cache.update({"ts": now, "data": out})
     return out
 
 
@@ -3335,7 +3673,8 @@ _ENDPOINTS = [
 
 
 def _probe_one(path: str, port: int = 8787) -> dict:
-    import urllib.request as _ur, time as _t
+    import time as _t
+    import urllib.request as _ur
     _st = _t.time()
     try:
         with _ur.urlopen(f"http://127.0.0.1:{port}{path}", timeout=25) as _r:
@@ -3361,12 +3700,12 @@ def live_endpoints() -> dict:
     for _w in (live_portal_dash, live_chain, live_alerts, live_calendar):
         try:
             _w()
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/live_api.py:3690 live_endpoints")
     try:
         live_realtime()   # 新浪快照拉取（60s 缓存命中后 <1ms）
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3694 live_endpoints")
     out = {"ok": True, "ts": datetime.now().strftime("%H:%M:%S"),
            "total": len(_ENDPOINTS), "endpoints": []}
     try:
@@ -3423,8 +3762,8 @@ def live_wufu_rotation() -> dict:
             out["weak_vote"] = g.get("weak_vote")
             out["defensive"] = g.get("global_rotation")
             out["date"] = g.get("date") or out["date"]
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/live_api.py:3752 live_wufu_rotation")
     return out
 
 

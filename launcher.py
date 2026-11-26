@@ -2,13 +2,24 @@
 """QuantDeck 启动器：一键启动 量化 Deck（:8787）+ DeepSeek HARNESS（:3080）。
 
 行为：
-  - 数据目录：环境变量 LWQUANT_CACHE_DIR > EXE/仓库 同级 data/
+  - 数据目录：环境变量 LWQUANT_CACHE_DIR > EXE/仓库 同级 data/cache/
   - HARNESS：若存在 harness/ 运行时且系统有 Node.js → 自动启动（DSH_HOME=harness/home）
     · 首次使用：把 harness/home/.credentials.yaml.example 复制为 .credentials.yaml
       并填入 DeepSeek API Key（先接 AI 的 API，AI 会协助你接入其余数据源 API）
     · 没有 Node.js 时跳过 HARNESS（量化系统照常运行）
   - 浏览器：自动打开 量化门户 http://127.0.0.1:8787（HARNESS GUI 为 3080，可手动打开）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import os
 import shutil
 import subprocess
@@ -75,14 +86,15 @@ def _open_browsers():
     time.sleep(2.0)
     try:
         webbrowser.open("http://127.0.0.1:8787")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "launcher.py:78 _open_browsers")
 
 
 def main():
     base = base_dir()
     if not os.environ.get("LWQUANT_CACHE_DIR"):
-        os.environ["LWQUANT_CACHE_DIR"] = str(base / "data")
+        # ★2026-08-22 修复：须指向含 bars.db 的目录（data/cache/），data/ 下的是空占位库
+        os.environ["LWQUANT_CACHE_DIR"] = str(base / "data" / "cache")
     data_dir = os.environ["LWQUANT_CACHE_DIR"]
     print(f"[QuantDeck] 数据目录: {data_dir}")
     if not (Path(data_dir) / "bars.db").exists():

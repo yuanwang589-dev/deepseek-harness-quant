@@ -21,6 +21,17 @@
 输出：output/timing_system_{ts}.json（时间戳文件名，写保护免疫）+ 固定名兼容
 UI：Pitch 页顶部一行式状态条（live_patch /api/live/timing 消费）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import glob
 import json
 import math
@@ -34,7 +45,9 @@ BASE = Path(__file__).resolve().parent.parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
-BARS_DB = r"data/cache/bars.db"
+from data.cache import CACHE_DIR
+
+BARS_DB = str(CACHE_DIR / "bars.db")
 OUT_DIR = BASE / "output"
 
 
@@ -67,29 +80,29 @@ def _merged_max_date() -> str:
     conns = []
     try:
         conns.append(_bars_conn())
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:72 _merged_max_date")
     try:
         from pathlib import Path as _P
         for _p in sorted(_P(BARS_DB).parent.glob("bars_incr_*.db"))[-3:]:
             try:
                 conns.append(sqlite3.connect(f"file:{_p}?mode=ro&immutable=1", uri=True, timeout=3))
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:79 _merged_max_date")
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:81 _merged_max_date")
     for _c in conns:
         try:
             r = _c.execute("SELECT MAX(date) FROM daily_bar").fetchone()[0]
             if r and (mx is None or r > mx):
                 mx = r
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:88 _merged_max_date")
         finally:
             try:
                 _c.close()
-            except Exception:
-                pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:93 _merged_max_date")
     if mx:
         _merged_max_cache.update(t=now, v=mx)
     return mx or ""
@@ -142,8 +155,8 @@ def policy_score() -> dict:
             # ★#351 精简 note：结论式（公式细节 EPU+社融+利差 → 说明页），reason 用 short
             _note = f"{_feel}（{_bk} {_d.get('month','')}）"
             return {"score": _sc, "note": _note, "short": _feel}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:147 policy_score")
     try:
         from factors.policy.epu_factors import load_epu_monthly
         df = load_epu_monthly()
@@ -242,8 +255,8 @@ def macro_score() -> dict:
                     if dv is not None and abs(dv) >= 0.095 and (m60 is None or m60 < 0):
                         sc = max(15, sc - 15)   # 分化极端(≥9.5pp)+等权弱 → 降 15 分
                         note += "｜等权分化降档"
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:247 macro_score")
         sc = max(5, min(100, sc))
         return {"score": sc, "note": note, "short": _rl_cn}
     except Exception as e:
@@ -280,8 +293,8 @@ def sentiment_score() -> dict:
                               .replace("（加仓区）", "").replace("买入区", "").strip()) or "中性"
                     return {"score": sc, "note": note, "short": _short}
                 break
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:285 sentiment_score")
     # bars 兜底（外包温度计缺失）：保持原涨停密度逻辑，note 标注兜底
     try:
         con = _bars_conn()
@@ -362,8 +375,8 @@ def breadth_score() -> dict:
                 note = "｜".join(note_parts)
                 _short = "恐慌" if sc >= 80 else ("偏冷" if sc >= 60 else ("中性" if sc >= 40 else ("偏热" if sc >= 30 else "亢奋")))
                 return {"score": sc, "note": note, "short": _short}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:367 breadth_score")
     # bars 兜底（外包快照缺失）：当日上涨家数占比
     try:
         con = _bars_conn()
@@ -434,8 +447,8 @@ def _style_state() -> dict:
                 "divergence_60": dv, "ind_breadth_60": ib, "crowding_pctile": cp,
                 "fresh": True, "snap_file": _sf.get("file"),
                 "evidence": "H30 行业轮动 + H27 大小盘分化 + C-10 量化拥挤（外包快照）"}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:439 _style_state")
     return {"style": "未知", "note": "快照读取失败"}
 
 
@@ -523,8 +536,8 @@ def write_outputs(r: dict) -> Path:
     try:
         (OUT_DIR / "timing_system.json").write_text(
             json.dumps(r, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:528 write_outputs")
     return p
 
 
@@ -533,8 +546,8 @@ def latest() -> dict:
     if fs:
         try:
             return json.loads(Path(fs[-1]).read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:538 latest")
     return {}
 
 
