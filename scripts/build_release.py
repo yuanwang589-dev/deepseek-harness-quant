@@ -19,6 +19,13 @@ ROOT = Path(__file__).resolve().parent.parent
 TOP_SKIP = {"build", "backups", "updates", "__pycache__", ".venv"}
 # 内部维护文档（含本机路径，不进公开发布包）
 SKIP_REL = {"docs/上传GitHub.md", "docs/发布清单_v1.0.9.md"}
+# ★2026-11-10 修复：原只排除 build/backups/updates/__pycache__/.venv → 3.2GB 行情库、
+#   281MB 日志、.git 全部进包（违反「行情数据禁止再分发」）。
+SKIP_PREFIX = ("data/cache/", "data/factorpool/output/", "data/trash/", "logs/", "output/",
+               "report/", ".git/", ".venv/", ".pytest_cache/", ".ruff_cache/",
+               ".arts/", ".pi/", ".codeartsdoer/", ".playwright-mcp/", "updates/", "backups/")
+SKIP_DIRS = {"__pycache__", ".git", ".venv", ".pytest_cache", ".ruff_cache",
+             ".arts", ".pi", ".codeartsdoer", ".playwright-mcp"}
 
 
 def main():
@@ -36,15 +43,15 @@ def main():
     with zipfile.ZipFile(str(out), "w", zipfile.ZIP_DEFLATED) as z:
         for root, dirs, files in os.walk(ROOT):
             if root == str(ROOT):
-                dirs[:] = [d for d in dirs if d not in TOP_SKIP]
+                dirs[:] = [d for d in dirs if d not in TOP_SKIP and d not in SKIP_DIRS]
             else:
-                dirs[:] = [d for d in dirs if d not in ("__pycache__",)]
+                dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
             for f in files:
                 if f.endswith((".zip", ".exe")):
                     continue
                 p = os.path.join(root, f)
                 rel = os.path.relpath(p, ROOT).replace("\\", "/")
-                if rel in SKIP_REL:
+                if rel in SKIP_REL or any(rel.startswith(x) for x in SKIP_PREFIX):
                     continue
                 z.write(p, "DSHQuant/" + rel)
                 n += 1

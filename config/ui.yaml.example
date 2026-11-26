@@ -1,0 +1,24 @@
+# 前端导航 / 文案 / 会话过滤模板（复制为 ui.yaml 后按需修改）
+nav:
+  main:
+    - { id: portal, label: 门户, icon: home, url: / }
+    - { id: control, label: 控制, icon: cpu, url: /control }
+    - { id: pitch, label: 决策, icon: target, url: /pitch }
+    - { id: holdings, label: 持仓, icon: bar, url: /holdings }
+    - { id: factors, label: 因子, icon: molecule, url: /factors }
+    - { id: backtest, label: 回测, icon: chart, url: /backtest }
+    - { id: pitchtrack, label: 远期, icon: funnel, url: /pitchtrack }
+  more:
+    - { id: report, label: 日报, icon: doc, url: /report }
+    - { id: data, label: 数据, icon: db, url: /data }
+    - { id: help, label: 说明, icon: help, url: /help }
+
+texts:
+  turnlow_title: "turn_low 防守主力参考"
+  turnlow_sub: "40日调仓 top20 · T+1 · 无止损无择时"
+  turnlow_main_note: "主力组合候选（回测口径见回测页归档）：pitch 高分集中持仓回撤显著大于分散组合 → 主力走 turn_low 分散，pitch 高分只做卫星仓。"
+  turnlow_rebalance_note: "40 交易日一次调仓；每周一 19:15 链后以新分数为准（turn 覆盖率以接口返回为准）。"
+  timing_weight_text: ""
+
+control:
+  session_title_exclude: []

@@ -19,7 +19,11 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-import py7zr
+
+try:
+    import py7zr
+except ImportError:  # 延迟到 main 检查，避免 import 期直接崩
+    py7zr = None
 
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
@@ -138,6 +142,9 @@ def ingest_7z_file(path: Path) -> tuple:
 
 
 def main():
+    if py7zr is None:
+        print("缺少依赖 py7zr（分钟 7z 解压必需）：pip install py7zr")
+        return 2
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", type=str, default=None)
     ap.add_argument("--file", type=str, default=None)

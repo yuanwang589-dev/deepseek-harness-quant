@@ -34,6 +34,13 @@
   .stop-item { padding:6px 0; border-bottom:1px dashed rgba(255,255,255,.08); }
   .stop-item:last-child { border-bottom:none; }
   .stop-item .pos-kv { border-bottom:none; }
+  /* ★2026-11-20 自动买卖开关 */
+  .auto-switch { position:relative; display:inline-block; width:44px; height:24px; flex:none; }
+  .auto-switch input { opacity:0; width:0; height:0; }
+  .auto-slider { position:absolute; inset:0; background:#3a3a42; border-radius:999px; transition:background .2s; cursor:pointer; }
+  .auto-slider:before { content:""; position:absolute; width:18px; height:18px; left:3px; top:3px; background:#fff; border-radius:50%; transition:transform .2s; }
+  .auto-switch input:checked + .auto-slider { background:#27ae60; }
+  .auto-switch input:checked + .auto-slider:before { transform:translateX(20px); }
 </style>
 </head>
 <body style="background:var(--bg);margin:0">
@@ -43,6 +50,16 @@
 
   <!-- KPI 区 -->
   <div class="v2-kpi anim-stagger" id="kpi-box"></div>
+
+  <!-- 自动买卖开关（★2026-11-20：一键开关 config auto_execute.enabled） -->
+  <div class="v2-card anim-fade-in-up" style="margin-top:12px;display:flex;align-items:center;gap:12px;padding:12px 16px">
+    <span style="font-weight:600;font-size:14px">自动买卖</span>
+    <label class="auto-switch" title="开启后：每日自动卖出止损/止盈触发股，并买入 pitch 前 N">
+      <input type="checkbox" id="auto-exec-chk">
+      <span class="auto-slider"></span>
+    </label>
+    <span class="mini" id="auto-exec-meta" style="color:var(--muted)">加载中…</span>
+  </div>
 
   <!-- regime + 净值 -->
   <div class="v2-card anim-fade-in-up" style="margin-top:14px">
@@ -90,8 +107,10 @@
     if (sp.stop_loss_pct != null) parts.push('硬止损 ' + (sp.stop_loss_pct * 100).toFixed(0) + '%');
     if (sp.time_stop_weeks != null) parts.push('时间 ' + sp.time_stop_weeks + ' 周');
     if (sp.max_drawdown_pct != null) parts.push('回撤 ' + (sp.max_drawdown_pct * 100).toFixed(0) + '%');
+    if (sp.high_drawdown_exit != null) parts.push('高点回撤 ' + (sp.high_drawdown_exit * 100).toFixed(0) + '%');
     if (sp.trailing_ma != null) parts.push('MA' + sp.trailing_ma);
-    return parts.length ? parts.join(' · ') : '—';
+    if (!parts.length) return '—';
+    return parts.join(' · ') + (sp.estimated ? '（规则推导）' : '');
   }
 
   // ★#410 净值折线图（组合净值 vs 基准，SVG 双线，替换原简陋竖条）
@@ -132,7 +151,7 @@
   }
 
   function loadAll() {
-    LW.api.get('/api/live/holdings').then(function (d) {
+    LW.api.get('/api/live/holdings', { timeout: 12000 }).then(function (d) {
       var pf = d.portfolio || {};
       var pnl = d.pnl || {};
       var pr = d.position_risk || {};
@@ -152,21 +171,26 @@
       var n = heldPos.length;
 
       /* KPI 4 卡 */
+      // ★2026-11-20 单位统一：pnl.total_ret / perf.stats.* 都是小数比率（-0.004 = -0.4%），
+      //   原前端直接 toFixed(2) 当百分数 → 「组合收益 -0.00%」「超额 0.09%（应为 -8.65%）」
       var tv = pnl.total_value != null && !isNaN(pnl.total_value) ? pnl.total_value : null;
-      var tr = pnl.total_ret != null && !isNaN(pnl.total_ret) ? pnl.total_ret : null;
-      var sret = stats.total_ret != null && !isNaN(stats.total_ret) ? stats.total_ret : null;
+      var tr = pnl.total_ret != null && !isNaN(pnl.total_ret) ? pnl.total_ret * 100 : null;
+      var sret = stats.total_ret != null && !isNaN(stats.total_ret) ? stats.total_ret * 100 : null;
       // ★2026-08-14 收益口径统一：持仓市值与组合收益都用 pnl 实时口径（盘中实时价），
       //   日线 stats.total_ret 仅作净值曲线/超额展示（样本积累期二者相近，盘中实时优先）
       var sretReal = tr;   // 实时组合收益（pnl 已实时化）
-      var sretNote = sretReal != null && stats.days > 0 && sret != null && Math.abs(sretReal - sret) > 0.005
+      var sretNote = sretReal != null && stats.days > 0 && sret != null && Math.abs(sretReal - sret) > 0.5
         ? '（盘中实时）' : '';
-      var ex = stats.excess != null && !isNaN(stats.excess) ? stats.excess : null;
+      var ex = stats.excess != null && !isNaN(stats.excess) ? stats.excess * 100 : null;
       var riskList = pr.per_stock || pr.positions || [];
       var nWatch = riskList.filter(function (r) { return (r.risk_level || r.status) === 'WATCH'; }).length;
-      function delta(v) { return v == null ? '<span class="d-flat">—</span>' : (v > 0 ? '<span class="d-up">' + Math.abs(v).toFixed(2) + '%</span>' : v < 0 ? '<span class="d-down">' + Math.abs(v).toFixed(2) + '%</span>' : '<span class="d-flat">0%</span>'); }
+      function delta(v) { return v == null ? '<span class="d-flat">—</span>' : (v > 0 ? '<span class="d-up">+' + Math.abs(v).toFixed(2) + '%</span>' : v < 0 ? '<span class="d-down">-' + Math.abs(v).toFixed(2) + '%</span>' : '<span class="d-flat">0%</span>'); }
+      // ★2026-11-20 金额口径：无股数时 total_value 是 1 股同权虚拟值（22 元 ≠ 万元），显示"—"并标注
+      var eqBasis = pnl.value_basis === 'equal_weight';
+      var tvTxt = tv != null && !eqBasis ? (tv / 10000).toFixed(2) + ' 万' : '—';
       var kpis = [
         { lb: '持仓数', vl: n + ' / ' + (pf.max_positions || 5), dt: '剩余 ' + Math.max(0, (pf.max_positions || 5) - n) + ' 名额', num: null },
-        { lb: '持仓市值', vl: tv != null ? (tv / 10000).toFixed(2) + ' 万' : '—', dt: tr != null ? '收益 ' + delta(tr) : '成本 ' + (pnl.total_cost != null && !isNaN(pnl.total_cost) ? pnl.total_cost.toFixed(0) : '—'), num: tv != null ? (tv / 10000).toFixed(2) + ' 万' : null },
+        { lb: '持仓市值', vl: tvTxt, dt: eqBasis ? '未记股数 · 仅收益率' : (tr != null ? '收益 ' + delta(tr) : '成本 ' + (pnl.total_cost != null && !isNaN(pnl.total_cost) ? pnl.total_cost.toFixed(0) : '—')), num: !eqBasis && tv != null ? tvTxt : null },
         { lb: '组合收益', vl: sretReal != null ? (sretReal >= 0 ? '+' : '') + sretReal.toFixed(2) + '%' : '—', dt: (sretNote ? sretNote + ' · ' : '') + (ex != null ? '超额 ' + delta(ex) : '样本积累中'), num: sretReal != null ? (sretReal >= 0 ? '+' : '') + sretReal.toFixed(2) + '%' : null },
         { lb: '风控', vl: (riskList.length ? (riskList.length - nWatch) + '/' + riskList.length : '—'), dt: nWatch > 0 ? nWatch + ' 只 WATCH' : '全部 PASS', num: null }
       ];
@@ -194,7 +218,7 @@
           '<div class="mini" style="display:flex;gap:16px;margin-top:8px">' +
           '<span style="display:inline-flex;align-items:center;gap:5px"><span style="display:inline-block;width:14px;height:3px;background:#5e6ad2;border-radius:2px"></span>组合净值</span>' +
           '<span style="display:inline-flex;align-items:center;gap:5px"><span style="display:inline-block;width:14px;height:3px;background:#3f3f46;border-radius:2px"></span>基准</span></div>';
-        document.getElementById('perf-sub').innerHTML = (stats.days || 0) + ' 交易日 · 最大回撤 ' + pct(stats.max_dd, 1) + ' · 基准 ' + (stats.bench_ret != null ? stats.bench_ret.toFixed(2) + '%' : '—');
+        document.getElementById('perf-sub').innerHTML = (stats.days || 0) + ' 交易日 · 最大回撤 ' + pct(stats.max_dd, 1) + ' · 基准 ' + pct(stats.bench_ret, 2);
       }
 
       /* 持仓卡片（人工/程序分组）★2026-08-14 超限透明 + 实时价标注 */
@@ -207,7 +231,9 @@
           var src = p.source === 'deck' ? '程序' : '人工';
           var srcCls = p.source === 'deck' ? 'chip-deck' : 'chip-manual';
           var tps = p.take_profit || {};
-          var tpTxt = tps.target_pct != null ? '+' + (tps.target_pct * 100).toFixed(0) + '%' : '—';
+          // ★2026-11-20 estimated = 目标止盈来自类型规则（非该股专属目标）→ 标「规则推导」
+          var tpTag = tps.estimated ? '（规则推导）' : '';
+          var tpTxt = tps.target_pct != null ? '+' + (tps.target_pct * 100).toFixed(0) + '%' + tpTag : '—';
           var stopTxt = stopPlanTxt(p.stop_plan || p.stop);
           var rl = p.risk_level || p.status || '—';
           var rlCls = (rl === 'WATCH' || rl === 'watch') ? 'warn' : 'ok';
@@ -280,7 +306,14 @@
           if (a.code && (a.status === 'NEAR' || a.status === 'TRIGGERED')) stopCodes[a.code] = a.status;
         });
         var tpCodes = {};
-        (tp.positions || []).forEach(function (p) { if (p.code) tpCodes[p.code] = 1; });
+        (tp.positions || []).forEach(function (p) {
+          // ★2026-11-20 只有 target/pullback/time 信号才算「止盈信号」；
+          //   hold（正常持有）此前也被计入 → 状态机把全部持仓显示成「止盈信号 5」
+          var hasTp = (p.signals || []).some(function (s) {
+            return s.type === 'target' || s.type === 'pullback' || s.type === 'time';
+          });
+          if (p.code && hasTp) tpCodes[p.code] = 1;
+        });
         function stateOf(p) {
           if (stopCodes[p.code] === 'TRIGGERED') return 'triggered';
           if (stopCodes[p.code] === 'NEAR') return 'near';
@@ -339,7 +372,8 @@
       var ieTxt = ie.top_industry ? '行业敞口：' + ie.top_industry + (ie.top_industry_pct != null ? ' ' + (ie.top_industry_pct * 100).toFixed(0) + '%' : '') + (ie.flag ? '（' + ie.flag + '）' : '') : '';
       document.getElementById('industry-box').innerHTML = ieTxt || '';
     }).catch(function (e) {
-      document.getElementById('pos-box').innerHTML = '<div class="mini" style="color:var(--red)"> ' + e + '</div>';
+      var msg = (e && e.message) ? e.message : String(e);
+      document.getElementById('pos-box').innerHTML = '<div class="mini" style="color:var(--red)">持仓数据加载失败：' + msg + '（60s 后自动重试）</div>';
     });
   }
 
@@ -350,6 +384,47 @@
     if (otypeCN && Object.keys(otypeCN).length) { cb(); return; }
     LW.api.get('/api/live/enums').then(function (e) { otypeCN = e.otypes || {}; }).catch(function () {}).then(cb);
   }
+  /* ★2026-11-20 自动买卖开关：GET 状态 / POST 切换（写 config auto_execute.enabled） */
+  function renderAutoBar() {
+    LW.api.get('/api/auto_execute', { timeout: 8000 }).then(function (d) {
+      var cfg = d.config || {}, last = d.last || null;
+      var chk = document.getElementById('auto-exec-chk');
+      if (chk) chk.checked = !!cfg.enabled;
+      var meta = document.getElementById('auto-exec-meta');
+      if (meta) {
+        var tags = [];
+        if (cfg.sell_on_stop !== false) tags.push('止损自动卖');
+        if (cfg.sell_on_take_profit !== false) tags.push('止盈自动卖');
+        var tail = last && last.ts
+          ? ' · 上次 ' + last.ts + '：卖 ' + (last.sells || 0) + ' 买 ' + (last.buys || 0) + (last.errors ? ' 错 ' + last.errors : '')
+          : ' · 尚未执行';
+        meta.textContent = (cfg.enabled ? '已开启' : '已关闭') + ' · 前 ' + (cfg.buy_n || 3) + ' 名 · '
+          + (tags.join(' / ') || '无动作') + tail;
+      }
+    }).catch(function () {
+      var meta = document.getElementById('auto-exec-meta');
+      if (meta) meta.textContent = '状态加载失败（服务未就绪）';
+    });
+  }
+  (function bindAutoBar() {
+    var chk = document.getElementById('auto-exec-chk');
+    if (!chk) return;
+    chk.addEventListener('change', function () {
+      var v = chk.checked;
+      chk.disabled = true;
+      LW.api.post('/api/auto_execute', { enabled: v }).then(function (r) {
+        chk.disabled = false;
+        LW.api.clear('/api/auto_execute');
+        renderAutoBar();
+      }).catch(function (e) {
+        chk.disabled = false;
+        chk.checked = !v;
+        var meta = document.getElementById('auto-exec-meta');
+        if (meta) meta.textContent = '切换失败：' + ((e && e.message) || e);
+      });
+    });
+    renderAutoBar();
+  })();
   ensureEnums(function () {
     loadAll();
     LW.decide.bind(document.getElementById('pos-box'));

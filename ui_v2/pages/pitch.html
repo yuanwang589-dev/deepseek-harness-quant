@@ -237,21 +237,27 @@
   }
   function stopPlanHtml(sp) {
     sp = sp || {};
-    if (sp.desc) {   // 长线格式（pitch_v2 _type_stop）
-      return '<div class="pv-stop"><div class="pv-stop-t">止损方案</div>' +
-        '<div class="pv-stop-d">' + R._f(sp.desc) + '</div>' +
-        '<div class="pv-stop-m">' +
-          (sp.stop_loss_pct != null ? '硬止损 <b>' + (sp.stop_loss_pct * 100).toFixed(0) + '%</b>' : '触发条件驱动') +
-          (sp.time_stop_weeks ? ' · 时间止损 ' + sp.time_stop_weeks + ' 周' : '') +
-          (sp.trailing_ma ? ' · 移动 MA' + sp.trailing_ma : '') + '</div>' +
-        ((sp.logic_fail_rules || []).map(function (r) { return '<div class="pv-stop-f">' + r.name + '：' + r.rule + '（' + r.action + '）</div>'; }).join('')) + '</div>';
-    } else if (sp.atr_stop != null || sp.stop_loss_pct != null) {   // 短线格式（tech_pitch_v3）
+    if (sp.atr_stop != null || sp.short_line != null) {   // 短线格式（tech_pitch_v3）
       return '<div class="pv-stop"><div class="pv-stop-t">止损方案（短线）</div>' +
         '<div class="pv-stop-d">ATR20 双倍线止损' + (sp.atr_stop != null ? '，现价下方 <b>' + sp.atr_stop + '</b> 为执行位（跌破即走）' : '') + '</div>' +
         '<div class="pv-stop-m">' + (sp.stop_loss_pct != null ? '硬止损 <b>' + (sp.stop_loss_pct * 100).toFixed(0) + '%</b>' : '') +
           (sp.trailing_ma ? ' · 移动 MA' + sp.trailing_ma : '') + '</div></div>';
     }
-    return '';
+    // 长线格式（pitch_v2 + type_stop_plan 补值）
+    var has = ['stop_loss_pct', 'time_stop_weeks', 'max_drawdown_pct', 'high_drawdown_exit', 'trailing_ma']
+      .some(function (k) { return sp[k] != null; });
+    if (!has && !(sp.logic_fail_rules || []).length) return '';
+    return '<div class="pv-stop"><div class="pv-stop-t">止损方案</div>' +
+      // estimated = 参数由类型规则补全；生成时的 desc 可能与补全后的参数矛盾（如"回撤超 20%" vs 8%），不展示
+      ((sp.desc && !sp.estimated) ? '<div class="pv-stop-d">' + R._f(sp.desc) + '</div>' : '') +
+      '<div class="pv-stop-m">' +
+        (sp.stop_loss_pct != null ? '硬止损 <b>' + (sp.stop_loss_pct * 100).toFixed(0) + '%</b>' : '触发条件驱动') +
+        (sp.time_stop_weeks ? ' · 时间止损 ' + sp.time_stop_weeks + ' 周' : '') +
+        (sp.max_drawdown_pct != null ? ' · 回撤 ' + (sp.max_drawdown_pct * 100).toFixed(0) + '%' : '') +
+        (sp.high_drawdown_exit != null ? ' · 高点回撤 ' + (sp.high_drawdown_exit * 100).toFixed(0) + '%' : '') +
+        (sp.trailing_ma ? ' · 移动 MA' + sp.trailing_ma : '') +
+        (sp.estimated ? ' <span style="color:var(--muted)">（规则推导）</span>' : '') + '</div>' +
+      ((sp.logic_fail_rules || []).map(function (r) { return '<div class="pv-stop-f">' + R._f(r.name) + '：' + R._f(r.rule) + '（' + R._f(r.action) + '）</div>'; }).join('')) + '</div>';
   }
   function pitchCard(o, latest) {
     var h = o.horizons || {};
@@ -343,10 +349,11 @@
     var risks = (o.risk_flags_detail || []).map(function (r) { return '<div class="pv-risk-item">' + R._f(r.desc) + '</div>'; }).join('');
     var bn = (o.beneish && o.beneish.level && o.beneish.level !== 'LOW') ? '<div class="pv-risk-item">Beneish ' + R._f(o.beneish.level) + '（M=' + R._f(o.beneish.m_score) + '）财务操纵风险</div>' : '';
     var sp = o.stop_plan || {};
-    var hedge = sp.desc ? '<div class="pv-hedge" style="margin-top:2px"><b>对冲</b> ' + R._f(sp.desc) + '</div>' : '';
-    var logic = (sp.logic_fail_rules || []).map(function (r) { return '<div class="pv-hedge">' + R._f(r.name) + '：' + R._f(r.rule) + ' → ' + R._f(r.action) + '</div>'; }).join('');
+    // ★2026-11-20 stopPlanHtml 原先定义了却从未调用 → 长线卡只有"对冲"一句话、看不到具体止损参数
+    var stopHtml = stopPlanHtml(sp);
     var q3 = '<div class="pv-q"><div class="pv-q-t"><span class="pv-q-n">③</span>致命风险与对冲</div>' +
-      (risks || bn || '<div class="pv-hedge">无红旗风险</div>') + hedge + logic + '</div>';
+      (risks || bn || '<div class="pv-hedge">无红旗风险</div>') +
+      (stopHtml || '<div class="pv-hedge">止损方案未配置</div>') + '</div>';
 
     return '<div class="pv-card anim-hover-lift">' +
       '<div class="pv-head"><span class="pv-code">' + R._f(o.code) + '</span><span class="pv-nm">' + R._f(o.name) + '</span>' +
@@ -737,19 +744,26 @@
 
   /* ★2026-08-15 turn_low 防守主力参考（L1 · 双轨决策支持：主力组合候选，非指令） */
   function loadTurnlowRef(box) {
-    LW.api.get('/api/live/turnlow_top?top_n=20').then(function (d) {
+    Promise.all([
+      LW.api.get('/api/live/turnlow_top?top_n=20'),
+      LW.api.get('/api/live/nav')
+    ]).then(function (res) {
+      var d = res[0] || {}, nav = res[1] || {}, tx = nav.texts || {};
       var items = (d.items) || [];
       var chips = items.map(function (x) {
         return '<span style="display:inline-flex;align-items:center;gap:5px;background:#131316;border:1px solid #2a2a30;border-radius:8px;padding:4px 9px;margin:2px 3px 2px 0;font-size:12px">' +
           '<b style="color:var(--navy)">' + x.code + '</b> ' + R._f(x.name || '').slice(0, 6) + '</span>';
       }).join('');
       var cov = d.coverage_pct != null ? d.coverage_pct + '%' : '—';
+      var title = tx.turnlow_title || 'turn_low 防守主力参考';
+      var sub = tx.turnlow_sub || '40日调仓 top20 · T+1 · 无止损无择时';
+      var mainNote = tx.turnlow_main_note || '主力组合候选（回测口径见回测页归档）：pitch 高分集中持仓回撤显著大于分散组合 → 主力走 turn_low 分散，pitch 高分只做卫星仓。';
+      var rebNote = tx.turnlow_rebalance_note || '40 交易日一次调仓；每周一 19:15 链后以新分数为准（turn 覆盖率以接口返回为准）。';
       box.innerHTML = '<div class="v2-card" style="margin-top:0;border-left:3px solid var(--green)">' +
-        '<h2> turn_low 防守主力参考 <span class="tag">40日调仓 top20 · T+1 · 无止损无择时 · 数据 ' + R._f(d.date, '—') + '（turn 覆盖 ' + cov + '）</span></h2>' +
+        '<h2> ' + title + ' <span class="tag">' + sub + ' · 数据 ' + R._f(d.date, '—') + '（turn 覆盖 ' + cov + '）</span></h2>' +
         '<div class="mini" style="margin-bottom:8px;color:#a1a1aa;line-height:1.8">' +
-          '<b style="color:#4ade80">主力组合候选</b>（实证 +15.9%/-8.7%/1.11 · 2019+）：' +
-          'pitch 高分集中持仓 = -41~-60% 回撤（雷达非引擎）→ 主力建议走 turn_low 分散，pitch 高分只做卫星仓。<br>' +
-          '<span style="opacity:.7">调仓 40 交易日一次（下次约 08-28）；周一 19:15 链后以新分数为准（turn 100%）。</span></div>' +
+          '<b style="color:#4ade80">主力组合候选</b>：' + mainNote + '<br>' +
+          '<span style="opacity:.7">' + rebNote + '</span></div>' +
         '<div style="line-height:2.2">' + (chips || '<div class="mini">暂无数据</div>') + '</div></div>';
     }).catch(function () { box.innerHTML = ''; });
   }

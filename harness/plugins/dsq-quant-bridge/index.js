@@ -25,6 +25,7 @@ module.exports = {
     const DSH_HOME = process.env.DSH_HOME || (require('os').homedir() + '/.dsh')
     const ARCH_FILE = DSH_HOME + '/quantapi_archived.json'
     const NIU_FILE = DSH_HOME + '/quantapi_niu_chat.json'
+    const QUANT_FILE = DSH_HOME + '/quantapi_quant_chat.json'   // ★2026-09-09 chat2 会话历史（桥自管，headless CLI 不落面板面）
     const SKILL_DIR = require('path').join(__dirname, '..', '..', '..', 'assets', 'skills') + '/'
     const PERSONAS = {
       linyuan: { name: '林园', dir: 'niu-san-linyuan' },
@@ -35,10 +36,17 @@ module.exports = {
       fengliu: { name: '冯柳', dir: 'niu-san-fengliu' },
     }
     const CORS = {
-      'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Access-Control-Request-Private-Network',
       'Access-Control-Allow-Private-Network': 'true',
+      'Vary': 'Origin',
+    }
+    // ★2026-11-10 安全修复：原 ACAO:* + 写接口零校验 → 任意网页可清空会话/消耗额度。
+    //   仅回显本机来源；无 Origin 的本地脚本放行（服务只绑定 loopback）。
+    function originAllowed(req) {
+      const o = String((req && req.headers && req.headers.origin) || '')
+      if (!o) return true
+      return /^http:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/.test(o)
     }
     let cacheSessions = null
     let cacheAt = 0
@@ -46,6 +54,8 @@ module.exports = {
     let archivedIds = {}
     let niuChats = {}
     let niuBusy = {}
+    let quantChats = {}     // ★2026-09-09 chat2 会话历史（sid → [{role,text}]，桥自管防 CLI 秒崩无回复）
+    let quantBusy = {}      // 会话级防重入
     const CORE_WORD = '主系统'
 
     async function loadStore() {
@@ -64,6 +74,13 @@ module.exports = {
         const d = JSON.parse(txt)
         if (d && typeof d === 'object') niuChats = d
       } catch (e) {}
+      try {
+        if (!fsSvc) return
+        const t = await fsSvc.resolve(QUANT_FILE)
+        const txt = await fsSvc.readText(t)
+        const d = JSON.parse(txt)
+        if (d && typeof d === 'object') quantChats = d
+      } catch (e) {}
     }
     async function saveStore() {
       try {
@@ -77,6 +94,13 @@ module.exports = {
         if (!fsSvc) return
         const t = await fsSvc.resolve(NIU_FILE)
         await fsSvc.writeText(t, JSON.stringify(niuChats))
+      } catch (e) {}
+    }
+    async function saveQuant() {
+      try {
+        if (!fsSvc) return
+        const t = await fsSvc.resolve(QUANT_FILE)
+        await fsSvc.writeText(t, JSON.stringify(quantChats))
       } catch (e) {}
     }
     function markArchived(id) {
@@ -137,6 +161,69 @@ module.exports = {
         await saveNiu()
       } finally {
         niuBusy[persona] = false
+      }
+    }
+
+    // ★2026-09-09 控制页 chat2 修复：原实现 spawn ['node','npx',... '--profile','headless','--resume',sid] 命令拼错
+    //   （node 试图加载 cwd 下的 npx 脚本 + headless 不支持 --resume）→ 子进程秒崩 → 前端 90s 空等 "无回复"。
+    //   改为与 niuGenerate 同构方案：llm.stream 直接生成，回复写入桥自管 quantChats（recent 优先读）。
+    async function quantGenerate(sid, text) {
+      if (quantBusy[sid]) return
+      quantBusy[sid] = true
+      try {
+        let hist = quantChats[sid] || []
+        if (!hist.length) {
+          try {
+            const sf = sessionQuery ? await sessionQuery.readSurface(sid) : null
+            const evs = (sf && Array.isArray(sf.events)) ? sf.events : []
+            for (let i = 0; i < evs.length; i++) {
+              const _r = roleOf(evs[i])
+              const _t = textOf(evs[i])
+              if (_r && _t && !isInjected(_t)) hist.push({ role: _r, text: _t })
+            }
+          } catch (e) {}
+        }
+        hist = hist.slice(-8)
+        hist.push({ role: 'user', text: String(text).slice(0, 2000) })
+        quantChats[sid] = hist.slice(-60)
+        await saveQuant()
+        let provider = 'deepseek'
+        let model = 'deepseek-chat'
+        try {
+          if (agentDefaultModel && agentDefaultModel.currentSelection) {
+            const sel = await agentDefaultModel.currentSelection()
+            if (sel && sel.provider) provider = sel.provider
+            if (sel && sel.model) model = sel.model
+          }
+        } catch (e) {}
+        const sys = [
+          '你是 DeepSeek HARNESS 量化决策助手（LWQuant）。基于量化系统的真实数据判断，语气专业、简洁（≤200字）。',
+          '收到「1」或「自主推进」时，给出一轮可执行的持仓/机会审查结论；必要时文末附 JSON：{"actions":[...]}。',
+          '输出不构成投资建议。',
+        ].join('\n')
+        const messages = hist.slice(0, -1).map(function (m) {
+          return { id: 'q-h' + Math.random().toString(36).slice(2, 10), role: m.role === 'user' ? 'user' : 'assistant', content: [{ type: 'text', text: m.text }], source: m.role === 'user' ? { kind: 'user' } : { kind: 'model', provider: provider, model: model } }
+        })
+        messages.push({ id: 'q-u' + Math.random().toString(36).slice(2, 10), role: 'user', content: [{ type: 'text', text: String(text).slice(0, 2000) }], source: { kind: 'user' } })
+        let out = ''
+        if (!llm || !llm.stream) throw new Error('llm 服务不可用')
+        for await (const c of llm.stream({ provider: provider, model: model, messages: messages, system: sys, temperature: 0.6, maxTokens: 1000 })) {
+          if (c && c.type === 'text-delta' && c.text) out += c.text
+          else if (c && c.type === 'reasoning-delta' && c.text) out += c.text
+        }
+        out = String(out || '').trim()
+        if (!out) out = '（模型未返回内容，请稍后重试）'
+        const list = (quantChats[sid] || [])
+        list.push({ role: 'assistant', text: out.slice(0, 4000) })
+        quantChats[sid] = list.slice(-80)
+        await saveQuant()
+      } catch (e) {
+        const list = (quantChats[sid] || [])
+        list.push({ role: 'assistant', text: '【生成失败】' + String((e && e.message) || e).slice(0, 200) })
+        quantChats[sid] = list.slice(-80)
+        try { await saveQuant() } catch (e2) {}
+      } finally {
+        quantBusy[sid] = false
       }
     }
 
@@ -252,6 +339,14 @@ module.exports = {
       loadStore()
       const quantApiHandler = async function (req, res) {
           const rawPath = String(req.url || '').split('?')[0]
+          // ★2026-11-10：仅回显本机来源；跨源写操作直接 403
+          const _origin = String((req.headers && req.headers.origin) || '')
+          const _originOk = originAllowed(req)
+          res.setHeader('Access-Control-Allow-Origin', _originOk && _origin ? _origin : 'null')
+          if (req.method !== 'GET' && req.method !== 'OPTIONS' && !_originOk) {
+            res.writeHead(403, Object.assign({ 'Content-Type': 'application/json; charset=utf-8' }, CORS))
+            return res.end(JSON.stringify({ ok: false, error: '跨源写操作被拒绝' }))
+          }
           // ★2026-08-25 前端兼容：控制页（v1.0.9）调 /niuapi/*，别名映射到 /quantapi/niu/*
           const pathname = rawPath === '/niuapi/sessions' ? '/quantapi/niu/sessions'
             : rawPath === '/niuapi/recent' ? '/quantapi/niu/recent'
@@ -273,6 +368,10 @@ module.exports = {
               const sid = queryParam(req, 'sessionId')
               const limit = parseInt(queryParam(req, 'limit') || '30', 10)
               if (!sid) return sendJson(res, 400, { error: 'need sessionId' })
+              // ★2026-09-09 chat2 修复：桥自管历史优先（含 llm 生成回复），避免读到 GUI 会话旧翼
+              if (quantChats[String(sid)] && quantChats[String(sid)].length) {
+                return sendJson(res, 200, { messages: quantChats[String(sid)].slice(-limit) })
+              }
               const sf = sessionQuery ? await sessionQuery.readSurface(sid) : null
               const evs = (sf && Array.isArray(sf.events)) ? sf.events : []
               const msgs = []
@@ -337,13 +436,9 @@ module.exports = {
               const sid = body.sessionId
               if (!text) return sendJson(res, 400, { ok: false, error: 'need text' })
               if (!sid) return sendJson(res, 400, { ok: false, error: 'need sessionId' })
-              if (!subprocess) return sendJson(res, 503, { ok: false, error: 'subprocess 不可用' })
-              subprocess.spawn({
-                argv: [NODE, DSH_BIN, '-y', '@deepseek-ai/dsh', '--profile', 'headless', '--resume', String(sid), text],
-                cwd: DSH_HOME,
-                stdio: { stdin: 'inherit', stdout: 'pipe', stderr: 'pipe' },
-                graceMs: 600000,
-              })
+              // ★2026-09-09 chat2 修复：原实现 spawn ['node','npx',...]（node 把 npx 当脚本加载 → 秒崩 × headless 无 --resume）
+              //   → 永无回复。改走 llm.stream 直接生成（与 niuGenerate 同构、已验证），回复落 quantChats 由 recent 读取。
+              quantGenerate(String(sid), text).catch(function () {})
               return sendJson(res, 200, { ok: true, accepted: true })
             }
             if (req.method === 'POST' && pathname === '/quantapi/delete') {

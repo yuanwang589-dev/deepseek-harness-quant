@@ -30,9 +30,11 @@ import pandas as pd
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
-BARS = BASE / "data" / "cache" / "bars.db"
+from data.cache import CACHE_DIR
+
+BARS = CACHE_DIR / "bars.db"
 OUT_DIR = BASE / "data" / "factorpool" / "output"
-IND_CACHE = BASE / "data" / "cache" / "sw_industry"
+IND_CACHE = CACHE_DIR / "sw_industry"
 
 # ★申万一级 31 个（2021 版分类）——兜底默认值；实际优先读 config/params.yaml
 #   snapshot.sw_l1_industries（架构铁律：会变的清单配置化，代码不写死）。

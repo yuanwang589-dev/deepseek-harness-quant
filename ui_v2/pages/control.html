@@ -343,7 +343,13 @@
     });
   }
   /* 会话分类菜单：主系统（根会话）+ 主观·牛散 */
-  var KEEP_EXCLUDE_TITLES = ['如何实现笔记本关屏不关机', '基本面研究员 (1)'];
+  // ★2026-11-11：会话过滤名单走 /api/live/nav（config/ui.yaml），不在页面写死
+  var KEEP_EXCLUDE_TITLES = [];
+  if (window.LW && LW.api) {
+    LW.api.get('/api/live/nav').then(function (n) {
+      KEEP_EXCLUDE_TITLES = ((n && n.control && n.control.session_title_exclude) || []);
+    }).catch(function () {});
+  }
   var sessKw = '';
   var selectedSess = {};   // ★2026-08-16 批量删除选中集合 {sid: true}
   function relatedRoots() {

@@ -25,7 +25,8 @@ BASE = Path(__file__).resolve().parent.parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
-CACHE = Path(r"data/factorpool/output/cache")
+# ★2026-08-25 BASE 前缀（原相对路径在非项目根 CWD 启动时误报 FileNotFoundError）
+CACHE = BASE / "data" / "factorpool" / "output" / "cache"
 OUT = BASE / "output" / "global_rotation.json"
 
 # 级1：四指数（与因子池规格一致）

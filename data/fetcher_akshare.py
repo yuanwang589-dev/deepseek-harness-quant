@@ -18,12 +18,18 @@
 → 需自算 preclose/pct_chg；is_st 置 0（ST 判定以 Baostock 主源为准）。
 """
 import os
+import sys
 import time
 from contextlib import contextmanager
+from pathlib import Path
 
 import pandas as pd
 
-from .cache import DailyCache
+BASE = Path(__file__).resolve().parent.parent
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+# ★2026-11-10 修复：原 `from .cache import` 在脚本方式运行（python data/fetcher_akshare.py）必 ImportError
+from data.cache import DailyCache
 
 # 统一代码 '600519.SH' → 新浪 'sh600519'；北交所 'bj430047'（baostock 不支持 → 本模块兜底）
 _MKT_PREFIX = {"SH": "sh", "SZ": "sz", "BJ": "bj"}
@@ -91,6 +97,8 @@ def fetch_daily(code, start="2010-01-01", end=None, adjust="qfq", retries=2):
                                              "turn", "pct_chg", "is_st"])
             df = df.rename(columns={"turnover": "turn"})
             df["code"] = code.upper()
+            # ★2026-11-10 修复：先排序再算 preclose/pct_chg（原顺序在排序前，降序返回时全反号）
+            df = df.sort_values("date").reset_index(drop=True)
             # 自算 preclose / pct_chg（首行无昨收 → NaN）
             df["preclose"] = df["close"].shift(1)
             df["pct_chg"] = df["close"] / df["preclose"] - 1.0
@@ -99,7 +107,6 @@ def fetch_daily(code, start="2010-01-01", end=None, adjust="qfq", retries=2):
                 df[c] = pd.to_numeric(df[c], errors="coerce")
             df = df[["date", "code", "open", "high", "low", "close", "preclose",
                      "volume", "amount", "turn", "pct_chg", "is_st"]]
-            df = df.sort_values("date").reset_index(drop=True)
             return df
         except Exception as e:
             last_err = e

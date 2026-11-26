@@ -124,6 +124,20 @@ def load_pending(db_path, exec_date: str) -> list:
         con.close()
 
 
+def delete_pending(db_path, exec_date: str, code: str, side: str) -> None:
+    """删除单笔 pending（一字板作废用）——★2026-11-10：原只打印"作废"不删行，
+    load_pending(exec_date<=) 每天重新取到 → 僵尸单无限重试刷日志。"""
+    if not Path(db_path).exists():
+        return
+    con = sqlite3.connect(str(db_path))
+    try:
+        con.execute("DELETE FROM rotation_pending WHERE exec_date=? AND code=? AND side=?",
+                    (exec_date, code, side))
+        con.commit()
+    finally:
+        con.close()
+
+
 def is_limit_locked(bar: dict) -> bool:
     """一字板（开盘即封死）：open==high==low 且偏离前收 ≥9.8%（含 10%/20% 板块近似）
     任一字段缺失 → 视为非一字板（保守，不拦单）"""
@@ -276,7 +290,7 @@ def _to_hold_rows(acc, today: str, bars: dict) -> list:
                      "entry_price": p.get("avg_cost"),
                      "last_price": bar.get("close"),
                      "hold_days": _trade_days_held(p.get("entry_date") or "", today),
-                     "stop_plan": {}})
+                     "stop_plan": p.get("stop_plan") or {"stop_loss_pct": 0.07}})
     return rows
 
 
@@ -293,6 +307,8 @@ def _execute_pending(acc, dry_run: bool) -> list:
         bar = (_bars_for([o["code"]], o["exec_date"]) or {}).get(o["code"]) or {}
         if is_limit_locked(bar):
             print(f"[paper_rotation] {o['code']} {o['side']} {o['exec_date']} 一字板 → 作废")
+            if not dry_run:
+                delete_pending(PAPER_DB, o["exec_date"], o["code"], o["side"])
             continue
         px = bar.get("open")
         if not px:
@@ -348,7 +364,10 @@ def run_once(dry_run: bool = False, today: "str | None" = None) -> dict:
 
     # ②b 替换式轮动（第 4 级）：有新高分标的要买但空位不足 → 卖 kept 中分数最低者
     held_now = {h["code"] for h in kept}
-    want = [c for c in ranked[:top_n] if c not in held_now]
+    # ★2026-11-11 修复：当日已卖出的代码不得同日再买回（原会生成 sell+buy 同价单，
+    #   产生无意义双边成本，dry-run 实测 301699.SZ 同日卖出/买入同价）。
+    sold_codes = {s["code"] for s in sells}
+    want = [c for c in ranked[:top_n] if c not in held_now and c not in sold_codes]
     slots = max(0, int(cfg["max_positions"]) - len(kept))
     need = max(0, len(want) - slots)
     pool = [h for h in kept if int(h.get("hold_days") or 0) >= min_hold]
@@ -370,6 +389,7 @@ def run_once(dry_run: bool = False, today: "str | None" = None) -> dict:
         for h in kept)
     buy_plan = compute_buys(ranked_codes=ranked, scores=scores, holds=kept, cfg=cfg,
                             cash=cash_now, equity=equity_now)
+    buy_plan["buys"] = [b for b in buy_plan.get("buys") or [] if b["code"] not in sold_codes]
 
     # ④ 写新 pending（次日开盘成交）；qty 由金额/信号日收盘价换算（100 股一手）
     orders = []

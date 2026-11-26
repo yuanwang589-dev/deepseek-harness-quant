@@ -23,7 +23,26 @@
 import json
 from pathlib import Path
 
+import yaml
+
 BASE = Path(__file__).resolve().parent.parent.parent
+
+
+def _load_scoring_cfg() -> dict:
+    """读取 config/strategies.yaml 的 scoring 段（缺失回退 .example）。
+
+    ★2026-11-11：阈值/权重/配额从代码迁到配置（AGENTS 铁律：会变的东西不写死）。"""
+    for name in ("strategies.yaml", "strategies.yaml.example"):
+        p = BASE / "config" / name
+        if p.exists():
+            try:
+                return (yaml.safe_load(p.read_text(encoding="utf-8")) or {}).get("scoring") or {}
+            except Exception:
+                return {}
+    return {}
+
+
+SCORING_CFG = _load_scoring_cfg()
 
 # ---------------------------------------------------------------
 # ★类型差异化权重（核心配置，改这里 = 改系统风格）
@@ -48,7 +67,7 @@ DEFAULT_WEIGHTS = {"w_gains": 0.40, "w_prob": 0.35, "w_safety": 0.25}
 
 # 多类型命中加分（同票被多类机会命中 = 共识确认）
 # ★B-12 十强扩展（2026-08-10 总指导）：命中 6+ 档（十强 rank≥0.75 命中≥6 = 真共识）
-CONSENSUS_BONUS = {2: 3.0, 3: 6.0, 4: 9.0,
+CONSENSUS_BONUS = {2: 3.0, 3: 6.0, 4: 9.0, 5: 3.0,
                    6: 6.0, 7: 8.0, 8: 10.0, 9: 12.0, 10: 14.0}
 
 # Pitch 门槛（每类独立，v2.0：安全类门槛略低但风控更严，弹性类门槛高）
@@ -78,6 +97,16 @@ WINRATE_MULT = {
 # ---------------------------------------------------------------
 SIZE_TIER_LARGE = 1000.0   # 大盘下限（亿）
 SIZE_TIER_MID   = 300.0    # 中盘下限（亿）
+
+# ★2026-11-11 配置覆盖（config/strategies.yaml scoring 段；缺省保留上方默认值）
+for _k, _v in (SCORING_CFG.get("type_weights") or {}).items():
+    if isinstance(_v, dict):
+        TYPE_WEIGHTS[_k] = {**TYPE_WEIGHTS.get(_k, DEFAULT_WEIGHTS), **_v}
+PITCH_GATE.update({k: int(v) for k, v in (SCORING_CFG.get("pitch_gate") or {}).items()})
+WINRATE_MULT.update({k: float(v) for k, v in (SCORING_CFG.get("winrate_mult") or {}).items()})
+CONSENSUS_BONUS.update({int(k): float(v) for k, v in (SCORING_CFG.get("consensus_bonus") or {}).items()})
+SIZE_TIER_LARGE = float(SCORING_CFG.get("size_tier_large", SIZE_TIER_LARGE))
+SIZE_TIER_MID = float(SCORING_CFG.get("size_tier_mid", SIZE_TIER_MID))
 
 
 def size_tier_of(mv_yi):

@@ -1,0 +1,60 @@
+# 策略注册 + 评分阈值（实际配置；缺失时 score.py 回退 strategies.yaml.example）
+# ★AGENTS 铁律：阈值/权重/配额不写死在代码，改本文件即生效（无需改代码）。
+extra: {}
+
+scoring:
+  # 类型差异化评分权重（w_gains 收益 / w_prob 概率 / w_safety 安全，三者之和 = 1.0）
+  type_weights:
+    reversal:     { w_gains: 0.30, w_prob: 0.35, w_safety: 0.35 }
+    value:        { w_gains: 0.30, w_prob: 0.30, w_safety: 0.40 }
+    breakout:     { w_gains: 0.45, w_prob: 0.25, w_safety: 0.30 }
+    revalue:      { w_gains: 0.45, w_prob: 0.35, w_safety: 0.20 }
+    event:        { w_gains: 0.30, w_prob: 0.40, w_safety: 0.30 }
+    quality_gap:  { w_gains: 0.30, w_prob: 0.30, w_safety: 0.40 }
+    pv_consensus: { w_gains: 0.25, w_prob: 0.35, w_safety: 0.40 }
+
+  # Pitch 门槛（每类独立）
+  pitch_gate:
+    reversal: 80
+    value: 62
+    breakout: 72
+    revalue: 70
+    event: 68
+    quality_gap: 62
+    pv_consensus: 68
+
+  # 实证胜率校正（17 年 6 月胜率 / 全场均值 53.75%）
+  winrate_mult:
+    quality_gap: 1.311
+    value: 1.164
+    revalue: 0.999
+    pv_consensus: 0.993
+    event: 0.959
+    breakout: 0.848
+    reversal: 0.726
+
+  # 多类型命中加分
+  consensus_bonus: { 2: 3.0, 3: 6.0, 4: 9.0, 5: 3.0, 6: 6.0, 7: 8.0, 8: 10.0, 9: 12.0, 10: 14.0 }
+
+  # 大中小盘市值门槛（亿元）
+  size_tier_large: 1000.0
+  size_tier_mid: 300.0
+
+  # 顶级买点标签阈值（择时高概率 + 高稀有度 + 强买入）
+  top_buy:
+    timing_min: 75.0
+    level: "适合买入"
+    score_pad: 10.0
+    types: [quality_gap, value]
+
+  # Pitch 配额
+  tier_slots: { 大盘: 2, 中盘: 2, 小盘: 1 }
+  otype_slots:
+    revalue: 2
+    value: 2
+    quality_gap: 3
+    event: 2
+    reversal: 1
+    breakout: 1
+    pv_consensus: 1
+  ref_types: [quality_gap, value]

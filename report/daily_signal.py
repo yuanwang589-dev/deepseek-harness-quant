@@ -66,11 +66,13 @@ def main() -> int:
     regime = _safe_read(BASE / "output" / "dynamic_regime.json") or {}
     snap_p = _latest("data/factorpool/output/market_snapshot_ext_*.json")
     rotation = _safe_read(BASE / "output" / "global_rotation.json") or {}
-    opp_pool = _safe_read(_latest("output/opp_pool_*.json")) or {}
-    pitch_v2 = _safe_read(_latest("output/pitch_v2_*.json")) or {}
-    tech_pitch = _safe_read(_latest("output/tech_pitch_*.json")) or {}
+    # ★2026-11-10 契约修复：机会池/Pitch 产物在 logs/（原写 output/ → 4 源恒空）
+    opp_pool = _safe_read(_latest("logs/opp_pool_*.json")) or {}
+    pitch_v2 = _safe_read(_latest("logs/pitch_v2_*.json")) or {}
+    tech_pitch = _safe_read(_latest("logs/tech_pitch_*.json")) or {}
 
-    timing_score = float((timing.get("timing") or {}).get("score", 50))
+    # ★2026-11-10 字段修复：timing_system 顶层即 score/level（原读 timing["timing"] → 恒 50）
+    timing_score = float(timing.get("score", 50) or 50)
     traffic_state = traffic.get("state", "wait")
     traffic_label = traffic.get("label", "观望")
     regime_cur = regime.get(ym, {}) or {}
@@ -79,9 +81,11 @@ def main() -> int:
 
     snap_age_h = round((now.timestamp() - snap_p.stat().st_mtime) / 3600, 1) if snap_p else 999.0
 
-    opp = opp_pool.get("opp_pool") or {}
-    pitch_v2_picks = pitch_v2.get("picks", []) or []
-    tech_picks = tech_pitch.get("picks", []) or []
+    opp_n = opp_pool.get("n")
+    if opp_n is None:
+        opp_n = len(opp_pool.get("opportunities") or [])
+    pitch_v2_picks = pitch_v2.get("pitch", []) or []   # ★字段名是 pitch（原 picks）
+    tech_picks = tech_pitch.get("entries", []) or []  # ★字段名是 entries（原 picks）
 
     out = {
         "ok": True,
@@ -96,7 +100,7 @@ def main() -> int:
         "dims": {
             "timing": {
                 "score": timing_score,
-                "level": (timing.get("timing") or {}).get("level", "中性"),
+                "level": timing.get("level", "中性"),
             },
             "traffic_light": {
                 "state": traffic_state,
@@ -117,8 +121,8 @@ def main() -> int:
                 "a_share_weak": rotation.get("a_share_weak"),
             },
             "opportunities": {
-                "n": opp.get("n", 0),
-                "date": opp.get("date"),
+                "n": opp_n,
+                "date": opp_pool.get("date"),
             },
             "pitch": {
                 "v2_n": len(pitch_v2_picks),

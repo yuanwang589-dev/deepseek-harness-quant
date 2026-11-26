@@ -98,6 +98,10 @@ def main():
     #   config paper_rotation.enabled=false 时内部直接跳过（零副作用）。
     run_step("纸上短线轮换", [PY, "-X", "utf8", str(BASE / "strategy" / "paper_rotation.py")],
              timeout=300)
+    # ★2026-11-20 L2 台账自动买卖（持仓页）：止损/止盈信号自动卖 + pitch_v2 前 N 自动买；
+    #   config auto_execute.enabled=false 时零副作用。放在止损/止盈引擎重跑之后。
+    run_step("台账自动买卖", [PY, "-X", "utf8", str(BASE / "strategy" / "auto_execute.py")],
+             timeout=300)
     # 5) 日报
     run_step("每日决策日报", [PY, "-X", "utf8", str(BASE / "data" / "daily_report_auto.py")])
     log("=== 盘前数据更新链完成 ===")

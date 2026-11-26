@@ -22,7 +22,7 @@ import argparse
 import json
 import sqlite3
 import sys
-from datetime import datetime, date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent.parent
@@ -261,6 +261,9 @@ def compute_factors_pit(px: pd.DataFrame, vx: pd.DataFrame,
     f["roe"] = pd.to_numeric(f["roe"], errors="coerce")
     f["sq_nyoy"] = pd.to_numeric(f["sq_nyoy"], errors="coerce")
     f["non_st"] = (~f.index.isin(st_codes)).astype(int)
+    # ★2026-11-10 修复：scan.triggers() 依赖 non_lowprice，本函数此前未生成该列 →
+    #   任何股票通过前置条件即抛 KeyError('non_lowprice')，胜率回测从未成功。
+    f["non_lowprice"] = (f["close"] >= 1.5).astype(int) if "close" in f.columns else 1
     # ★估值列（PIT 回测近似，2026-08-08 主程序 v1.1 引入真实估值后对齐）：
     #   历史 daily_basic 估值无本地缓存 → 用价格分位近似（与 scan.py 无估值数据时的
     #   降级语义一致）：pb 置 NaN（触发兜底不阻塞）、pe_ttm 置 1.0（正数满足 >0 检查）
@@ -391,7 +394,9 @@ def run(start: str = "2019-01", end: str = None, with_pv_consensus: bool = False
         # ★pv_consensus（第 7 类，B-6）：五强历史重算触发（外包 AI-1 2026-08-09）
         if with_pv_consensus and len(win) >= 2000:
             try:
-                from factors.opportunities.backtest_pv_consensus import pv_consensus_codes
+                from factors.opportunities.backtest_pv_consensus import (
+                    pv_consensus_codes,
+                )
                 pv_codes = pv_consensus_codes(win, mode=pv_mode)
                 for code in pv_codes:
                     g = by_code.get(code)

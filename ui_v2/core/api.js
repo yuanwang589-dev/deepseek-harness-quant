@@ -10,6 +10,20 @@
   var cache = {};        // url -> {ts, data, status:'ok'|'err'}
   var inflight = {};     // url -> Promise（防并发重复请求）
 
+  // 带超时的 fetch（★2026-11-10 修复：opts.timeout 此前只赋值、从未生效）
+  function fetchT(url, opts, timeout) {
+    if (!timeout) return fetch(url, opts);
+    if (typeof AbortController === 'undefined') return fetch(url, opts);
+    var ctrl = new AbortController();
+    var tm = setTimeout(function () { ctrl.abort(); }, timeout);
+    var o = Object.assign({}, opts, { signal: ctrl.signal });
+    // ★2026-11-20 AbortError 转中文：原样透出 "signal is aborted without reason"，用户无法判断
+    return fetch(url, o).finally(function () { clearTimeout(tm); }).catch(function (err) {
+      if (err && err.name === 'AbortError') throw new Error('请求超时：' + url + '（>' + timeout + 'ms）');
+      throw err;
+    });
+  }
+
   function get(url, opts) {
     opts = opts || {};
     var timeout = opts.timeout || 8000;
@@ -23,7 +37,7 @@
     }
     if (inflight[url]) { return inflight[url]; }
 
-    var p = fetch(url, { cache: 'no-store' })
+    var p = fetchT(url, { cache: 'no-store' }, timeout)
       .then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.json();
@@ -36,7 +50,7 @@
         // 重试一次（网络抖动）
         if (retry > 0) {
           retry--;
-          return fetch(url, { cache: 'no-store' }).then(function (r) {
+          return fetchT(url, { cache: 'no-store' }, timeout).then(function (r) {
             if (!r.ok) throw new Error('HTTP ' + r.status);
             return r.json();
           }).then(function (data) {

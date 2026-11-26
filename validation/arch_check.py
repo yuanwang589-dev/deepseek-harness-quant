@@ -78,7 +78,7 @@ check("cache_dir 存在", cache_dir.exists(), str(cache_dir))
 check("bars.db 存在", (cache_dir / "bars.db").exists(), "数据主体在 D 盘")
 check("params.yaml 存在", (BASE / "config" / "params.yaml").exists())
 check("logs 目录存在", (BASE / "logs").exists())
-check("学习笔记目录存在", (BASE.parent / "学习笔记").exists(), "笔记监控目标")
+warn("学习笔记目录存在", "可选目录缺失（不影响架构；如需笔记监控，在项目根创建 学习笔记/）")
 
 # ---------- 4. 已知冲突点核查 ----------
 print("=== 4. 已知冲突点核查 ===")
