@@ -113,51 +113,110 @@ def _compose_score(closes, factor_list):
 
 
 def _q(sql, db, params=()):
-    con = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
+    # ★2026-11-11：显式检查数据文件，避免 script1 在缺库时抛裸 OperationalError 中断进程
+    p = Path(str(db)).resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"数据文件不存在: {p}")
+    con = sqlite3.connect(f"{p.as_uri()}?mode=ro&immutable=1", uri=True)
     try:
         return con.execute(sql, params).fetchall()
     finally:
         con.close()
 
 
-def _load_pool(stocks):
-    rows = _q("SELECT code, circ_mv FROM hist_mv WHERE month='2020-12'", f"{CACHE}/hist_mv.db")
-    top = sorted(rows, key=lambda r: -(r[1] or 0))[:stocks * 3]
-    codes = [r[0] for r in top]
+def _load_pool(stocks, start, end=None, min_rows=150):
+    """★2026-11-26 PIT 候选全集：用 start 之前最近一个月数据选 Top stocks*3。
+
+    原实现固定 month='2020-12' 却回测 2020-2025 —— look-ahead + 幸存者偏差。
+    本函数只用 start 之前可知的数据，返回候选全集（每期再由 _active_codes 动态重选）。
+    min_rows 参数化便于测试（临时库造不出 1000 行）。
+    """
+    d = pd.Timestamp(str(start))
+    pm = (d.replace(day=1) - pd.Timedelta(days=1)).strftime("%Y-%m")
+    lo = (d - pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+    hi = (d - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # 优先 hist_mv.db（真实市值，PIT 月份从 start 推导）
+    rows = []
+    try:
+        rows = _q("SELECT code, circ_mv FROM hist_mv WHERE month=?",
+                  f"{CACHE}/hist_mv.db", (pm,))
+    except Exception:
+        rows = []
+    if not rows:
+        # 成交额代理：start 前 30 天；归一 tushare 千元→元（与 cache.normalize_units 同口径）
+        try:
+            rows = _q(
+                "SELECT code, AVG(CASE WHEN source IN ('tushare','tushare_backup') "
+                "THEN amount*1000 ELSE amount END) AS a FROM daily_bar "
+                "WHERE adjust='qfq' AND code NOT LIKE 'sh.%' AND code NOT LIKE 'sz.%' "
+                "AND date>=? AND date<=? AND amount IS NOT NULL AND amount>0 "
+                "GROUP BY code ORDER BY a DESC", f"{CACHE}/bars.db", (lo, hi))
+        except Exception:
+            rows = []
+    codes = [r[0] for r in sorted(rows, key=lambda r: -(r[1] or 0))[:stocks * 3]]
+    if not codes:
+        return []
     ph = ",".join("?" * len(codes))
-    ok = set(r[0] for r in _q(
-        f"SELECT code FROM daily_bar WHERE code IN ({ph}) AND date>='2020-06-01' AND date<='2025-12-31' "
-        "GROUP BY code HAVING COUNT(*)>=1000", f"{CACHE}/bars.db", codes))
-    return [c for c in codes if c in ok][:stocks]
+    # ★数据充足性用 start 之前的 400 天历史窗口判断（PIT，且与回测区间长度无关）；
+    #   原用回测区间导致短区间（如 6 个月 ~120 行）永远达不到 1000 行 → 选池为空。
+    lb = (d - pd.Timedelta(days=400)).strftime("%Y-%m-%d")
+    sql = f"SELECT code FROM daily_bar WHERE code IN ({ph}) AND date>=? AND date<? "
+    args = list(codes) + [lb, str(start)[:10]]
+    sql += "GROUP BY code HAVING COUNT(*)>=?"
+    args.append(int(min_rows))
+    try:
+        ok = set(r[0] for r in _q(sql, f"{CACHE}/bars.db", args))
+    except Exception:
+        ok = set()
+    return [c for c in codes if c in ok][:stocks * 3]
 
 
-def _load_prices(codes, start, end):
-    """加载 close/open/high 面板（T+1 open 执行 + 涨停过滤用）"""
+def _load_prices(codes, start, end, warmup_days=400):
+    """加载 close/open/high/amount 四面板（T+1 open 执行 + 成交额动态选池）。
+
+    ★2026-11-26：加载起点 = start - warmup_days（near_high_250 需约 250 交易日），
+    因子有足够历史；最终收益仍由 run_backtest 按 start 截断。
+    """
+    from data.cache import normalize_units
+    load_start = (pd.Timestamp(str(start)) - pd.Timedelta(days=warmup_days)).strftime("%Y-%m-%d")
     cache = DailyCache()
-    batch = cache.get_daily_batch(codes, start="2020-06-01", end=end, adjust="qfq",
-                                  fields=["close", "open", "high"])
-    close_s, open_s, high_s = {}, {}, {}
+    batch = cache.get_daily_batch(codes, start=load_start, end=end, adjust="qfq",
+                                  fields=["close", "open", "high", "amount", "source"])
+    series = {}
     for c, df in batch.items():
         if len(df) < 250:
             continue
-        df = df.set_index("date").sort_index()
-        close_s[c] = df["close"]
-        open_s[c] = df["open"]
-        high_s[c] = df["high"]
+        df = normalize_units(df).set_index("date").sort_index()
+        for col in ("close", "open", "high", "amount"):
+            series.setdefault(col, {})[c] = df[col]
     calendar = [r[0] for r in _q(
-        "SELECT DISTINCT date FROM daily_bar WHERE date>='2020-06-01' AND date<=? ORDER BY date",
-        f"{CACHE}/bars.db", (end,))]
-    return {
-        "close": pd.DataFrame({c: close_s[c].reindex(calendar) for c in close_s}).ffill(),
-        "open": pd.DataFrame({c: open_s[c].reindex(calendar) for c in open_s}).ffill(),
-        "high": pd.DataFrame({c: high_s[c].reindex(calendar) for c in high_s}).ffill(),
-    }
+        "SELECT DISTINCT date FROM daily_bar WHERE date>=? AND date<=? ORDER BY date",
+        f"{CACHE}/bars.db", (load_start, str(end)[:10]))]
+    out = {}
+    for col in ("close", "open", "high", "amount"):
+        # ★2026-11-26：批量读取无数据时返回空面板，不再 KeyError（健壮性）
+        if not series.get(col):
+            out[col] = pd.DataFrame(index=calendar)
+            continue
+        frame = pd.DataFrame({c: series[col][c].reindex(calendar) for c in series[col]})
+        # 停牌日成交额应为 0（不能 ffill 旧成交额，否则退市/停牌股仍被动态池选中）
+        out[col] = frame.fillna(0.0) if col == "amount" else frame.ffill()
+    return out
+
+
+def _active_codes(amount, pos, universe, pool_size):
+    """★2026-11-26 动态选池：过去 20 日平均成交额 Top pool_size（仅用 pos 及之前数据，PIT）。"""
+    if amount is None or not pool_size:
+        return list(universe)
+    a = amount.iloc[max(0, pos - 20):pos + 1].mean().reindex(universe).dropna()
+    return a.nlargest(min(int(pool_size), len(a))).index.tolist()
 
 
 def _get_panel(stocks, start, end):
     key = (stocks, start, end)
     if _PANEL["key"] != key:
-        codes = _load_pool(stocks)
+        codes = _load_pool(stocks, start, end)
         _PANEL["key"] = key
         _PANEL["data"] = _load_prices(codes, start, end)
     return _PANEL["data"]
@@ -166,8 +225,13 @@ def _get_panel(stocks, start, end):
 def _load_fin():
     global _FIN
     if _FIN is None:
-        rows = _q("SELECT code, end_date, ann_date, total_revenue, n_income FROM financials_ts",
-                  f"{CACHE}/finance_ts.db")
+        try:
+            rows = _q("SELECT code, end_date, ann_date, total_revenue, n_income FROM financials_ts",
+                      f"{CACHE}/finance_ts.db")
+        except Exception as e:
+            print(f"[bt_runner] finance_ts.db 不可用（{e}）→ script1 回退 tech3")
+            _FIN = pd.DataFrame()
+            return _FIN
         fin = pd.DataFrame(rows, columns=["code", "end_date", "ann_date", "total_revenue", "n_income"])
         fin["code6"] = fin["code"].str[:6]
         fin["end"] = pd.to_datetime(fin["end_date"])
@@ -181,7 +245,12 @@ def _load_fin():
 def _load_mv():
     global _MV
     if _MV is None:
-        rows = _q("SELECT month, code, circ_mv FROM hist_mv WHERE month>='2020-06'", f"{CACHE}/hist_mv.db")
+        try:
+            rows = _q("SELECT month, code, circ_mv FROM hist_mv WHERE month>='2020-06'", f"{CACHE}/hist_mv.db")
+        except Exception as e:
+            print(f"[bt_runner] hist_mv.db 不可用（{e}）→ script1 回退 tech3")
+            _MV = pd.DataFrame()
+            return _MV
         _MV = pd.DataFrame(rows, columns=["month", "code", "circ_mv"]).pivot_table(
             index="month", columns="code", values="circ_mv")
     return _MV
@@ -211,6 +280,9 @@ def _script1_score(closes):
     beta = _compute_beta(closes)
     fin = _load_fin()
     mdf = _load_mv()
+    # ★2026-11-11：缺库时返回 None（由 run_backtest 回退 tech3 并给出明确提示），不崩溃
+    if fin is None or fin.empty or mdf is None or mdf.empty:
+        return None
     codes6 = [c.split(".")[0] for c in closes.columns]
     score = pd.DataFrame(np.nan, index=closes.index, columns=closes.columns)
     ym = closes.index.astype(str).str[:7]
@@ -257,9 +329,11 @@ def _monthly_backtest(closes, opens, highs, score, topn):
     return _period_backtest(closes, opens, highs, score, topn, rebalance="M")
 
 
-def _period_backtest(closes, opens, highs, score, topn, rebalance="M"):
+def _period_backtest(closes, opens, highs, score, topn, rebalance="M",
+                     amount=None, pool_size=None):
     """泛化调仓回测：rebalance='M' 月频 / 40 等交易日数 / 'Q' 季度。
-    ★T+1 open 买入 + 一字板涨停过滤（open≈high 买不进），返回日收益序列。"""
+    ★T+1 open 买入 + 一字板涨停过滤（open≈high 买不进），返回日收益序列。
+    ★2026-11-26：每期用 amount 动态重选流动性池（PIT），再按 score 选 TopN。"""
     if isinstance(rebalance, int):
         # 固定交易日调仓：每 rebalance 个交易日选一次（跳过前 60 日热身）
         positions = list(range(60, len(closes.index), rebalance))
@@ -268,7 +342,8 @@ def _period_backtest(closes, opens, highs, score, topn, rebalance="M"):
         ret = pd.Series(0.0, index=closes.index)
         for i, pos in enumerate(positions[:-1]):
             nxt_pos = positions[i + 1]
-            sc = score.iloc[pos].dropna()
+            sc = score.iloc[pos].reindex(
+                _active_codes(amount, pos, closes.columns, pool_size)).dropna()
             if len(sc) < topn:
                 continue
             picks = sc.nlargest(topn).index.tolist()
@@ -277,7 +352,11 @@ def _period_backtest(closes, opens, highs, score, topn, rebalance="M"):
                 continue
             bo = opens.iloc[buy_pos].reindex(picks)
             bh = highs.iloc[buy_pos].reindex(picks)
-            buyable = bo[(bo < bh - 1e-9)].index
+            bc = closes.iloc[buy_pos].reindex(picks)
+            # ★2026-11-10 修复：原 `open==high` 判一字板，实测 327 只中 322 只并非涨停（误杀 5.8%）。
+            #   真正一字板 = 开=高=收（全天单一定价）；开盘即最高但盘中回落可成交。
+            _bb = pd.DataFrame({"o": bo, "h": bh, "c": bc}).dropna()
+            buyable = _bb.index[~((_bb["o"] >= _bb["h"] - 1e-9) & (_bb["o"] == _bb["c"]))]
             if len(buyable) < 1:
                 continue
             seg = closes[buyable].iloc[buy_pos: nxt_pos + 1].pct_change().fillna(0)
@@ -296,7 +375,8 @@ def _period_backtest(closes, opens, highs, score, topn, rebalance="M"):
         pos = closes.index.get_loc(me)
         if pos < 60:
             continue
-        sc = score.iloc[pos].dropna()
+        sc = score.iloc[pos].reindex(
+            _active_codes(amount, pos, closes.columns, pool_size)).dropna()
         if len(sc) < topn:
             continue
         picks = sc.nlargest(topn).index.tolist()
@@ -347,30 +427,54 @@ def run_backtest(strategy="tech3", topn=5, stocks=300, start="2021-01-01", end="
     t0 = time.time()
     panel = _get_panel(stocks, start, end)
     closes, opens, highs = panel["close"], panel["open"], panel["high"]
+    amount = panel.get("amount")   # ★2026-11-26：成交额面板（动态选池用）
     # ★动态化：外部策略评分分发（factor_list 声明式组合 / scorer 内置函数 / 内置策略）
     if meta.get("factor_list"):
         score = _compose_score(closes, meta["factor_list"])
     elif meta.get("scorer") == "script1":
         score = _script1_score(closes)
+        if score is None:
+            return {"ok": False, "error": "script1 依赖 finance_ts.db / hist_mv.db（当前缺失）。"
+                                           "请先运行 data/build_factor_backtest_db.py 与 data/build_hist_mv.py，或改用 --strategy tech3"}
     elif meta.get("scorer") == "turn_low" or (meta.get("external") and meta.get("factors") == ["turn_20d"]):
         score = _turn_low_score(closes)
     elif strategy == "script1":
         score = _script1_score(closes)
+        if score is None:
+            return {"ok": False, "error": "script1 依赖 finance_ts.db / hist_mv.db（当前缺失）。"
+                                           "请先运行 data/build_factor_backtest_db.py 与 data/build_hist_mv.py，或改用 --strategy tech3"}
     elif strategy == "turn_low":
         score = _turn_low_score(closes)
     else:
         score = _tech3_score(closes)
-    ret = _period_backtest(closes, opens, highs, score, topn, rebalance=meta.get("rebalance", "M"))
+    ret = _period_backtest(closes, opens, highs, score, topn,
+                           rebalance=meta.get("rebalance", "M"),
+                           amount=amount, pool_size=stocks)
     ret = ret.loc[ret.index.astype(str) >= start]
-    cost = 0.00026 + 0.0005 + 0.001   # 佣金+印花税+滑点，每月全换仓摊到日
-    ret = ret - cost * 2 * 60 / max(len(ret), 1)
+    # ★2026-11-10 修复：原按写死"全期 60 次调仓"摊销成本，与实际调仓频率无关
+    #   （季度策略被年化多扣 6+ 个百分点）。按 rebalance 周期估算实际调仓次数。
+    _reb = meta.get("rebalance", "M")
+    if isinstance(_reb, str) and _reb.upper() == "Q":
+        _per = 63
+    elif isinstance(_reb, str) and _reb.upper() == "M":
+        _per = 21
+    elif isinstance(_reb, int) and _reb > 0:
+        _per = _reb
+    else:
+        _per = 21
+    # ★2026-11-26：统一成本口径，印花税仅卖出侧（原双边多扣一次印花税）
+    from backtest.bt_cost import round_trip_cost
+    cost = round_trip_cost()
+    _n_reb = max(1, int(round(len(ret) / _per)))
+    ret = ret - cost * _n_reb / max(len(ret), 1)
     bench = closes.pct_change().fillna(0).mean(axis=1).loc[ret.index]
     nav = (1 + ret).cumprod()
     bench_nav = (1 + bench).cumprod()
     metrics = compute_metrics(ret)
     bench_metrics = compute_metrics(bench)
     excess_nav = (nav / bench_nav)   # 超额净值（策略相对基准）
-    excess_annual = metrics["annual_return"] - bench_metrics["annual_return"]
+    # ★2026-11-26：空序列时 compute_metrics 返回 {}，用 .get 兜底避免 KeyError
+    excess_annual = metrics.get("annual_return", 0) - bench_metrics.get("annual_return", 0)
 
     # 归档（每次运行都存档；latest 覆盖旧值，历史时间戳保留）
     n_stocks = int(closes.shape[1])
@@ -404,11 +508,22 @@ def run_backtest(strategy="tech3", topn=5, stocks=300, start="2021-01-01", end="
 
 
 if __name__ == "__main__":
-    r = run_backtest("tech3", 5, 300)
+    # ★2026-11-11：加 argparse（原无参数解析，`--help` 被忽略并直接跑两策略写归档）
+    import argparse
+    ap = argparse.ArgumentParser(description="bt_runner 回测（默认只打印帮助；需显式 --strategy）")
+    ap.add_argument("--strategy", default=None, help="tech3 / script1 / turn_low / factor_all / 外部注册策略")
+    ap.add_argument("--topn", type=int, default=5)
+    ap.add_argument("--stocks", type=int, default=300)
+    ap.add_argument("--start", default="2021-01-01")
+    ap.add_argument("--end", default="2025-12-31")
+    args = ap.parse_args()
+    if not args.strategy:
+        ap.print_help()
+        sys.exit(0)
+    r = run_backtest(args.strategy, args.topn, args.stocks, args.start, args.end)
+    if "metrics" not in r:
+        print(f"[bt_runner] 回测失败：{r.get('error', r)}")
+        sys.exit(1)
     m = r["metrics"]
-    print(f"tech3: 年化 {m['annual_return']:.1%} 回撤 {m['max_drawdown']:.1%} 夏普 {m['sharpe']:.2f} "
-          f"耗时 {r['elapsed_s']}s 样本 {m['n_days']} 天")
-    r2 = run_backtest("script1", 5, 300)
-    m2 = r2["metrics"]
-    print(f"script1: 年化 {m2['annual_return']:.1%} 回撤 {m2['max_drawdown']:.1%} 夏普 {m2['sharpe']:.2f} "
-          f"耗时 {r2['elapsed_s']}s")
+    print(f"{args.strategy}: 年化 {m['annual_return']:.1%} 回撤 {m['max_drawdown']:.1%} "
+          f"夏普 {m['sharpe']:.2f} 耗时 {r.get('elapsed_s')}s 样本 {m.get('n_days')} 天")
