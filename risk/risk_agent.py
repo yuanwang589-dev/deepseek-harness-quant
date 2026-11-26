@@ -18,9 +18,20 @@ risk/risk_agent.py — Risk Agent（M4 纪律引擎核心，第15课原文落地
 
 参数来源：config/params.yaml risk 段（M4 前已配置：三层回撤 5/10/15%、ATR 2×等）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 from dataclasses import dataclass
-from enum import Enum
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -45,9 +56,14 @@ class RiskCheckResult:
 class RiskAgent:
     """风险控制 Agent - 拥有一票否决权（M4 纪律引擎核心）"""
 
-    def __init__(self, config: dict, audit_log: Optional[Path] = None):
+    def __init__(self, config: dict, audit_log: Optional[Path] = None,
+                 state: Optional[dict] = None):
+        # ★2026-11-26 风控接线：注入可变状态字典（由 risk_gate 从磁盘 load/save），
+        #   使熔断状态可跨进程/跨实例恢复（deck_server 常驻 vs auto_execute 独立脚本）。
+        #   gate 不传时退化为本进程内存态（保持原行为）。
+        self.state = state if state is not None else {}
         # ---- 硬约束（来自 params.yaml risk 段）----
-        self.max_single_position = config.get("max_position_pct", 0.10)   # 单笔上限 10%
+        self.max_single_position = config.get("max_position_pct", 0.20)   # 单笔上限 20%（与 5 只等权对齐）
         self.max_symbol_exposure = config.get("max_symbol_exposure", 0.20)  # 单标的 20%
         self.max_sector_exposure = config.get("max_industry_pct", 0.30)    # 行业 30%
         self.max_total_exposure = config.get("max_total_exposure", 0.80)   # 总仓位 80%
@@ -58,14 +74,24 @@ class RiskAgent:
         self.circuit_position = config.get("circuit_breaker_position", 0.30)  # 熔断后仓位 30%
         self.cooldown_days = config.get("circuit_breaker_cooldown_days", 5)  # 冷静期 5 天
 
-        self.is_circuit_breaker_active = False
+        # ★2026-11-26：从持久化 state 恢复熔断状态（ISO 时间串 → datetime）
+        self.is_circuit_breaker_active = bool(self.state.get("active", False))
         self.circuit_breaker_at = None
+        _at = self.state.get("at")
+        if _at:
+            try:
+                self.circuit_breaker_at = datetime.fromisoformat(str(_at))
+            except (ValueError, TypeError):
+                self.is_circuit_breaker_active = False  # 损坏的时间戳 → 不熔断
         self.audit_log = audit_log or (Path(__file__).resolve().parent.parent / "logs" / "risk_audit.log")
 
     # ---------- 审核（原文 check_order 完整逻辑）----------
     def check_order(self, symbol: str, size: float, current_portfolio: dict,
-                    current_drawdown: float, sector: str = "") -> RiskCheckResult:
+                    current_drawdown: float, sector: str = "",
+                    sector_map: Optional[dict] = None) -> RiskCheckResult:
         """审核订单请求 → APPROVE / REDUCE(缩小) / REJECT"""
+        # ⓪ 冷静期自动恢复（★2026-11-10：原 check_cooldown 无调用，熔断永不恢复）
+        self.check_cooldown()
         # ① 熔断检查
         if self.is_circuit_breaker_active:
             return self._result(Decision.REJECT, "熔断冷静期：禁止新建仓（只可减仓）")
@@ -88,7 +114,13 @@ class RiskAgent:
             return self._result(Decision.REDUCE, f"标的集中度限制，缩小至 {allowed:.1%}", adjusted_size=allowed)
         # ⑤ 行业集中度（有行业信息时）
         if sector:
-            cur_sector = sum(v for k, v in current_portfolio.items() if k.startswith(sector))
+            # ★2026-11-10 修复：原 `k.startswith(sector)` 用股票代码做键，永不命中 →
+            #   行业集中度上限形同虚设。传入 sector_map{code:行业} 时按行业聚合。
+            if sector_map:
+                cur_sector = sum(v for k, v in current_portfolio.items()
+                                 if sector_map.get(k) == sector)
+            else:
+                cur_sector = sum(v for k, v in current_portfolio.items() if k.startswith(sector))
             if cur_sector + size > self.max_sector_exposure:
                 allowed = self.max_sector_exposure - cur_sector
                 if allowed <= 0:
@@ -112,10 +144,20 @@ class RiskAgent:
             return "reduce_risk"
         return "normal"
 
+    def _sync_state(self):
+        """★2026-11-26：把熔断状态回写注入的 state（risk_gate 据此持久化到磁盘）。"""
+        if not self.state:
+            return
+        self.state["active"] = bool(self.is_circuit_breaker_active)
+        self.state["at"] = self.circuit_breaker_at.isoformat() if self.circuit_breaker_at else None
+        self.state["cooldown_days"] = self.cooldown_days
+        self.state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
     def _trigger_circuit_breaker(self, dd: float):
         """触发熔断：只可减仓至 circuit_position，进入冷静期"""
         self.is_circuit_breaker_active = True
         self.circuit_breaker_at = datetime.now()
+        self._sync_state()
         self._audit("CIRCUIT_BREAKER_TRIGGERED", f"回撤 {dd:.1%}，减仓至 {self.circuit_position:.0%}，冷静期 {self.cooldown_days} 天")
 
     def check_cooldown(self) -> bool:
@@ -125,6 +167,8 @@ class RiskAgent:
         days = (datetime.now() - self.circuit_breaker_at).days
         if days >= self.cooldown_days:
             self.is_circuit_breaker_active = False
+            self.circuit_breaker_at = None
+            self._sync_state()
             self._audit("CIRCUIT_BREAKER_RESET", f"冷静期 {days} 天结束，恢复正常")
             return True
         return False
@@ -144,8 +188,8 @@ class RiskAgent:
                     + (f" | adjusted={adjusted_size:.4f}" if adjusted_size is not None else "") + "\n")
             with open(self.audit_log, "a", encoding="utf-8") as f:
                 f.write(line)
-        except Exception:
-            pass  # 审计失败不阻塞风控（但理论上不应发生）
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "risk/risk_agent.py:180 _audit")
 
 
 # ============================================================
@@ -229,13 +273,13 @@ def atr_stop_price(entry_price: float, atr: float, n: float = 2.0) -> dict:
 # ============================================================
 if __name__ == "__main__":
     print("=== RiskAgent 审核演示（第15课场景）===")
-    cfg = {"max_position_pct": 0.10, "max_symbol_exposure": 0.20,
+    cfg = {"max_position_pct": 0.20, "max_symbol_exposure": 0.20,
            "max_industry_pct": 0.30, "max_total_exposure": 0.80,
            "drawdown_levels": {"warning": 0.05, "control": 0.10, "circuit_breaker": 0.15}}
     ra = RiskAgent(cfg)
     scenarios = [
         ("正常买入10%", dict(symbol="AAPL", size=0.10, current_portfolio={}, current_drawdown=0.02)),
-        ("超限买入15%", dict(symbol="AAPL", size=0.15, current_portfolio={}, current_drawdown=0.02)),
+        ("超限买入25%", dict(symbol="AAPL", size=0.25, current_portfolio={}, current_drawdown=0.02)),
         ("集中度(已有AAPL15%再买10%)", dict(symbol="AAPL", size=0.10, current_portfolio={"AAPL": 0.15}, current_drawdown=0.02)),
         ("回撤超控制线加仓", dict(symbol="MSFT", size=0.05, current_portfolio={}, current_drawdown=0.12)),
         ("熔断状态任何买入", dict(symbol="MSFT", size=0.05, current_portfolio={}, current_drawdown=0.16)),

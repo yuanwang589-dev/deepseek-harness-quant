@@ -20,6 +20,17 @@ Deck 显示当前持仓 + 卖出操作；模拟盘实时段联动（sim_tracks �
   python strategy/portfolio.py --sell CODE PRICE REASON   # 卖出
   python strategy/portfolio.py --status         # 查看持仓
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import json
 import sys
@@ -61,8 +72,12 @@ def _entry_price_of(code: str, date: str):
         con = sqlite3.connect("file:data/cache/bars.db?mode=ro&immutable=1",
                               uri=True, timeout=3)
         row = con.execute(
-            "SELECT close FROM daily_bar WHERE code=? AND date=? ORDER BY adjust DESC LIMIT 1",
+            "SELECT close FROM daily_bar WHERE code=? AND date=? AND adjust='qfq' LIMIT 1",
             (code, date)).fetchone()
+        if not row:
+            row = con.execute(
+                "SELECT close FROM daily_bar WHERE code=? AND date=? AND adjust IN ('none','raw') LIMIT 1",
+                (code, date)).fetchone()
         con.close()
         return float(row[0]) if row and row[0] else None
     except Exception:
@@ -74,23 +89,30 @@ def _latest_close_of(code: str):
     ★2026-08-12 百轮#102：双库合并——主库写保护后最新日数据在 bars_incr 增量库，
     单读主库会让盈亏停在旧日（#65 教训）"""
     try:
-        import sqlite3
         import glob as _glob
+        import sqlite3
         from pathlib import Path as _P
         paths = ["data/cache/bars.db"]
         try:
             from data.cache import CACHE_DIR
             paths += [str(p) for p in sorted(CACHE_DIR.glob("bars_incr_*.db"))[-3:]]
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "strategy/portfolio.py:88 _latest_close_of")
         best = None
         for _p in paths:
             try:
-                _uri = _P(_p).as_uri() + "?mode=ro&immutable=1"
+                # ★2026-11-20 修复：相对路径 as_uri() 恒抛 ValueError（被 except 吞掉）
+                #   → 现价恒 None、持仓收益全空。resolve() 转绝对路径（同 portfolio_perf #2026-08-25 修法）
+                _uri = _P(_p).resolve().as_uri() + "?mode=ro&immutable=1"
                 con = sqlite3.connect(_uri, uri=True, timeout=3)
                 row = con.execute(
-                    "SELECT close, date FROM daily_bar WHERE code=? ORDER BY date DESC LIMIT 1",
+                    "SELECT close, date FROM daily_bar WHERE code=? AND adjust='qfq' "
+                    "ORDER BY date DESC LIMIT 1",
                     (code,)).fetchone()
+                if not row:
+                    row = con.execute(
+                        "SELECT close, date FROM daily_bar WHERE code=? AND adjust IN ('none','raw') "
+                        "ORDER BY date DESC LIMIT 1", (code,)).fetchone()
                 con.close()
                 if row and row[0] and (best is None or row[1] > best[1]):
                     best = (float(row[0]), row[1])
@@ -101,10 +123,37 @@ def _latest_close_of(code: str):
         return None
 
 
+def _drawdown_proxy(positions: list) -> tuple:
+    """★2026-11-26 风控接线：当前组合回撤代理（项目无 L2 台账净值曲线）。
+
+    用持仓 entry_price + 最新收盘价算等权浮亏：max(0, -mean(close/entry-1))。
+    返回 (dd: float, available: bool)；无有效配对时 (0.0, False)，
+    由调用方把 dd_available=False 传给 risk_gate（size 折半 + 审计）。
+    """
+    vals = []
+    for p in positions or []:
+        if p.get("status") != "holding":
+            continue
+        entry = p.get("entry_price")
+        if not entry:
+            continue
+        cur = _latest_close_of(p.get("code"))
+        if not cur:
+            continue
+        try:
+            vals.append(float(cur) / float(entry) - 1)
+        except (ValueError, TypeError, ZeroDivisionError):
+            continue
+    if not vals:
+        return 0.0, False
+    return max(0.0, -sum(vals) / len(vals)), True
+
+
 def _load_latest_trade_date() -> str | None:
     """★2026-08-12 十轮#172：最新交易日（主库+增量库合并探测，immutable 防锁）"""
     try:
         import sqlite3 as _sq
+
         from data.cache import CACHE_DIR
         dates = []
         for _db in [CACHE_DIR / "bars.db"] + sorted(CACHE_DIR.glob("bars_incr_*.db"))[-3:]:
@@ -128,8 +177,8 @@ def _load() -> dict:
     if p.exists():
         try:
             return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "strategy/portfolio.py:169 _load")
     return {"version": 1, "updated_at": None, "max_positions": MAX_POSITIONS,
             "positions": [], "history": []}
 
@@ -200,10 +249,11 @@ def _name_of(code: str):
 
 
 def stop_plan_for(otype, matrix: dict = None) -> dict:
-    """按 otype 从止损矩阵 v2 生成 stop_plan（无 otype/矩阵缺失 → _default 兜底）"""
+    """按 otype 从止损矩阵 v2 生成 stop_plan（无 otype/矩阵缺失 → _default 兜底）
+    ★2026-11-20 矩阵字段为空时用 config/params.yaml(risk) 默认值补齐（不再返回全 None 方案）"""
     matrix = matrix if matrix is not None else _load_stop_matrix()
     row = matrix.get(otype) or matrix.get("_default") or {}
-    return {
+    plan = {
         "otype": otype or "unknown",
         "stop_loss_pct": row.get("stop_loss_pct"),
         "time_stop_weeks": row.get("time_stop_weeks"),
@@ -212,6 +262,12 @@ def stop_plan_for(otype, matrix: dict = None) -> dict:
         "note": (row.get("stop_loss_pct_note") or "")[:100],
         "source": "stop_matrix_v2.json（分包2 交付）",
     }
+    try:
+        from risk.risk_config import fill_stop_plan
+        fill_stop_plan(plan)
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "strategy/portfolio.py:257 stop_plan_for")
+    return plan
 
 
 def _ensure_legacy_fields(d: dict):
@@ -225,39 +281,89 @@ def _ensure_legacy_fields(d: dict):
     return d
 
 
-def sync_from_decisions() -> dict:
+def sync_from_decisions(path=None) -> dict:
     """读 deck_decisions（最新时间戳文件）：action=buy 且不在持仓 → 入持仓（holding）
-    返回本次同步摘要 {added, over_limit, skipped}"""
+    path: 指定决策文件（auto_execute 写 auto_decisions_*.json 时用）
+    ★2026-11-26 风控接线：每笔 buy 先过 l0_gate + pretrade_check，通过才建仓。
+    返回摘要 {added, over_limit, skipped, rejected}"""
+    # ★延迟 import：risk_gate → risk_agent/stop_rules，不反向 import portfolio，杜绝循环
+    from risk import risk_gate as RG
+
     # ★2026-08-11 写保护免疫：deck_decisions 已是时间戳文件名，固定名可能不存在 → glob 取最新
-    _dec = _latest_glob("deck_decisions_*.json", DECISIONS_JSON)
+    _dec = Path(path) if path else _latest_glob("deck_decisions_*.json", DECISIONS_JSON)
     if not _dec.exists():
-        return {"added": [], "over_limit": [], "skipped": []}
+        return {"added": [], "over_limit": [], "skipped": [], "rejected": []}
     decisions = json.loads(_dec.read_text(encoding="utf-8"))
     if not isinstance(decisions, list):
         decisions = []
     d = _load()
     d = _ensure_legacy_fields(d)          # ★B-11：旧持仓补 otype/stop_plan
+    # ★2026-11-20 over_limit 只是「最近一次决策的名额快照」，不再跨日累积
+    #   （用户反馈：历史超限越堆越多，持仓页顶部的超限清单一长串）。
+    #   每次 sync 先清空，随后按本次 decisions 重建；entry_price=None 的记录本就从未买入。
+    if any(p.get("status") == "over_limit" for p in d["positions"]):
+        d["positions"] = [p for p in d["positions"] if p.get("status") != "over_limit"]
     # ★2026-08-11 修复：existing 含 over_limit——否则同一条 buy 记录每次 sync 都重复 append（实测 002414 累积 5 条）
+    # ★2026-11-20：over_limit 记录允许「升格」——名额空出后自动买入，否则被拒过的候选永久占位、自动买入永远买不进
     existing = {p["code"] for p in d["positions"] if p["status"] in ("holding", "over_limit")}
+    _ol_map = {p["code"]: p for p in d["positions"] if p["status"] == "over_limit"}
     risk = _risk_map()
     matrix = _load_stop_matrix()
-    added, over_limit, skipped = [], [], []
+    added, over_limit, skipped, rejected = [], [], [], []
+
+    # ★2026-11-26 风控上下文（一次算好，避免逐笔重复）：
+    #   weights 用等权资金份额（1/MAX_POSITIONS），与 size 口径一致，避免归一化到 1 后总仓位恒超限
+    _holding = [p for p in d["positions"] if p["status"] == "holding"]
+    _unit = 1.0 / max(MAX_POSITIONS, 1)
+    weights = {p["code"]: _unit for p in _holding}
+    dd, dd_available = _drawdown_proxy(_holding)
+    # 行业映射（复用 S6 的 _industry_map，从机会池/科技池反查）
+    try:
+        from risk.position_monitor import _industry_map
+        sector_map = _industry_map(list(weights) +
+                                   [r.get("code") for r in decisions if r.get("code")])
+    except Exception:
+        sector_map = {}
+
     for rec in decisions:
         if rec.get("action") != "buy":
             continue
         code = rec.get("code")
-        if not code or code in existing:
+        _op = _ol_map.get(code) if code in existing else None
+        if not code or (code in existing and _op is None):
             continue
         # ★2026-08-12 十轮#172 防御：entry_date 早于最新交易日 7 天视为历史已完成（清零/复盘后不复位持仓）
         try:
             _ed = rec.get("date") or ""
-            if _ed and (_mx := _load_latest_trade_date()) and _ed < (_mx - timedelta(days=7)):
-                skipped.append(code)
-                continue
-        except Exception:
-            pass
+            if _ed and (_mx := _load_latest_trade_date()):
+                _ed_d = datetime.strptime(str(_ed)[:10], "%Y-%m-%d")
+                _mx_d = datetime.strptime(str(_mx)[:10], "%Y-%m-%d")
+                if _ed_d < (_mx_d - timedelta(days=7)):
+                    skipped.append(code)
+                    continue
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "strategy/portfolio.py:333 sync_from_decisions")
         # 去重：同一 code 已 exit 过 → 允许再买（入 history 检查）
-        otype = _otype_of(code)           # ★B-11：机会类型（从最新池查）
+        otype = (rec.get("pitch_meta") or {}).get("otype") or _otype_of(code)   # ★优先审批记录 pitch_meta
+
+        # ★★2026-11-26 门禁 ①：L0 择时硬门控（全 fail-closed）
+        _ok, _why = RG.l0_gate(otype, code)
+        if not _ok:
+            rejected.append({"code": code, "reason": _why, "layer": "L0"})
+            RG.audit("SYNC_L0_REJECT", _why, code=code, otype=otype)
+            continue
+        # ★★2026-11-26 门禁 ②：RiskAgent 一票否决（REJECT 拦截 / REDUCE 留痕）
+        _chk = RG.pretrade_check(
+            code, _unit, weights, dd,
+            sector=sector_map.get(code, ""), sector_map=sector_map,
+            dd_available=dd_available,
+        )
+        from risk.risk_agent import Decision as _D
+        if _chk.decision == _D.REJECT:
+            rejected.append({"code": code, "reason": _chk.reason, "layer": "PRETRADE"})
+            continue
+        _risk_cap = _chk.adjusted_size if _chk.decision == _D.REDUCE else _unit
+
         pos = {
             "code": code,
             "name": rec.get("name") or _name_of(code) or code,
@@ -268,12 +374,23 @@ def sync_from_decisions() -> dict:
             "otype": otype,               # ★B-11：AI-2 自动止损引擎按此查止损计划
             "stop_plan": stop_plan_for(otype, matrix),   # ★B-11：止损矩阵 v2 映射
             "status": "holding",
-            "source": "deck",
+            "source": rec.get("source") or "deck",
             "decide_ts": rec.get("ts"),
             "risk_level": risk.get(code, "NO_DATA"),
+            "risk_size_cap": round(float(_risk_cap), 4),  # ★风控缩放留痕（台账无仓位字段，不静默缩数量）
+            "risk_check": _chk.decision.value,
             "note": rec.get("note") or "",
             "exit": None,
         }
+        if _op is not None:
+            # 已有 over_limit 记录：有名额才升格，否则保持原状（不重复 append）
+            if len([p for p in d["positions"] if p["status"] == "holding"]) >= MAX_POSITIONS:
+                over_limit.append(code)
+                continue
+            _op.update(pos)
+            _op["status"] = "holding"
+            added.append(code)
+            continue
         if len([p for p in d["positions"] if p["status"] == "holding"]) >= MAX_POSITIONS:
             pos["status"] = "over_limit"
             over_limit.append(code)
@@ -281,8 +398,10 @@ def sync_from_decisions() -> dict:
             added.append(code)
         d["positions"].append(pos)
         existing.add(code)
+        weights[code] = _unit  # 本轮新增也计入后续门禁检查
     _save(d)
-    return {"added": added, "over_limit": over_limit, "skipped": skipped}
+    return {"added": added, "over_limit": over_limit, "skipped": skipped,
+            "rejected": rejected}
 
 
 def sell(code: str, price: float = None, reason: str = "manual") -> dict:
@@ -291,6 +410,22 @@ def sell(code: str, price: float = None, reason: str = "manual") -> dict:
     target = None
     for p in d["positions"]:
         if p["code"] == code and p["status"] in ("holding", "over_limit"):
+            # ★2026-11-26 卖出侧 StopRules 留痕：手动卖出不阻断，但记录是否触发铁律
+            try:
+                from risk import risk_gate as RG
+                _cur = float(price) if price else _latest_close_of(code)
+                _sd = RG.sell_check({
+                    "code": code, "entry_price": p.get("entry_price"),
+                    "current_price": _cur, "entry_date": p.get("entry_date"),
+                    "stop": p.get("stop"),
+                })
+                _tag = ",".join(t.value for t, _ in _sd.reasons) if _sd.reasons else "none"
+                RG.audit("MANUAL_SELL_RULE" if _sd.should_sell else "MANUAL_SELL_NO_RULE",
+                         f"{_sd.action} | {_tag} | {reason}", code=code)
+                p["risk_sell_check"] = {"should_sell": _sd.should_sell,
+                                        "action": _sd.action, "reasons": _tag}
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "strategy/portfolio.py:416 sell")
             p["status"] = "exit"
             p["exit"] = {"date": datetime.now().strftime("%Y-%m-%d"),
                          "price": price, "reason": reason}
