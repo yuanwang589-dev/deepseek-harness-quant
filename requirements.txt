@@ -7,14 +7,20 @@ akshare>=1.15.0            # 覆盖源（业绩快报/机构调研等）
 tushare>=1.4.0             # 财报主源（ann_date → Point-in-Time，需 token）
 
 # ---- 回测与绩效 ----
-backtrader>=1.9.78         # 主回测引擎（实测通过）
-vectorbt>=1.0.0            # 参数扫描/Ablation 加速（实测通过，注意 freq='D' 与 1.1 API）
-quantstats>=0.0.81         # 绩效指标（实测通过）
+# 注：backtrader / vectorbt / quantstats 当前代码未引用（回测为自研 bt_engine/bt_runner），
+#     如需扩展再自行安装，避免新用户安装失败。
 
 # ---- 数据处理 ----
 numpy>=1.26
 pandas>=2.2
 pyyaml>=6.0                # 读取 config/params.yaml
+scipy>=1.10                # 政策因子 / 统计
+requests>=2.31             # 备用服务器 HTTP / 数据源
+psutil>=5.9                # 手动更新进程管理
+py7zr>=0.20                # 分钟数据 7z 解压
+plotly>=5.18               # 回测图表（bt_report）
 
 # ---- 可选 ----
 matplotlib>=3.8            # 图表
+curl_cffi>=0.5             # EPU 抓取（缺失时自动回退 urllib）
+jqdatasdk>=1.8             # 聚宽（可选）

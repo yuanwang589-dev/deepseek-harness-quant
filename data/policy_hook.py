@@ -10,6 +10,17 @@
   防守区（score<-0.5）→ 额外降 1 档（full→half，cash 至少 0.5）；中性/进攻不干预。
   当前状态：2026-06 score +0.21 中性区 → 0 干预（无害过渡）。
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import json
 import sys
 import time
@@ -51,14 +62,14 @@ def load() -> dict:
             d = json.loads(OUT.read_text(encoding="utf-8"))
             _cache.update({"ts": now, "data": d})
             return d
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/policy_hook.py:54 load")
     d = _compute()
     if d:
         try:
             OUT.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/policy_hook.py:60 load")
         _cache.update({"ts": now, "data": d})
     return d or {}
 

@@ -47,7 +47,7 @@
     if (!btn || btn.disabled) return;
     var orig = btn.textContent;
     btn.disabled = true; btn.textContent = '生成中…';
-    LW.api.get('/api/export_data', { bypass: true }).then(function (d) {
+    LW.api.post('/api/export_data', {}).then(function (d) {
       var name = kind === 'xlsx' ? d.excel : d.poster;
       btn.disabled = false; btn.textContent = orig;
       if (name) { window.open('/dl/' + name, '_blank'); }

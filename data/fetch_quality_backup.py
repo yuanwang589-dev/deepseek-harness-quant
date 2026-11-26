@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """data/fetch_quality_backup.py — 质量因子补拉（备用服务器通道，2026-08-09）
 
 ★重大发现：备用HTTP服务器 备用服务器 fina-indicator 权限已开通（商家升级），
@@ -14,6 +14,17 @@
   python data/fetch_quality_backup.py --workers 4          # 全市场续传
   python data/fetch_quality_backup.py --limit 20           # 小样本验证
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import concurrent.futures
 import json
@@ -51,8 +62,8 @@ def log(msg):
     try:
         with open(LOG, "a", encoding="utf-8") as f:
             f.write(line + "\n")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "data/fetch_quality_backup.py:54 log")
 
 
 def _num(v):

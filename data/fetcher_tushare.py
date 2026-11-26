@@ -11,8 +11,20 @@
 
 备用服务器（HTTP API）：data/fetcher_tushare_backup.py（<your-backup-server>）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import os
 import time
+import urllib.parse
 from pathlib import Path
 
 os.environ.setdefault("NO_PROXY", "*")  # 数据抓取不走代理，防限频/握手问题
@@ -22,6 +34,57 @@ import pandas as pd
 _PRO = None
 _LAST_CALL = 0.0
 _MIN_INTERVAL = 0.05  # 主服务器宽松节流（实测单次 ~1s，此值仅防手滑打爆）
+_ROOT_API_PATCHED = False
+
+
+def _install_root_path_api():
+    """★2026-11-02 修「Tushare 全线静默空转」：
+
+    官方 SDK 的 DataApi.query 发的是 `POST {http_url}/{api_name}`（waditu 老服务风格），
+    而 https://api.tushare.pro 的官方端点只接受根路径 POST（body 里带 api_name）。
+    当 params.yaml 配 tushare_api_url=https://api.tushare.pro 时，实际请求打到
+    /index_daily → 404 page not found；SDK 不报错、返回空 DataFrame，于是
+    pipeline 日志从 10-16 起天天「⚠ Tushare 日线增量失败（已重试）→ 跳过当日增量」
+    却没人发现（bars.db 的 tushare 增量长期空跑）。
+
+    这里在类级打补丁（模块导入时经 _pro() 触发，幂等）：
+      - URL 无路径（https://api.tushare.pro）→ 官方根路径 POST，非 JSON/非零 code 显式抛错
+      - URL 带路径（自建镜像 /dataapi 之类）→ 保持原 SDK 拼路径行为，不破坏既有部署
+    """
+    global _ROOT_API_PATCHED
+    if _ROOT_API_PATCHED:
+        return
+    import requests
+    from tushare.pro.client import DataApi
+
+    _orig_query = DataApi.query
+
+    def _query(self, api_name, fields="", **kwargs):
+        url = getattr(self, "_DataApi__http_url", "") or ""
+        if urllib.parse.urlparse(url).path not in ("", "/"):
+            return _orig_query(self, api_name, fields=fields, **kwargs)
+        kwargs.setdefault("ts_type_name", url)
+        payload = {
+            "api_name": api_name,
+            "token": getattr(self, "_DataApi__token", ""),
+            "params": kwargs,
+            "fields": fields,
+        }
+        res = requests.post(url, json=payload,
+                            timeout=getattr(self, "_DataApi__timeout", 15) or 15)
+        try:
+            result = res.json()
+        except ValueError:
+            raise RuntimeError(
+                f"Tushare {api_name} 非 JSON 响应（HTTP {res.status_code}，URL={url}）: "
+                f"{(res.text or '')[:120]}")
+        if result.get("code") != 0:
+            raise RuntimeError(f"Tushare {api_name} 返回错误: {str(result.get('msg'))[:150]}")
+        data = result.get("data") or {}
+        return pd.DataFrame(data.get("items") or [], columns=data.get("fields") or [])
+
+    DataApi.query = _query
+    _ROOT_API_PATCHED = True
 
 
 def _load_cfg():
@@ -37,14 +100,15 @@ def _pro():
       重试链累加 = 整链 100s+）；10s 快速失败 + _call 重试 5 次更稳更快。"""
     global _PRO
     if _PRO is None:
+        _install_root_path_api()
         import tushare as ts
         cfg = _load_cfg()
         p = ts.pro_api(cfg["tushare_token"])
         p._DataApi__http_url = cfg.get("tushare_api_url", "https://api.tushare.pro")
         try:
             p._DataApi__timeout = 10
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/fetcher_tushare.py:99 _pro")
         _PRO = p
     return _PRO
 
@@ -224,6 +288,11 @@ def get_income(ts_code: str, start_date: str = "20200101", end_date: str = None,
     df = _call(fn, ts_code=ts_code, start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""))
     if df is None or df.empty:
         return pd.DataFrame()
+    if "ann_date" in df.columns:
+        # ★2026-11-10 PIT：只保留已公告（ann_date <= 今天），按公告日排序——
+        #   原按 end_date 排序会让 iloc[-1] 取到尚未披露的报告期。
+        df = df[df["ann_date"].fillna("99999999") <= time.strftime("%Y%m%d")]
+        return df.sort_values(["ann_date", "end_date"]).reset_index(drop=True)
     return df.sort_values("end_date").reset_index(drop=True)
 
 
@@ -234,6 +303,11 @@ def get_balancesheet(ts_code: str, start_date: str = "20200101", end_date: str =
     df = _call(fn, ts_code=ts_code, start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""))
     if df is None or df.empty:
         return pd.DataFrame()
+    if "ann_date" in df.columns:
+        # ★2026-11-10 PIT：只保留已公告（ann_date <= 今天），按公告日排序——
+        #   原按 end_date 排序会让 iloc[-1] 取到尚未披露的报告期。
+        df = df[df["ann_date"].fillna("99999999") <= time.strftime("%Y%m%d")]
+        return df.sort_values(["ann_date", "end_date"]).reset_index(drop=True)
     return df.sort_values("end_date").reset_index(drop=True)
 
 
@@ -244,6 +318,11 @@ def get_cashflow(ts_code: str, start_date: str = "20200101", end_date: str = Non
     df = _call(fn, ts_code=ts_code, start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""))
     if df is None or df.empty:
         return pd.DataFrame()
+    if "ann_date" in df.columns:
+        # ★2026-11-10 PIT：只保留已公告（ann_date <= 今天），按公告日排序——
+        #   原按 end_date 排序会让 iloc[-1] 取到尚未披露的报告期。
+        df = df[df["ann_date"].fillna("99999999") <= time.strftime("%Y%m%d")]
+        return df.sort_values(["ann_date", "end_date"]).reset_index(drop=True)
     return df.sort_values("end_date").reset_index(drop=True)
 
 
@@ -254,6 +333,11 @@ def get_fina_indicator(ts_code: str, start_date: str = "20200101", end_date: str
     df = _call(fn, ts_code=ts_code, start_date=start_date.replace("-", ""), end_date=end_date.replace("-", ""))
     if df is None or df.empty:
         return pd.DataFrame()
+    if "ann_date" in df.columns:
+        # ★2026-11-10 PIT：只保留已公告（ann_date <= 今天），按公告日排序——
+        #   原按 end_date 排序会让 iloc[-1] 取到尚未披露的报告期。
+        df = df[df["ann_date"].fillna("99999999") <= time.strftime("%Y%m%d")]
+        return df.sort_values(["ann_date", "end_date"]).reset_index(drop=True)
     return df.sort_values("end_date").reset_index(drop=True)
 
 

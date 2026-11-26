@@ -21,6 +21,17 @@
 输出：output/timing_system_{ts}.json（时间戳文件名，写保护免疫）+ 固定名兼容
 UI：Pitch 页顶部一行式状态条（live_patch /api/live/timing 消费）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import glob
 import json
 import math
@@ -34,7 +45,9 @@ BASE = Path(__file__).resolve().parent.parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
-BARS_DB = r"data/cache/bars.db"
+from data.cache import CACHE_DIR
+
+BARS_DB = str(CACHE_DIR / "bars.db")
 OUT_DIR = BASE / "output"
 
 
@@ -67,29 +80,29 @@ def _merged_max_date() -> str:
     conns = []
     try:
         conns.append(_bars_conn())
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:72 _merged_max_date")
     try:
         from pathlib import Path as _P
         for _p in sorted(_P(BARS_DB).parent.glob("bars_incr_*.db"))[-3:]:
             try:
                 conns.append(sqlite3.connect(f"file:{_p}?mode=ro&immutable=1", uri=True, timeout=3))
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:79 _merged_max_date")
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:81 _merged_max_date")
     for _c in conns:
         try:
             r = _c.execute("SELECT MAX(date) FROM daily_bar").fetchone()[0]
             if r and (mx is None or r > mx):
                 mx = r
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:88 _merged_max_date")
         finally:
             try:
                 _c.close()
-            except Exception:
-                pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:93 _merged_max_date")
     if mx:
         _merged_max_cache.update(t=now, v=mx)
     return mx or ""
@@ -142,8 +155,8 @@ def policy_score() -> dict:
             # ★#351 精简 note：结论式（公式细节 EPU+社融+利差 → 说明页），reason 用 short
             _note = f"{_feel}（{_bk} {_d.get('month','')}）"
             return {"score": _sc, "note": _note, "short": _feel}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:147 policy_score")
     try:
         from factors.policy.epu_factors import load_epu_monthly
         df = load_epu_monthly()
@@ -180,11 +193,18 @@ def macro_score() -> dict:
             return {"score": 50, "note": "无择时信号（中性）"}
         d = json.loads(Path(fs[-1]).read_text(encoding="utf-8"))
         rl = d.get("regime_label", "")
+        # ★2026-09-21 兼容红绿灯三态（traffic_light v2）：daily_signal 的 regime_label 现输出
+        #   贪婪/观望/恐慌中文（词=系统风险/乖离），已不再产出英文趋势五档——五档映射全部 miss 恒 50。
+        #   红绿灯→宏观分（越高越适合买入）：贪婪=趋势强势偏热75、观望=震荡55、恐慌=系统性风险15。
         mapping = {"strong_uptrend": 90, "uptrend": 75, "choppy": 55,
-                   "downtrend": 30, "strong_downtrend": 15}
+                   "downtrend": 30, "strong_downtrend": 15,
+                   "greedy": 75, "wait": 55, "panic": 15,
+                   "贪婪": 75, "观望": 55, "恐慌": 15}
         sc = mapping.get(rl, 50)
         _rl_cn = {"strong_uptrend": "强势上行", "uptrend": "上行", "choppy": "震荡",
-                  "downtrend": "下行", "strong_downtrend": "弱势下行"}.get(rl, "中性")
+                  "downtrend": "下行", "strong_downtrend": "弱势下行",
+                  "greedy": "贪婪", "wait": "观望", "panic": "恐慌",
+                  "贪婪": "贪婪", "观望": "观望", "恐慌": "恐慌"}.get(rl, "中性")
         note = f"Regime={rl}"
         # ★#105 真实宏观库修正（macro.db immutable）
         try:
@@ -235,8 +255,8 @@ def macro_score() -> dict:
                     if dv is not None and abs(dv) >= 0.095 and (m60 is None or m60 < 0):
                         sc = max(15, sc - 15)   # 分化极端(≥9.5pp)+等权弱 → 降 15 分
                         note += "｜等权分化降档"
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:247 macro_score")
         sc = max(5, min(100, sc))
         return {"score": sc, "note": note, "short": _rl_cn}
     except Exception as e:
@@ -273,8 +293,8 @@ def sentiment_score() -> dict:
                               .replace("（加仓区）", "").replace("买入区", "").strip()) or "中性"
                     return {"score": sc, "note": note, "short": _short}
                 break
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:285 sentiment_score")
     # bars 兜底（外包温度计缺失）：保持原涨停密度逻辑，note 标注兜底
     try:
         con = _bars_conn()
@@ -287,18 +307,17 @@ def sentiment_score() -> dict:
         n = len(rows)
         lu = sum(1 for r in rows if r[0] and r[1] and r[0] / r[1] >= 1.097)
         lu_pct = lu / n * 100
+        # ★2026-09-21 方向对齐主口径：外包温度计"越低越恐慌=买入区"（恐慌底部90/偏冷70/中性50/偏热30/过热15）。
+        #   原 bars 兜底沿用旧反向逻辑（涨停越多分越高=活跃 85）会推反汇总档位——改同向档位映射，
+        #   且 short 换结论词（原恒硬编码"涨停情绪"指标名，69分与25分都显示"涨停情绪"误导）。
         if lu_pct >= 4:
-            sc = max(20, 75 - (lu_pct - 4) * 15)
-            note = f"涨停 {lu} 只（{lu_pct:.1f}%）过热降温"
+            sc, short, note = 15, "过热", f"涨停 {lu} 只（{lu_pct:.1f}%）过热"
         elif lu_pct >= 1.5:
-            sc = min(85, 55 + lu_pct * 8)
-            note = f"涨停 {lu} 只（{lu_pct:.1f}%）情绪活跃"
+            sc, short, note = 30, "偏热", f"涨停 {lu} 只（{lu_pct:.1f}%）偏热"
         elif lu_pct >= 0.5:
-            sc = 45
-            note = f"涨停 {lu} 只（{lu_pct:.1f}%）情绪平淡"
+            sc, short, note = 50, "中性", f"涨停 {lu} 只（{lu_pct:.1f}%）中性"
         else:
-            sc = 25
-            note = f"涨停 {lu} 只（{lu_pct:.1f}%）情绪冰点"
+            sc, short, note = 90, "恐慌", f"涨停 {lu} 只（{lu_pct:.1f}%）恐慌冰点（买入区）"
         vols = [r[2] for r in rows if r[2]]
         if vols:
             import statistics
@@ -307,7 +326,7 @@ def sentiment_score() -> dict:
             temp = "量能适中" if 0.8 < vs / (vm + 1e-9) < 1.3 else ("量能放大" if vs / (vm + 1e-9) >= 1.3 else "量能萎缩")
             note += f"｜{temp}"
         note += "（bars 兜底）"
-        return {"score": round(sc, 1), "note": note, "short": "涨停情绪"}
+        return {"score": round(sc, 1), "note": note, "short": short}
     except Exception as e:
         return {"score": 50, "note": f"情绪分异常（{str(e)[:40]}）"}
 
@@ -356,8 +375,8 @@ def breadth_score() -> dict:
                 note = "｜".join(note_parts)
                 _short = "恐慌" if sc >= 80 else ("偏冷" if sc >= 60 else ("中性" if sc >= 40 else ("偏热" if sc >= 30 else "亢奋")))
                 return {"score": sc, "note": note, "short": _short}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:367 breadth_score")
     # bars 兜底（外包快照缺失）：当日上涨家数占比
     try:
         con = _bars_conn()
@@ -428,8 +447,8 @@ def _style_state() -> dict:
                 "divergence_60": dv, "ind_breadth_60": ib, "crowding_pctile": cp,
                 "fresh": True, "snap_file": _sf.get("file"),
                 "evidence": "H30 行业轮动 + H27 大小盘分化 + C-10 量化拥挤（外包快照）"}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:439 _style_state")
     return {"style": "未知", "note": "快照读取失败"}
 
 
@@ -517,8 +536,8 @@ def write_outputs(r: dict) -> Path:
     try:
         (OUT_DIR / "timing_system.json").write_text(
             json.dumps(r, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:528 write_outputs")
     return p
 
 
@@ -527,8 +546,8 @@ def latest() -> dict:
     if fs:
         try:
             return json.loads(Path(fs[-1]).read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/policy/timing_system.py:538 latest")
     return {}
 
 

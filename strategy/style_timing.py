@@ -9,6 +9,17 @@
      （>0 小盘强势 → 超配 left 池；<0 大盘强势 → 超配 right 池）
   3. 相对强度过 20 日均线平滑（防单日噪声），映射为池权重偏移（±上限）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import sys
 from pathlib import Path
 
@@ -101,8 +112,8 @@ if __name__ == "__main__":
         m = pd.read_csv(r"data\cache\circ_mv_map.csv")
         m["code6"] = m["code"].astype(str).str[:6]
         mv_map = dict(zip(m["code6"], m["mv_yi"]))
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "strategy/style_timing.py:104 <module>")
 
     print("=== 大小盘相对强度自测（400只样本）===")
     st = small_large_strength(closes, mv_map)

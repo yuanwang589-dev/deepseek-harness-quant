@@ -16,6 +16,17 @@
   python data/fetcher_finance.py --start 100     # 断点续传（从第 100 只开始）
   python data/fetcher_finance.py --status        # 查看进度
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import sys
 import time
@@ -237,8 +248,8 @@ def main():
                     con.commit()
                     done += 1
                     continue
-            except Exception:
-                pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "data/fetcher_finance.py:240 main")
             fail.append((code, str(e)[:60]))
         if (i + 1) % 20 == 0:
             el = time.time() - t0

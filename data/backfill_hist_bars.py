@@ -23,14 +23,25 @@ data/backfill_hist_bars.py — ★2010-2018 全市场历史行情回填（Tushar
 注意：is_st 历史标记暂无数据源（stock_st 仅近期）→ 2010-2018 先置 0，审计 F-1 范围外
 用法：python data/backfill_hist_bars.py [--workers 2] [--limit N] [--dry-run] [--status]
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
+import os
 import sqlite3
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
-import os
 for k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]:
     os.environ.pop(k, None)
 os.environ["NO_PROXY"] = "*"
@@ -54,8 +65,8 @@ def log(msg):
         LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "data/backfill_hist_bars.py:57 log")
 
 
 def _conn():
@@ -190,8 +201,8 @@ def _backup_fetch_day(trade_date, k_map, raw_only=False):
             rows.append((
                 code.upper(), date_s,
                 float(o), float(h), float(l), float(c), pc_v,
-                float(vol) if vol is not None else None,
-                float(amt) if amt is not None else None,
+                float(vol) * 100 if vol is not None else None,
+                float(amt) * 1000 if amt is not None else None,
                 None, float(pct) if pct is not None else None, 0,
                 "none", "tushare_backup",
             ))
@@ -199,8 +210,8 @@ def _backup_fetch_day(trade_date, k_map, raw_only=False):
             rows.append((
                 code.upper(), date_s,
                 float(o), float(h), float(l), float(c), pc_v,
-                float(vol) if vol is not None else None,
-                float(amt) if amt is not None else None,
+                float(vol) * 100 if vol is not None else None,
+                float(amt) * 1000 if amt is not None else None,
                 None, float(pct) if pct is not None else None, 0,
                 "qfq", "tushare_backup",
             ))
@@ -234,7 +245,7 @@ def fetch_day(pro, trade_date, k_map, use_backup=False):
             code.upper(), date_s,
             r["open"] * price_k, r["high"] * price_k, r["low"] * price_k, r["close"] * price_k,
             r["pre_close"] * price_k,
-            r["vol"], r["amount"], None, r["pct_chg"], 0,
+            r["vol"] * 100, r["amount"] * 1000, None, r["pct_chg"], 0,
             "qfq", "tushare",
         ))
     return trade_date, rows, None
@@ -242,9 +253,11 @@ def fetch_day(pro, trade_date, k_map, use_backup=False):
 
 def run(workers=2, limit=None, dry_run=False, use_backup=False):
     # 已完成检查（source 为 tushare / tushare_backup 且 2019 前；date 为 YYYY-MM-DD → 转 YYYYMMDD）
+    # ★2026-11-10：加 adjust 条件——raw 模式写入 none 后，qfq 缺口不能被误判为"已完成"
     con = _conn()
     done_days = {r[0].replace("-", "") for r in con.execute(
-        "SELECT DISTINCT date FROM daily_bar WHERE source IN ('tushare','tushare_backup') AND date<'2019-01-01'").fetchall()}
+        "SELECT DISTINCT date FROM daily_bar WHERE source IN ('tushare','tushare_backup') "
+        "AND adjust='qfq' AND date<'2019-01-01'").fetchall()}
     con.close()
 
     if use_backup:

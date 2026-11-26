@@ -17,7 +17,7 @@
   data/*.py data/demo/build_demo_db.py config/*.example
   harness/home/profiles/web/cordis.patch.yml harness/home/profiles/web/cordis.yml
   harness/home/profiles/web/plugins/ harness/home/skills/
-  harness/install.cmd launcher.py main.py dev_auto.py
+  harness/install.cmd launcher.py main.py dev_auto.py dsh_log.py
   README.md LICENSE CHANGELOG.md VERSION .gitignore docs/ AGENTS.md
 
 保护清单（永不覆盖）：
@@ -43,7 +43,7 @@ ALLOW_ROOTS = (
     "harness/home/profiles/web/plugins", "harness/home/skills",
 )
 ALLOW_FILES = (
-    "launcher.py", "main.py", "dev_auto.py", "README.md", "LICENSE",
+    "launcher.py", "main.py", "dev_auto.py", "dsh_log.py", "README.md", "LICENSE",
     "CHANGELOG.md", "VERSION", ".gitignore", "AGENTS.md",
     "harness/install.cmd", "requirements.txt",
 )
@@ -131,8 +131,14 @@ def main():
             print(f"  已备份 → backups/{bk.name}")
 
         # 应用文件
+        _root_r = ROOT.resolve()
         for rel in files:
-            target = ROOT / rel
+            target = (ROOT / rel).resolve()
+            # ★2026-11-10 修复：allowed() 的 startswith 前缀可被 `deck/../../x.py` 绕过，
+            #   写入前用 resolve().is_relative_to(ROOT) 做最终防线。
+            if not target.is_relative_to(_root_r):
+                print(f"  ✗ 拒绝越界路径: {rel}")
+                continue
             target.parent.mkdir(parents=True, exist_ok=True)
             if dry:
                 print(f"  [dry] + {rel}")
@@ -141,7 +147,10 @@ def main():
                 shutil.copyfileobj(fsrc, fdst)
         # 删除
         for rel in removed:
-            target = ROOT / rel
+            target = (ROOT / rel).resolve()
+            if not target.is_relative_to(_root_r):
+                print(f"  ✗ 拒绝越界路径: {rel}")
+                continue
             if dry:
                 print(f"  [dry] - {rel}")
                 continue

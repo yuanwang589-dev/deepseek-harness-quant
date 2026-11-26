@@ -12,12 +12,24 @@
 统一代码格式：'600519.SH' / '000001.SZ'
 adjust：'qfq' 前复权 / 'hfq' 后复权 / 'none' 不复权
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import os
 import sqlite3
 import time
 from pathlib import Path
 
 import pandas as pd
+
 
 # 缓存目录解析（优先级：环境变量 LWQUANT_CACHE_DIR > params.yaml data.cache_dir > 默认 data/cache）
 def _resolve_cache_dir() -> Path:
@@ -33,8 +45,8 @@ def _resolve_cache_dir() -> Path:
             if d:
                 p = Path(str(d))
                 return p if p.is_absolute() else Path(__file__).resolve().parent.parent / p
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "data/cache.py:37 _resolve_cache_dir")
     return Path(__file__).resolve().parent.parent / "data" / "cache"
 
 CACHE_DIR = _resolve_cache_dir()
@@ -123,12 +135,20 @@ class DailyCache:
         return con
 
     def _init_schema(self):
-        with self._conn() as con:
+        con = self._conn()
+        try:
             con.executescript(_SCHEMA)
+            con.commit()
+        finally:
+            con.close()
 
     def _init_schema_inc(self):
-        with self._conn_inc() as con:
+        con = self._conn_inc()
+        try:
             con.executescript(_SCHEMA)
+            con.commit()
+        finally:
+            con.close()
 
     def _writable(self, path=None) -> bool:
         """探测指定库是否可写（环境写保护/锁定 → False）
@@ -155,6 +175,11 @@ class DailyCache:
         """
         if df is None or df.empty:
             return 0
+        # ★2026-11-10 单位归一：调用方传原始单位（tushare=千元/手、baostock/akshare=元/股），
+        #   落库前统一为 元/股，杜绝混源后 amount 缩 1000 倍/volume 缩 100 倍且不报错。
+        df = df.copy()
+        df["source"] = source
+        df = normalize_units(df)
         # 写库路由：单库模式用主库；双库模式探测主库（可写→主库；只读→incr 库）
         target = self.db_path
         if self.inc_path is not None:
@@ -220,6 +245,10 @@ class DailyCache:
             return 0
         if "code" not in df.columns:
             raise ValueError("put_daily_batch 需要 df 含 code 列")
+        # ★2026-11-10 单位归一（同 put_daily）：Tushare 原始千元/手 → 元/股
+        df = df.copy()
+        df["source"] = source
+        df = normalize_units(df)
         target = self.db_path
         if self.inc_path is not None:
             if getattr(self, "_wprobe_result", None) is None:
@@ -252,6 +281,18 @@ class DailyCache:
                 "INSERT OR REPLACE INTO daily_bar "
                 "(code,date,open,high,low,close,preclose,volume,amount,turn,pct_chg,is_st,adjust,source) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            # ★2026-11-10 修复：批量写入不更新 bar_meta → covers() 恒 False →
+            #   下游误判"未缓存"重复拉网络并用其他源覆盖。按本次涉及的 code 回填覆盖区间。
+            _now = time.strftime("%Y-%m-%d %H:%M:%S")
+            for _code in sorted({str(c).upper() for c in df["code"]}):
+                _r = con.execute(
+                    "SELECT MIN(date), MAX(date), COUNT(*) FROM daily_bar WHERE code=? AND adjust=?",
+                    (_code, adjust)).fetchone()
+                if _r and _r[2]:
+                    con.execute(
+                        "INSERT OR REPLACE INTO bar_meta (code,adjust,start_date,end_date,rows,updated_at) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (_code, adjust, _r[0], _r[1], _r[2], _now))
             con.commit()
         finally:
             con.close()
@@ -266,13 +307,16 @@ class DailyCache:
         归档后它们会挤进"最近 3 个"窗口浪费连接数；真实增量库 ≥1MB（5538+ 行）"""
         if self.inc_path is None:
             return []
-        paths = [self.inc_path] if Path(self.inc_path).exists() else []
         import glob as _glob
+        # ★2026-11-10 修复：固定 bars_incr.db 是常规写入目标，必须始终保留；
+        #   原 `paths[-3:]` 在时间戳库 ≥3 个时会把它裁掉 → 每日增量整体读不到。
+        main_inc = [Path(self.inc_path)] if Path(self.inc_path).exists() else []
+        stamps = []
         for f in sorted(_glob.glob(str(self.inc_path.with_name("bars_incr_*.db")))):
             p = Path(f)
-            if p != self.inc_path and p.stat().st_size >= 100 * 1024:
-                paths.append(p)
-        return paths[-3:] if len(paths) > 3 else paths
+            if p != Path(self.inc_path) and p.stat().st_size >= 100 * 1024:
+                stamps.append(p)
+        return (main_inc + stamps[-2:]) if main_inc else stamps[-3:]
 
     @staticmethod
     def _ro_uri(p) -> str:
@@ -344,8 +388,8 @@ class DailyCache:
                     _c["val"] = d
                     _c["ver"] = _ver
                     return d
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/cache.py:380 latest_trade_date")
         _c["ts"] = _now
         _c["val"] = best
         _c["ver"] = _ver
@@ -357,7 +401,9 @@ class DailyCache:
         ★2026-08-10 性能修复：主库 immutable 只读连接（0.01s，绕 20s 等锁）；增量库 timeout=3"""
         code = code.upper()
         frames = []
-        for p in self._inc_paths() + [self.db_path]:   # 增量在前 → drop_duplicates keep last = 增量覆盖
+        # ★2026-11-10 修复：主库在前、增量在后 + keep="last" → 增量覆盖主库同 key
+        #   （原顺序相反，主库旧值把增量新值覆盖，重拉/修正全部读不到）
+        for p in [self.db_path] + self._inc_paths():
             if not Path(p).exists():
                 continue
             sql = ("SELECT code,date,open,high,low,close,preclose,volume,amount,"
@@ -418,11 +464,12 @@ class DailyCache:
                         "volume", "amount", "turn", "pct_chg", "is_st", "adjust", "source"]
             num_cols = list(_NUM_COLS)
         else:
-            flds = [f for f in fields if f in _NUM_COLS or f == "is_st"]
+            # ★2026-11-26：放行 source（normalize_units 需按 source 判断混源单位）
+            flds = [f for f in fields if f in _NUM_COLS or f in ("is_st", "source")]
             sel_cols = ["code", "date"] + flds + ["adjust"]
             num_cols = [f for f in flds if f in _NUM_COLS]
-        out_all = {}   # code -> list[DataFrame]（增量在前 → concat 后 drop_duplicates keep=last 覆盖）
-        db_paths = self._inc_paths() + [self.db_path]
+        out_all = {}   # code -> list[DataFrame]（主库在前 → concat 后 keep=last 保留增量）
+        db_paths = [self.db_path] + self._inc_paths()
         sql_head = ("SELECT " + ",".join(sel_cols) +
                     " FROM daily_bar WHERE adjust=? AND code IN (")
         for p in db_paths:
@@ -430,7 +477,10 @@ class DailyCache:
                 continue
             try:
                 # ★2026-08-10：主库与时间戳增量库 immutable；固定 inc 库普通连接（可能正写）
-                if p == str(self.db_path) or p != str(self.inc_path):
+                # ★2026-11-10 修复：原 p == str(...) 恒假 → else 分支永不可达。
+                _is_main = (Path(p) == Path(self.db_path))
+                _is_active_inc = (self.inc_path is not None and Path(p) == Path(self.inc_path))
+                if _is_main or not _is_active_inc:
                     con = sqlite3.connect(self._ro_uri(p), uri=True, timeout=3)
                 else:
                     con = sqlite3.connect(p, timeout=3)
@@ -457,13 +507,13 @@ class DailyCache:
                         df[c] = pd.to_numeric(df[c], errors="coerce")
                     for code, g in df.groupby("code"):
                         out_all.setdefault(code, []).append(g)
-            except Exception:
-                pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "data/cache.py:499 get_daily_batch")
             finally:
                 try:
                     con.close()
-                except Exception:
-                    pass
+                except Exception as _dsh_exc:
+                    _dsh_swallow(_dsh_exc, "data/cache.py:504 get_daily_batch")
         res = {}
         for code, frames in out_all.items():
             if not frames:
@@ -516,6 +566,34 @@ class DailyCache:
             return False
         return bool(meta["start_date"] and meta["end_date"]
                     and meta["start_date"] <= start and meta["end_date"] >= end)
+
+    def list_codes(self, adjust="qfq") -> list:
+        """★2026-11-26：列出缓存中所有股票代码（合并主库+增量库，去重排序）。
+
+        用于 bt_engine.main 取股票域，替代原"相对路径直连 bars.db、绕过双库"的做法。
+        排除 sh./sz. 残留格式（与项目其他 SQL 口径一致）。
+        """
+        import sqlite3
+        out = set()
+        for p in [self.db_path] + self._inc_paths():
+            if not Path(p).exists():
+                continue
+            try:
+                con = sqlite3.connect(self._ro_uri(p), uri=True, timeout=3)
+                try:
+                    # ★优先读 bar_meta（每股票一行，毫秒级）；无记录才回退全表 DISTINCT（3.7GB 约 3 分钟）
+                    rows = con.execute(
+                        "SELECT DISTINCT code FROM bar_meta WHERE adjust=?", (adjust,)).fetchall()
+                    if not rows:
+                        rows = con.execute(
+                            "SELECT DISTINCT code FROM daily_bar WHERE adjust=?", (adjust,)).fetchall()
+                    out.update(r[0] for r in rows)
+                finally:
+                    con.close()
+            except Exception:
+                continue
+        # 统一排除残留格式（与项目其他 SQL 口径一致）
+        return sorted(c for c in out if c and not str(c).lower().startswith(("sh.", "sz.")))
 
 
 def _f(x):

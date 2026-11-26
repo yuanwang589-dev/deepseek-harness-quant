@@ -61,10 +61,13 @@
 </div>
 
 <script src="/v2/core/api.js"></script>
+<script src="/v2/core/render.js"></script>
 <script src="/v2/components/sidebar.js"></script>
 <script src="/v2/components/icons.js"></script>
 <script>
 (function () {
+  /* ★2026-09-09 修复：缺 var R=LW.render 导致页面 R 未定义，远期表格/明细全部中断渲染 */
+  var R = LW.render;
   /* ★2026-08-16 修复：侧栏渲染调用缺失导致点进远期页菜单消失——与全站统一 */
   LW.sidebar.render('sidebar', { active: 'pitchtrack' });
   function esc(s) {
@@ -81,7 +84,10 @@
   /* ★2026-08-16 远期池明细（从持仓页移入）：分池统计对比 + 池 Tab 选择 + 单池明细 + 止损逻辑 */
   function loadForward() {
     LW.api.get('/api/pitch_track').then(function (d) {
-      var es = (d.entries || []).filter(function (e) { return e.pool_type; });   // 过滤 pool_type=null 旧批次
+      /* ★2026-09-09 对齐后端 summary_by_pool(e.get('pool_type') or 'auto_pitch')：历史无 pool_type 旧批次归 A 池，
+       否则表格 A=3 而 KPI A=16 口径不一致 → 被误读为"数据缺失" */
+      var es = (d.entries || []).map(function (e) { if (!e.pool_type) e.pool_type = 'auto_pitch'; return e; })
+        .filter(function (e) { return e.pool_type; });
       var box = document.getElementById('fwd-box');
       function ret(v) { return (v != null && !isNaN(v)) ? '<b style="color:' + R.color(v) + '">' + (v * 100).toFixed(1) + '%</b>' : '<span style="opacity:.35">—</span>'; }
       function wp(v) { return (v != null && !isNaN(v)) ? (v * 100).toFixed(0) + '%' : '<span style="opacity:.35">—</span>'; }
@@ -128,7 +134,7 @@
       function detailRows(list) {
         return list.map(function (o) {
           var f = o.fwd || {};
-          var typeTxt = R.otypeCN && R.otypeCN[o.otype] ? R.otypeCN[o.otype] : o.otype;
+          var typeTxt = R.otypeCN ? (R.otypeCN(o.otype) || o.otype) : o.otype;
           var niuTxt = o.pool_type === 'niu_select' ? (o.persona_name ? ' · ' + o.persona_name : '') : '';
           return '<tr><td><b>' + R._f(o.code) + '</b> ' + R._f(o.name).slice(0, 6) + niuTxt + '</td>' +
             '<td><span class="vtag" style="background:rgba(94,106,210,.12);color:#8b5cf6">' + R._f(typeTxt) + '</span></td>' +

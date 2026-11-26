@@ -16,6 +16,17 @@ strategy/equal_weight_timing.py — 主策略 v3（用户拍板 A 方向，2026-
   python strategy/equal_weight_timing.py --date 2026-08-06   # 生成当日持仓清单
   python strategy/equal_weight_timing.py --backtest           # 全量回测验证
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import sqlite3
 import sys
@@ -161,11 +172,11 @@ def regime_cash(date, confirm=None, cooldown=None) -> float:
                     pen = regime_penalty()
                     if pen > 0:
                         cash0 = max(cash0, pen)
-                except Exception:
-                    pass
+                except Exception as _dsh_exc:
+                    _dsh_swallow(_dsh_exc, "strategy/equal_weight_timing.py:164 regime_cash")
                 return cash0
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "strategy/equal_weight_timing.py:167 regime_cash")
 
     # 回退：RegimeDetector（真实 OHLC）
     if confirm is None or cooldown is None:

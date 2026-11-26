@@ -157,14 +157,15 @@
     var prefix = opts.prefix != null ? opts.prefix : sign;
     var suffix = opts.suffix != null ? opts.suffix : (sfx ? ' ' + sfx : '');
     if (typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
-      el.textContent = prefix + num.toFixed(decimals) + suffix; return;
+      el.textContent = prefix + Math.abs(num).toFixed(decimals) + suffix; return;
     }
     var dur = opts.duration || 1200, start = null;
     function step(ts) {
       if (start == null) start = ts;
       var t = Math.min(1, (ts - start) / dur);
       var eased = t === 1 ? 1 : 1 - Math.pow(2, -10 * t);   // expo-out
-      el.textContent = prefix + (num * eased).toFixed(decimals) + suffix;
+      // ★2026-11-20 负数已由 prefix 出力，取绝对值避免 "--0.40" 双负号
+      el.textContent = prefix + Math.abs(num * eased).toFixed(decimals) + suffix;
       if (t < 1) window.requestAnimationFrame(step);
     }
     window.requestAnimationFrame(step);

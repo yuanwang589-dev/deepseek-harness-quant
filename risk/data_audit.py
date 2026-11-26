@@ -34,6 +34,17 @@
   F-5 [P2] 财报 PIT 用固定延迟近似（无 ann_date 披露日），设计为 tushare 源但实现用同花顺
   F-6 [P2] qfq 前复权以查询日为基准 → 历史价随分红再查询而变，回测不可精确复现（验收用 hfq/none 对照）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import csv
 import json
@@ -131,8 +142,8 @@ class DataAuditor:
             if d:
                 p = Path(str(d))
                 return p if p.is_absolute() else BASE / p
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "risk/data_audit.py:134 _resolve_cache_dir")
         return BASE / "data" / "cache"
 
     def _conn(self, db: Path):

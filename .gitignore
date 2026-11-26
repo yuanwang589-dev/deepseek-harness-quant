@@ -19,7 +19,7 @@ harness/home/.credentials.yaml
 
 # ---- 数据（Tushare 协议：不得再分发；请自行获取） ----
 data/cache/
-data/factorpool/
+data/factorpool/output/
 data/trash/
 *.db
 *.sqlite
@@ -29,16 +29,27 @@ data/trash/
 # ---- 运行产物 ----
 logs/
 output/
-report/
+report/daily_report_*.md
+report/position_risk*.json
+report/data_audit_report_*.json
+report/data_audit_report_*.md
+harness/home/quantapi_*.json
 deck/dashboard_*_20*.html
 deck/*.json
 
-# ---- 系统 / IDE ----
+# ---- 系统 / IDE / 工具会话目录（非项目资产） ----
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
 *.log
+.arts/
+.pi/
+.playwright-mcp/
+.security/
+.codeartsdoer/
+.pytest_cache/
+.ruff_cache/
 
 # ---- 打包产物 ----
 build/

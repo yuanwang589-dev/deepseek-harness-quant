@@ -128,6 +128,7 @@
   LW.decide = {
     _done: {},
     _listeners: _listeners,
+    init: init,
     approve: approve,
     toast: toast,
     on: function (fn) { var k = Date.now() + '' + Math.random(); _listeners[k] = fn; return k; },
@@ -175,4 +176,8 @@
       });
     }
   };
+
+  // ★2026-11-10 修复：页面加载即预填审批状态（原 init 只在 approve 内调用 →
+  //   刷新后已买入/已放弃卡片仍显示按钮，且防重失效可重复提交）
+  if (window.LW && window.LW.api) init();
 })();

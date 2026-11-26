@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """data/verify_day_pipeline.py — 日数据管道落地验证（总指导 2026-08-11）
 
 ★用途：17:30 TushareInc + 17:35 FactorDaily + 18:30 全链跑完后，一键验证当日数据落地质量。
@@ -25,9 +24,16 @@ EXT_DAILY = Path(r"data/factorpool/output/daily_scores")
 F5 = ("turn_mid_prox", "sentiment", "turnover", "reversal20", "lowvol")
 
 
-def _latest(pattern: str, subdir: str = "logs") -> Path:
+def _latest(pattern: str, subdir: str = "logs") -> "Path | None":
     fs = sorted(glob.glob(str(BASE / subdir / pattern)), key=os.path.getmtime)
     return Path(fs[-1]) if fs else None
+
+
+def _ext_pool_missing() -> bool:
+    """外包因子池 daily_scores 是否缺失（★2026-10-16）。
+    该目录属外部量化代码库产物，本项目内整目录丢失；相关检查项（2/3/5/7/9）为
+    「外部依赖缺失」而非本地故障 → 只提示不计 fails，避免每天 4 项噪音掩盖真异常。"""
+    return not glob.glob(str(EXT_DAILY / "daily_*.csv"))
 
 
 def main() -> int:
@@ -42,20 +48,26 @@ def main() -> int:
         if not d or d == "2026-08-10":
             print("   ⚠️ 仍是 08-10（08-11 数据未入库？）", flush=True)
     except Exception as e:
-        print(f"1) 探测失败: {str(e)[:60]}", flush=True); fails += 1
+        print(f"1) 探测失败: {str(e)[:60]}", flush=True)
+        fails += 1
 
-    # 2) 外包 daily CSV + 五强完整率
-    try:
-        import pandas as pd
-        fs = sorted(glob.glob(str(EXT_DAILY / "daily_*.csv")), key=os.path.getmtime)
-        f = Path(fs[-1])
-        df = pd.read_csv(f, nrows=3000)
-        ok = sum(1 for ft in F5 if f"{ft}_rank" in df.columns and df[f"{ft}_rank"].notna().mean() >= 0.5)
-        print(f"2) 最新 daily: {f.name} | 五强列可用 {ok}/5", flush=True)
-        if ok < 4:
-            print("   ⚠️ 五强 rank 缺失（需检查 scheduler 产出）", flush=True); fails += 1
-    except Exception as e:
-        print(f"2) daily 读取失败: {str(e)[:60]}", flush=True); fails += 1
+    # 2) 外包 daily CSV + 五强完整率（外包缺失 → 外部依赖，跳过不计 fails）
+    if _ext_pool_missing():
+        print("2) 外包因子池 daily_scores 缺失 → 跳过（外部依赖未恢复，非本地故障）", flush=True)
+    else:
+        try:
+            import pandas as pd
+            fs = sorted(glob.glob(str(EXT_DAILY / "daily_*.csv")), key=os.path.getmtime)
+            f = Path(fs[-1])
+            df = pd.read_csv(f, nrows=3000)
+            ok = sum(1 for ft in F5 if f"{ft}_rank" in df.columns and df[f"{ft}_rank"].notna().mean() >= 0.5)
+            print(f"2) 最新 daily: {f.name} | 五强列可用 {ok}/5", flush=True)
+            if ok < 4:
+                print("   ⚠️ 五强 rank 缺失（需检查 scheduler 产出）", flush=True)
+                fails += 1
+        except Exception as e:
+            print(f"2) daily 读取失败: {str(e)[:60]}", flush=True)
+            fails += 1
 
     # 3) ext_signal 命中
     try:
@@ -66,31 +78,40 @@ def main() -> int:
             date = next(iter(sig.values()))["date"]
             print(f"   数据日期: {date}", flush=True)
     except Exception as e:
-        print(f"3) ext_signal 失败: {str(e)[:60]}", flush=True); fails += 1
+        print(f"3) ext_signal 失败: {str(e)[:60]}", flush=True)
+        fails += 1
 
     # 4) opp_pool
     try:
         p = _latest("opp_pool_*.json")
+        if p is None:
+            raise FileNotFoundError("无 opp_pool_*.json")
         d = json.loads(p.read_text(encoding="utf-8"))
         print(f"4) opp_pool: {p.name} | date={d.get('date')} n={d.get('n')}", flush=True)
     except Exception as e:
-        print(f"4) opp_pool 失败: {str(e)[:60]}", flush=True); fails += 1
+        print(f"4) opp_pool 失败: {str(e)[:60]}", flush=True)
+        fails += 1
 
-    # 5) market crowding
-    try:
-        import csv as _csv
-        fs = sorted(glob.glob(str(EXT_DAILY / "market_*.csv")), key=os.path.getmtime)
-        with open(fs[-1], encoding="utf-8") as fh:
-            rd = _csv.DictReader(fh)
-            row = next(rd)
-        filled = sum(1 for ft in F5 if row.get(f"crowding_{ft}", "").strip())
-        print(f"5) market crowding: {os.path.basename(fs[-1])} 填充 {filled}/5", flush=True)
-    except Exception as e:
-        print(f"5) crowding 失败: {str(e)[:60]}", flush=True)
+    # 5) market crowding（★同 2)：外包缺失 → 跳过）
+    if _ext_pool_missing():
+        print("5) market crowding: 外包因子池缺失 → 跳过（外部依赖）", flush=True)
+    else:
+        try:
+            import csv as _csv
+            fs = sorted(glob.glob(str(EXT_DAILY / "market_*.csv")), key=os.path.getmtime)
+            with open(fs[-1], encoding="utf-8") as fh:
+                rd = _csv.DictReader(fh)
+                row = next(rd)
+            filled = sum(1 for ft in F5 if row.get(f"crowding_{ft}", "").strip())
+            print(f"5) market crowding: {os.path.basename(fs[-1])} 填充 {filled}/5", flush=True)
+        except Exception as e:
+            print(f"5) crowding 失败: {str(e)[:60]}", flush=True)
 
     # 6) Pitch v2（含大小盘分档 + 强因子直通 + 双线子分类）
     try:
         p = _latest("pitch_v2_*.json")
+        if p is None:
+            raise FileNotFoundError("无 pitch_v2_*.json")
         d = json.loads(p.read_text(encoding="utf-8"))
         names = [x.get("name") for x in d.get("pitch", [])][:5]
         from collections import Counter as _C
@@ -111,9 +132,14 @@ def main() -> int:
         n_nom = fr.get("n_strong_nominal", 0)
         print(f"7) 强因子: 独立 {n_ind} / 名义 {n_nom}（家族去重，共线性修正）", flush=True)
         if n_ind == 0:
-            print("   ⚠️ 无强因子（factor_risk 未跑？dev_auto 8.57）", flush=True); fails += 1
+            if _ext_pool_missing():
+                print("   ⏸️ 无强因子：外包因子池缺失所致（外部依赖，不计故障）", flush=True)
+            else:
+                print("   ⚠️ 无强因子（factor_risk 未跑？dev_auto 8.57）", flush=True)
+                fails += 1
     except Exception as e:
-        print(f"7) 强因子失败: {str(e)[:60]}", flush=True); fails += 1
+        print(f"7) 强因子失败: {str(e)[:60]}", flush=True)
+        fails += 1
 
     # 8) ★短线因子模块（F5：event 加分 + 排雷 + 连板回避）
     try:
@@ -149,7 +175,7 @@ def main() -> int:
         _r = _sp.run([sys.executable, str(BASE / "data" / "check_consistency.py")],
                      capture_output=True, text=True, timeout=120)
         _ok = _r.returncode == 0
-        _line = [l for l in (_r.stdout or "").splitlines() if "结果:" in l]
+        _line = [ln for ln in (_r.stdout or "").splitlines() if "结果:" in ln]
         print(f"10) 数据一致性: {'✅' if _ok else '⚠️'} {_line[0] if _line else '（见 check_consistency 输出）'}", flush=True)
         if not _ok:
             fails += 1
@@ -159,7 +185,8 @@ def main() -> int:
     # 11) ★2026-08-12 百轮#99：实盘裁决体系（类型降权 + 归因数据可消费——#89-94 数据链）
     try:
         sys.path.insert(0, str(BASE / "deck"))
-        from live_api import live_validation
+        # deck/ 由 sys.path 动态注入 → 静态分析无法解析
+        from live_api import live_validation  # type: ignore
         _vv = live_validation()
         _dg = _vv.get("diagnosis") or {}
         _dw = _dg.get("down_warn") or []
@@ -175,7 +202,7 @@ def main() -> int:
     # 12) ★2026-08-12 百轮#99：决策链 13 环节（含实盘裁决——#97 数据链）
     #   ★#391 与 check_consistency 对齐：supplier-lag（note 含"内容滞后/供应商"）不算故障，只算 hard failure
     try:
-        from live_api import live_chain
+        from live_api import live_chain  # type: ignore  # deck/ 由 sys.path 动态注入
         _ch = live_chain()
         _chain = _ch.get("chain") or []
         _names = [n.get("name") for n in _chain]

@@ -4,6 +4,17 @@
 检查 8787 端口是否有 Deck 在监听且响应正常；异常则重启。
 被 dev_auto 每轮调用（保证桌面门户永不失效）。
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import socket
 
 # ★2026-08-13 黑框隐藏（总指挥要求：计划任务/常驻进程不弹黑框，运行完自动关闭不留窗）
@@ -12,8 +23,8 @@ try:
     _h = ctypes.windll.kernel32.GetConsoleWindow()
     if _h:
         ctypes.windll.user32.ShowWindow(_h, 0)
-except Exception:
-    pass
+except Exception as _dsh_exc:
+    _dsh_swallow(_dsh_exc, "deck/ensure_deck.py:15 <module>")
 
 import subprocess
 import sys
@@ -54,14 +65,14 @@ def ensure() -> bool:
                 if _src.exists():
                     _dst.write_bytes(_src.read_bytes())
             _log.write_text(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 日志轮转（>1MB）\n", encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/ensure_deck.py:57 ensure")
     def _trace(msg):
         try:
             with open(_log, "a", encoding="utf-8") as f:
                 f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/ensure_deck.py:63 _trace")
     _port = _port_listening()
     _http = _http_ok()
     if _port and _http:
@@ -92,8 +103,8 @@ def ensure() -> bool:
                 if _pid.isdigit():
                     sp.run(["taskkill", "/PID", _pid, "/F"], capture_output=True)
         time.sleep(2)
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/ensure_deck.py:95 ensure")
     # 启动（★2026-08-10 加独立日志：不再 DEVNULL，崩溃原因可查）
     try:
         log_f = open(BASE / "logs" / "deck_ensure.log", "a", encoding="utf-8")

@@ -1,0 +1,6 @@
+{
+  "ignore": [
+    "**/deck/live_api.py",
+    "**/data/check_consistency.py"
+  ]
+}

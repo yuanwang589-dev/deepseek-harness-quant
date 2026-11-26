@@ -15,6 +15,17 @@
   python data/factor_archive_chain.py            # 全链
   python data/factor_archive_chain.py --skip-gen # 跳过因子档案（C 包产物单独刷）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 
 # ★2026-08-13 黑框隐藏（总指挥要求：计划任务/常驻进程不弹黑框，运行完自动关闭不留窗）
@@ -23,8 +34,8 @@ try:
     _h = ctypes.windll.kernel32.GetConsoleWindow()
     if _h:
         ctypes.windll.user32.ShowWindow(_h, 0)
-except Exception:
-    pass
+except Exception as _dsh_exc:
+    _dsh_swallow(_dsh_exc, "data/factor_archive_chain.py:26 <module>")
 
 import os
 import subprocess
@@ -52,8 +63,8 @@ def log(msg: str):
     try:
         with open(LOG, "a", encoding="utf-8") as f:
             f.write(line + "\n")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "data/factor_archive_chain.py:55 log")
 
 
 def run():

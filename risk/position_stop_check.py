@@ -77,7 +77,8 @@ def _lookup_otype(code: str) -> dict:
                 items = d
             for it in items:
                 if it.get("code") == code:
-                    return {"otype": it.get("otype"), "score": it.get("score"),
+                    return {"otype": it.get("otype") or (it.get("pitch_meta") or {}).get("otype"),
+                            "score": it.get("score") if it.get("score") is not None else (it.get("pitch_meta") or {}).get("score"),
                             "src": p.name}
     return {}
 
@@ -129,8 +130,13 @@ def check_position(pos: dict, ref_date: str) -> dict:
                         "detail": f"持仓 {code} 无 otype 且 deck_decisions/pitch_v2 反查失败——"
                                   "建议审批时写入 stop_plan（portfolio 配合项）",
                         "action": "人工复核"})
-        # 兜底：15% 回撤保护线
-        plan = {"max_drawdown_pct": 0.15, "time_stop_weeks": 8}
+        # 兜底：config/params.yaml(risk) 默认保护线
+        try:
+            from risk.risk_config import risk_defaults
+            plan = {k: v for k, v in risk_defaults().items()
+                    if k in ("max_drawdown_pct", "time_stop_weeks", "stop_loss_pct", "trailing_ma")}
+        except Exception:
+            plan = {}
 
     if cur_price is None or not np.isfinite(cur_price) or cur_price <= 0:
         signals.append({"rule": "数据缺失", "level": "WARN",
@@ -180,6 +186,21 @@ def check_position(pos: dict, ref_date: str) -> dict:
                 signals.append({"rule": "移动止损", "level": "SELL", "priority": 4,
                                 "detail": f"收盘 {cur_price:.2f} < MA{tma} {ma:.2f}（入场后）",
                                 "action": "卖出"})
+    # ④.5 高点回撤（配置 high_drawdown_exit：入场后阶段高点回落 ≥ X%）
+    #   ★2026-11-20 与 ⑤ max_drawdown_pct（入场价回撤）口径不同，分别判定
+    hde = plan.get("high_drawdown_exit")
+    if hde:
+        try:
+            _post0 = bars[bars["date"] >= pd.Timestamp(pos.get("entry_date") or ref_date)]
+        except Exception:
+            _post0 = bars
+        if len(_post0):
+            peak = float(_post0["close"].max())
+            if peak > 0 and cur_price / peak - 1 <= -hde:
+                signals.append({"rule": "高点回撤", "level": "SELL", "priority": 5,
+                                "detail": f"入场后高点 {peak:.2f}，现价 {cur_price:.2f}，"
+                                          f"回落 {(cur_price / peak - 1) * 100:.1f}% ≥ {hde:.0%}",
+                                "action": "卖出"})
     # ⑤ 最大回撤保护线
     mdd = plan.get("max_drawdown_pct")
     if mdd and drawdown is not None and drawdown <= -mdd:
@@ -204,7 +225,7 @@ def check_position(pos: dict, ref_date: str) -> dict:
             "cur_price": cur_price, "entry_price": entry_price,
             "hold_days": hold_days, "drawdown": round(drawdown, 4) if drawdown is not None else None,
             "plan": {k: plan.get(k) for k in ("stop_loss_pct", "time_stop_weeks", "trailing_ma",
-                                               "max_drawdown_pct", "atr_stop_mult")},
+                                               "max_drawdown_pct", "high_drawdown_exit", "atr_stop_mult")},
             "signals": signals, "ref_date": ref_date}
 
 

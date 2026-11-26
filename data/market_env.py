@@ -5,6 +5,17 @@
   页面链 300s 超时被杀。拆为独立生成器：24h 缓存（glob 最新 <24h 直接复用）+ 时间戳输出。
   消费方：enhance_factor_report（只读不重算）/ 因子监控页。
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import glob
 import json
 import os
@@ -28,8 +39,8 @@ def _latest_cached() -> dict:
     if time.time() - mt < _CACHE_HOURS * 3600:
         try:
             return json.loads(Path(fs[-1]).read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/market_env.py:31 _latest_cached")
     return None
 
 
@@ -52,8 +63,8 @@ def build(force: bool = False) -> dict:
             _mx = DailyCache().latest_trade_date()
             if _mx:
                 d = _mx
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/market_env.py:55 build")
         px, vx = S.load_panel(end=d, days=320)
         basic = S.load_basic()
         fin = S.load_fundamentals(d)

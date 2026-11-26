@@ -9,6 +9,17 @@
 ★诚实说明：数据源为 bars.db 日线（盘后数据，08-10 盘中无当日行情）；
   主服务器恢复后可接实时竞价/分钟流 → 升级为盘中真·实时检测。
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import json
 
 # ★2026-08-13 黑框隐藏（总指挥要求：计划任务/常驻进程不弹黑框，运行完自动关闭不留窗）
@@ -17,8 +28,8 @@ try:
     _h = ctypes.windll.kernel32.GetConsoleWindow()
     if _h:
         ctypes.windll.user32.ShowWindow(_h, 0)
-except Exception:
-    pass
+except Exception as _dsh_exc:
+    _dsh_swallow(_dsh_exc, "factors/opportunities/breakout_monitor.py:20 <module>")
 
 import sqlite3
 import sys
@@ -68,8 +79,8 @@ def _load_alerts() -> dict:
     if files:
         try:
             return json.loads(Path(files[-1]).read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/breakout_monitor.py:71 _load_alerts")
     return {"ts": "", "date": "", "codes": [], "history": []}
 
 
@@ -130,8 +141,8 @@ def run() -> Path:
     try:
         (BASE / "logs" / "breakout_alerts.json").write_text(
             json.dumps(out, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/breakout_monitor.py:133 run")
     return p
 
 

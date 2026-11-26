@@ -14,6 +14,17 @@
   python risk/ext_review.py --top 15      # 只看前 N 强
 输出：output/ext_review_{ts}.md + .json（时间戳写保护免疫）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import csv
 import glob
@@ -57,8 +68,8 @@ def load_health() -> dict:
                 f = row.get("factor") or row.get("name") or ""
                 if f:
                     out[f] = row
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "risk/ext_review.py:60 load_health")
     return out
 
 

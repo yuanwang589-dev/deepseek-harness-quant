@@ -27,6 +27,17 @@
   python risk/stock_risk.py --scan                 # 全市场批量 → risk/stock_risk_map.json
   python risk/stock_risk.py --status
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import json
 import sqlite3
@@ -171,8 +182,8 @@ def scan_all(limit: int = None) -> dict:
         br_full = _json.loads((BASE / "logs" / "beneish_report_full.json").read_text(encoding="utf-8"))
         m_map = {x["code"]: x.get("level") for x in br_full.get("results", [])
                  if x.get("m_score") is not None}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "risk/stock_risk.py:174 scan_all")
     if not m_map:
         try:
             from risk.beneish import compute_map
@@ -208,12 +219,12 @@ def scan_all(limit: int = None) -> dict:
     if not _unchanged:
         try:
             OUT_TS.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "risk/stock_risk.py:211 scan_all")
     try:
         OUT.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "risk/stock_risk.py:215 scan_all")
     return out
 
 

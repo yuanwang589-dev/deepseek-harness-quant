@@ -32,12 +32,13 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from backtest.bt_cost import one_way_cost, round_trip_cost
 from data.cache import DailyCache
-from factors.factor_engine import compute_factor_panel, FACTOR_FUNCS
+from factors.factor_engine import FACTOR_FUNCS, compute_factor_panel
 from risk.risk_agent import RiskAgent
 from risk.stop_rules import StopRules
-from strategy.stock_state import classify_series
 from strategy.breakout_confirm import breakout_filter
+from strategy.stock_state import classify_series
 
 CFG = yaml.safe_load((BASE / "config" / "params.yaml").read_text(encoding="utf-8"))
 MV_MAP_CSV = r"data\cache\circ_mv_map.csv"
@@ -45,7 +46,7 @@ MV_MAP_CSV = r"data\cache\circ_mv_map.csv"
 # 分类策略参数（params.yaml stock_state/layers 可覆盖）
 HARD_STOP = CFG.get("risk", {}).get("stop_loss_pct", 0.07)
 HIGH_DD = CFG.get("risk", {}).get("high_drawdown_exit", 0.08)
-COST = 0.00026 + 0.0005 + 0.001
+COST = round_trip_cost()   # ★2026-11-26：统一成本口径，印花税仅卖出侧（原双边多扣一次）
 
 
 class BtEngine:
@@ -60,13 +61,15 @@ class BtEngine:
         self.risk_agent = RiskAgent(CFG.get("risk", {}))
         self.stop_rules = StopRules(CFG.get("risk", {}))
 
-    def load_panel(self, codes, min_len=1200):
-        """加载价格面板（2020 前上市 + 数据完整）→ closes DataFrame
+    def load_panel(self, codes, min_len=250):
+        """加载价格面板（★2026-11-11 修复幸存者偏差：并集日历 + 最短 250 日）→ closes DataFrame
         ★2026-08-10 性能优化：get_daily_batch 一次 SQL 全拉（逐只 5.5min → 目标 <1min）"""
         panel = {}
         batch = {}
+        # ★2026-11-26：warmup 加载（start 前 400 天），保证短回测区间也有足够历史算 120 日因子
+        load_start = (pd.Timestamp(str(self.start)) - pd.Timedelta(days=400)).strftime("%Y-%m-%d")
         try:
-            batch = self.cache.get_daily_batch(codes, start=self.start, end=self.end, adjust="qfq")
+            batch = self.cache.get_daily_batch(codes, start=load_start, end=self.end, adjust="qfq")
             for code, df in batch.items():
                 if len(df) < min_len:
                     continue
@@ -75,23 +78,28 @@ class BtEngine:
             batch = {}
         if not batch:  # 批量失败（极端）→ 回退逐只
             for code in codes:
-                df = self.cache.get_daily(code, start=self.start, end=self.end, adjust="qfq")
+                df = self.cache.get_daily(code, start=load_start, end=self.end, adjust="qfq")
                 if df is None or len(df) < min_len:
                     continue
                 panel[code] = df.set_index("date").sort_index()["close"]
         if not panel:
             return None
-        common = sorted(set.intersection(*[set(s.index) for s in panel.values()]))
-        closes = pd.DataFrame({c: panel[c] for c in panel}, index=common).ffill()
+        # ★2026-11-11 修复：原 `set.intersection` 会删掉任一股票缺数据的交易日（停牌/退市/晚上市）
+        #   → 只保留"全程存活且几乎不停牌"样本（典型幸存者偏差）。改为并集日历 + 逐股 reindex。
+        all_dates = sorted(set().union(*[set(s.index) for s in panel.values()]))
+        closes = pd.DataFrame({c: panel[c].reindex(all_dates) for c in panel},
+                              index=all_dates).ffill()
         return closes
 
-    def load_panel_full(self, codes, min_len=1200):
+    def load_panel_full(self, codes, min_len=250):
         """加载完整面板（含 volume/turn，供分类策略与突破确认用）
         ★2026-08-10 性能优化：批量读取同 load_panel"""
         panel = {}
         batch = {}
+        # ★2026-11-26：warmup 加载（start 前 400 天），与 load_panel 同口径
+        load_start = (pd.Timestamp(str(self.start)) - pd.Timedelta(days=400)).strftime("%Y-%m-%d")
         try:
-            batch = self.cache.get_daily_batch(codes, start=self.start, end=self.end, adjust="qfq")
+            batch = self.cache.get_daily_batch(codes, start=load_start, end=self.end, adjust="qfq")
             for code, df in batch.items():
                 if len(df) < min_len:
                     continue
@@ -100,7 +108,7 @@ class BtEngine:
             batch = {}
         if not batch:
             for code in codes:
-                df = self.cache.get_daily(code, start=self.start, end=self.end, adjust="qfq")
+                df = self.cache.get_daily(code, start=load_start, end=self.end, adjust="qfq")
                 if df is None or len(df) < min_len:
                     continue
                 panel[code] = df.set_index("date").sort_index()
@@ -115,6 +123,16 @@ class BtEngine:
             return dict(zip(m["code6"], m["mv_yi"]))
         except Exception:
             return None
+
+    @staticmethod
+    def _segment_return(closes: pd.DataFrame, picks, pos: int, nxt_pos: int) -> pd.Series:
+        """★2026-11-26：持仓区间日收益，含 T+1 首日。
+
+        原 `closes.iloc[pos+1:nxt_pos+1].pct_change().fillna(0)` 把首日置 0，
+        相当于丢掉信号次日收益。改为从 pos 起算 pct_change 再取 [1:]，
+        首日 = close[pos+1]/close[pos] - 1，不再被 fillna 吞掉。
+        """
+        return closes[picks].iloc[pos:nxt_pos + 1].pct_change().iloc[1:].fillna(0)
 
     def backtest_direction(self, closes: pd.DataFrame, direction: dict,
                            cost: float = COST) -> dict:
@@ -164,11 +182,11 @@ class BtEngine:
             # 次月区间收益（T+1：从下个交易日开始）
             nxt = month_ends[i + 1] if i + 1 < len(month_ends) else self.end
             nxt_pos = closes.index.get_loc(nxt) if nxt in closes.index else len(closes) - 1
-            seg = closes.iloc[pos + 1: nxt_pos + 1].pct_change().fillna(0)
+            seg = self._segment_return(closes, picks, pos, nxt_pos)
             if len(seg) == 0:
                 continue
-            ret.loc[seg.index] = seg[picks].mean(axis=1)
-            turnover_cost_total += cost * 2  # 每月全换仓（买+卖）
+            ret.loc[seg.index] = seg.mean(axis=1)
+            turnover_cost_total += cost   # 每月全换仓（买+卖），印花税单边已含在 cost 内
 
         # 扣除成本（按调仓次数分摊到日）
         n_days = len(ret)
@@ -211,19 +229,28 @@ class BtEngine:
         left_hold, right_hold, neutral_hold = {}, {}, {}
         w_left, w_right, w_neutral = 0.0, 0.0, 0.0
         cost_total, daily = 0.0, []
+        prev_codes = set()   # ★2026-11-26：上一期持仓，用于按换入/换出分别计费（印花税仅卖出）
 
         for di in range(1, n):
             day, prev = dates[di], dates[di - 1]
+            # ★2026-11-10 修复：原 `np.mean(三池混合)` 后再乘 (w_left+w_right+w_neutral)
+            #   而三者归一化后恒为 1 → 池权重/Regime 完全不进入收益。改为分池加权。
             day_ret = 0.0
-            rets = []
-            for hold in (left_hold, right_hold, neutral_hold):
-                for code in hold:
+            for _w, _hold in ((w_left, left_hold), (w_right, right_hold), (w_neutral, neutral_hold)):
+                if not _hold or _w <= 0:
+                    continue
+                _rr = []
+                for code in _hold:
                     d = panel[code]
                     if prev in d.index and day in d.index:
-                        rets.append(d.loc[day, "close"] / d.loc[prev, "close"] - 1)
-            if rets:
-                day_ret = np.mean(rets)
-            daily.append((w_left + w_right + w_neutral) * day_ret)
+                        _c1 = d.loc[day, "close"]
+                        _c0 = d.loc[prev, "close"]
+                        # ★2026-11-11：停牌/未上市日 NaN 不参与收益（原会得到 NaN 污染均值）
+                        if pd.notna(_c1) and pd.notna(_c0) and _c0 > 0:
+                            _rr.append(_c1 / _c0 - 1)
+                if _rr:
+                    day_ret += _w * float(np.mean(_rr))
+            daily.append(day_ret)
 
             # right 池欧奈尔止损（T 日信号当日结算）
             if right_hold:
@@ -240,16 +267,19 @@ class BtEngine:
                     if cur / bp - 1 <= -HARD_STOP or cur / hi2 - 1 <= -HIGH_DD:
                         to_sell.append(code)
                 if to_sell:
-                    sell_w = len(to_sell) / self.topn * w_right
+                    sell_w = len(to_sell) / max(len(right_hold), 1) * w_right
                     w_right -= sell_w
-                    cost_total += COST * sell_w
+                    cost_total += one_way_cost("sell") * sell_w
                     for code in to_sell:
                         del right_hold[code]
+                        prev_codes.discard(code)
 
             # 调仓日（季度）：分类选股
             if day in month_ends and di > 252:
                 pos = closes.index.get_loc(day)
-                st_day = {code: st.iloc[pos] for code, st in states_all.items() if pos < len(st)}
+                # ★2026-11-10 修复：原 `st.iloc[pos]` 用并集位置索引单股序列（长度不同）→ 取到未来状态。
+                #   改为按日期对齐。
+                st_day = {code: st.loc[day] for code, st in states_all.items() if day in st.index}
                 left_codes = [c for c, s in st_day.items() if s == "left"]
                 right_codes = [c for c, s in st_day.items() if s == "right"]
                 neutral_codes = [c for c, s in st_day.items() if s == "neutral"]
@@ -265,7 +295,7 @@ class BtEngine:
                 # 突破确认：right 池仅保留放量且非拥挤（CS-25/26）
                 if use_breakout and right_codes:
                     right_codes = [c for c in right_codes
-                                   if c in brk_all and pos < len(brk_all[c]) and brk_all[c].iloc[pos]]
+                                   if c in brk_all and day in brk_all[c].index and brk_all[c].loc[day]]
 
                 pools = [("left", left_codes), ("right", right_codes), ("neutral", neutral_codes)]
                 sizes = {k: max(len(v), 1) for k, v in pools}
@@ -291,10 +321,17 @@ class BtEngine:
                 left_hold = _pick(def_score.iloc[pos], left_codes, w_left, 6)
                 right_hold = _pick(atk_score.iloc[pos], right_codes, w_right, 4)
                 neutral_hold = _pick(neutral_score.iloc[pos], neutral_codes, w_neutral, 4)
-                cost_total += COST * (len(left_hold) + len(right_hold) + len(neutral_hold))
+                # ★2026-11-26：按实际换入/换出计费，买/卖成本分开（印花税仅卖出侧）
+                new_codes = set(left_hold) | set(right_hold) | set(neutral_hold)
+                buy_n = len(new_codes - prev_codes)
+                sell_n = len(prev_codes - new_codes)
+                cost_total += (one_way_cost("buy") * buy_n + one_way_cost("sell") * sell_n)
+                prev_codes = new_codes
 
         ret = pd.Series(daily, index=dates[1:])
-        ret_net = ret - cost_total / max(n - 1, 1)
+        # ★2026-11-26：warmup 期不计入收益（与 backtest_direction 的 start 过滤对齐）
+        ret = ret.loc[ret.index.astype(str) >= str(self.start)[:10]]
+        ret_net = ret - cost_total / max(len(ret), 1)
         return self._metrics(ret_net, cost_total, len(month_ends))
 
     @staticmethod
@@ -369,14 +406,11 @@ def main():
                     help="回测模式：comparison 对比 / classified 分类策略 / direction 方向化")
     args = ap.parse_args()
 
-    import sqlite3
-    con = sqlite3.connect(str(CFG["data"]["cache_dir"] + "/bars.db"))
-    codes = [r[0] for r in con.execute(
-        "SELECT DISTINCT code FROM daily_bar WHERE code NOT LIKE 'sh.%' AND code NOT LIKE 'sz.%'")]
-    con.close()
-    print(f"缓存股票: {len(codes)} 只")
-
+    # ★2026-11-26：改用 DailyCache.list_codes（合并主库+增量库），
+    #   原"相对路径直连 bars.db"既绕双库又依赖 cwd。
     eng = BtEngine(topn=args.topn, start=args.start, end=args.end)
+    codes = eng.cache.list_codes("qfq")
+    print(f"缓存股票: {len(codes)} 只")
 
     if args.mode == "direction":
         closes = eng.load_panel(codes[:args.limit])

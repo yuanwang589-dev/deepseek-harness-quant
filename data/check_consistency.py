@@ -8,10 +8,12 @@
   ⑤ 决策链环节数 + 异常环节
 用法：python data/check_consistency.py   （退出码 0=全部一致 / 1=有不一致）
 """
-import sys
+import contextlib
 import glob
-import os
 import json
+import os
+import sys
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -32,8 +34,12 @@ def _latest(pat: str, sub: str = "logs") -> dict:
 
 
 def _api(path: str) -> dict:
+    url = HOST + path
+    # 限制 scheme（S310）：显式 allowlist，避免 file: 等意外协议
+    if urllib.parse.urlparse(url).scheme not in ("http", "https"):
+        return {}
     try:
-        r = urllib.request.urlopen(HOST + path, timeout=15)
+        r = urllib.request.urlopen(url, timeout=15)  # noqa: S310 （scheme 已在上方 allowlist 校验）
         return json.loads(r.read())
     except Exception:
         return {}
@@ -41,12 +47,19 @@ def _api(path: str) -> dict:
 
 def check() -> int:
     fails = 0
+    _dg: dict = {}   # ★实盘裁决数据：第 14 项 try 失败时保持空，避免第 16 项 NameError（真缺陷）
 
     def _row(name, ok, detail=""):
         nonlocal fails
         if not ok:
             fails += 1
         print(f"  {'✅' if ok else '⚠️'} {name} {detail}")
+
+    # ★2026-10-16 外包因子池缺失探测：daily_scores / risk_multiplier 均无产出时，
+    #   依赖它们的检查项（强因子直通 / FRC 系数）属「外部依赖缺失」而非故障，
+    #   与 verify_day_pipeline 的同名处理一致（避免假红淹没真故障）。
+    _ext_missing = (not glob.glob("data/factorpool/output/daily_scores/daily_*.csv")
+                    and not glob.glob("data/factorpool/risk/risk_multiplier_*.json"))
 
     print("=== 数据一致性交叉校验 ===")
     # 1) Pitch 数：opp_pool 未过滤（含持有期不足）vs pitch_v2 已过滤（Pitch 页展示源）
@@ -117,8 +130,9 @@ def check() -> int:
         n_sh_pool = sum(1 for o in lo.get("opportunities", []) if o.get("strong_hit"))
     except Exception:
         n_sh, n_sh_pool = -1, -1
-    _row("强因子直通", n_sh > 0 and n_sh_pool <= n_sh,
-         f"跨家族 {n_sh} 只 ≥ 机会池内标注 {n_sh_pool}")
+    _row("强因子直通", _ext_missing or (n_sh > 0 and n_sh_pool <= n_sh),
+         f"跨家族 {n_sh} 只 ≥ 机会池内标注 {n_sh_pool}"
+         + ("（外包因子池缺失，外部依赖）" if _ext_missing else ""))
     # 9) ★择时系统 v4（百轮#66/#91/#105）：文件可读 + 四维齐全（政策=四因子评分，宏观=regime+社融/利率修正）
     _tm = _latest("timing_system_*.json", "output")
     _dims = _tm.get("dims", {})
@@ -133,15 +147,15 @@ def check() -> int:
         _rm_n = 0
         _rm_best = None
         for _p in _rmfs:
-            try:
+            with contextlib.suppress(Exception):
                 _n = len(json.loads(Path(_p).read_text(encoding="utf-8")).get("factors", {}))
                 if _n > _rm_n:
                     _rm_n, _rm_best = _n, _p
-            except Exception:
-                continue
     except Exception:
         _rm_n, _rm_best = 0, None
-    _row("FRC 系数", _rm_n > 30, f"{_rm_n} 因子" + (f"（{Path(_rm_best).name if _rm_best else '缺失'}）"))
+    _row("FRC 系数", _ext_missing or _rm_n > 30,
+         f"{_rm_n} 因子" + (f"（{Path(_rm_best).name if _rm_best else '缺失'}）")
+         + ("（外包因子池缺失，外部依赖）" if _ext_missing else ""))
     # 11) ★日历层（百轮#65）：get_window 可调用（当前窗口零副作用）
     try:
         from data.calendar_hook import get_window
@@ -201,33 +215,27 @@ def check() -> int:
         from pathlib import Path as _P17
         _B17 = r"data/cache/bars.db"
         _conns17 = [_s17.connect(f"file:{_B17}?mode=ro&immutable=1", uri=True, timeout=3)]
-        try:
+        with contextlib.suppress(Exception):
             for _p17 in sorted(_P17(_B17).parent.glob("bars_incr_*.db"))[-3:]:
-                try:
+                with contextlib.suppress(Exception):
                     _conns17.append(_s17.connect(f"file:{_p17}?mode=ro&immutable=1", uri=True, timeout=3))
-                except Exception:
-                    pass
-        except Exception:
-            pass
         _mx17, _n17 = None, 0
         for _c17 in _conns17:
-            try:
-                _m = _c17.execute("SELECT MAX(date) FROM daily_bar").fetchone()[0]
+            with contextlib.suppress(Exception):
+                # ★2026-10-16 只认股票行（qfq，排除 SH./SZ. 指数）：MAX(date) 无过滤会取到
+                #   fetch_index_daily 写入的 SH.000300 指数行（adjust='none'，无 is_st）
+                #   → is_st=1 恒 0 → 每天假报「丢列异常」。与 cache.latest_trade_date 口径一致。
+                _m = _c17.execute(
+                    "SELECT MAX(date) FROM daily_bar WHERE adjust='qfq' "
+                    "AND code NOT LIKE 'sh.%' AND code NOT LIKE 'sz.%'").fetchone()[0]
                 if _m and (_mx17 is None or _m > _mx17):
                     _mx17 = _m
-            except Exception:
-                pass
         for _c17 in _conns17:
-            try:
+            with contextlib.suppress(Exception):
                 _n = _c17.execute("SELECT COUNT(*) FROM daily_bar WHERE date=? AND is_st=1", (_mx17,)).fetchone()[0]
                 _n17 = max(_n17, _n)   # 任一台库该日正常即算正常（主库+增量库并存）
-            except Exception:
-                pass
-            finally:
-                try:
-                    _c17.close()
-                except Exception:
-                    pass
+            with contextlib.suppress(Exception):
+                _c17.close()
         _row("is_st 覆盖率", _n17 >= 50,
              f"最新日 {_mx17} is_st=1 {_n17} 只（正常 ~200；<50 = 丢列异常，load_st_codes 自动回溯）")
     except Exception as e:
@@ -244,7 +252,7 @@ def check() -> int:
         if _dsfs:
             _cols = ["kline_5m_std_rank", "intraday_range_rank", "open_vol_share_rank"]
             _df = _pd.read_csv(_dsfs[-1], usecols=lambda c: c in _cols)
-            _nonnull = {c: int(_df[c].notna().sum()) for c in _cols if c in _df.columns}
+            _nonnull = {c: sum(1 for _v in _df[c].notna() if _v) for c in _cols if c in _df.columns}
             _empty = [c for c, n in _nonnull.items() if n == 0]
             if _empty:
                 print(f"  ⚠️ 分钟因子 rank 全空（{len(_empty)}/{len(_nonnull)} 列）→ FRC 排雷/EXT 因子失效（外包侧缺口，已留言待修）")
@@ -267,12 +275,10 @@ def check() -> int:
             # 取因子数最多的文件（#250 铁律）
             _best, _bn = None, -1
             for _f in _dsfs:
-                try:
+                with contextlib.suppress(Exception):
                     _nc = sum(1 for c in _pd.read_csv(_f, nrows=0).columns if c.endswith("_rank"))
                     if _nc > _bn:
                         _bn, _best = _nc, _f
-                except Exception:
-                    pass
             if _best:
                 _df = _pd.read_csv(_best)
                 _flat = []
@@ -288,7 +294,7 @@ def check() -> int:
                 if _flat:
                     print(f"  ⚠️ 涨停/龙虎榜因子 rank 无区分度（{', '.join(_flat)}）→ 方向或数据异常需核查")
                 else:
-                    print(f"  ✅ 涨停/龙虎榜因子 rank 方向正常（有高值区分度）")
+                    print("  ✅ 涨停/龙虎榜因子 rank 方向正常（有高值区分度）")
     except Exception as _e:
         print(f"  ⚠️ 涨停因子符号检查异常: {str(_e)[:60]}")
 

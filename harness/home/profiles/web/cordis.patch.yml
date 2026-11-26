@@ -1,6 +1,8 @@
 # DSHQuant × DeepSeek HARNESS 宿主组合补丁层
 # 通过 insert 追加量化桥接插件（loader patch 语义：insert 到根 entry list）
 # 相对路径以本文件所在目录（DSH_HOME/profiles/web/）为基准
+# ★2026-08-25 换用 v16 固化版（/quantapi/* 路由，与控制页前端对齐）；
+#   旧单文件版（dsq-quant-bridge.js，注册 /quant/*）前端不调用，已不再挂载
 - insert:
     - id: dsq-quant-bridge
-      name: ./plugins/dsq-quant-bridge.js
+      name: ./plugins/dsq-quant-bridge/index.js

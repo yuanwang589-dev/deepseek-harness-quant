@@ -22,6 +22,17 @@ API：
   GET  /api/audit       → report/data_audit_report.json 数据健康度
   GET  /api/sim         → logs/sim_tracks.json         模拟盘双轨
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import json
 import re
 
@@ -31,8 +42,8 @@ try:
     _h = ctypes.windll.kernel32.GetConsoleWindow()
     if _h:
         ctypes.windll.user32.ShowWindow(_h, 0)
-except Exception:
-    pass
+except Exception as _dsh_exc:
+    _dsh_swallow(_dsh_exc, "deck/deck_server.py:34 <module>")
 
 import os
 import sys
@@ -62,6 +73,8 @@ def _json_safe(o):
     import math
     if isinstance(o, float):
         return None if (math.isnan(o) or math.isinf(o)) else o
+    if isinstance(o, (datetime, Path)):
+        return str(o)
     if isinstance(o, dict):
         return {k: _json_safe(v) for k, v in o.items()}
     if isinstance(o, list):
@@ -91,6 +104,33 @@ def _latest_decisions() -> Path:
     return fs[-1] if fs else DECISIONS
 
 PORT = 8787
+
+
+def _safe_file(root: Path, rel: str, suffixes=None):
+    """静态文件安全拼接：拒绝绝对路径与 `..` 穿越，返回解析后仍在 root 内的文件。
+
+    ★2026-11-10 安全修复：原 `/dl/`、`/v2/` 直接用 `BASE / rel`，绝对路径会重置锚点、
+    `..` 可逃逸到仓库外（实测 /dl/../deck/deck_server.py 返回源码）。"""
+    import urllib.parse
+    try:
+        rel = urllib.parse.unquote(str(rel)).replace("\\", "/").lstrip("/")
+        root_r = root.resolve()
+        fp = (root_r / rel).resolve()
+        if not fp.is_relative_to(root_r) or not fp.is_file():
+            return None
+        if suffixes and fp.suffix.lower() not in suffixes:
+            return None
+        return fp
+    except Exception:
+        return None
+
+
+def _origin_ok(handler) -> bool:
+    """写操作同源校验（防跨源 CSRF）。无 Origin 的本地脚本/curl 放行——服务只绑定 127.0.0.1。"""
+    origin = handler.headers.get("Origin") or handler.headers.get("Referer") or ""
+    if not origin:
+        return True
+    return origin.startswith(("http://127.0.0.1:", "http://localhost:", "http://[::1]:"))
 
 
 def _latest_pool_path() -> Path:
@@ -146,7 +186,7 @@ ROUTE_GLOB = {
 }
 
 
-def _resolve_route(path: str) -> Path:
+def _resolve_route(path: str):
     """★2026-08-09 v2 逻辑：有 ROUTE_GLOB 的路径**优先 glob 最新**（产出方全部改时间戳文件名，
     固定名可能是旧内容/被锁残留）；无 glob 规则时用 ROUTES 静态路径"""
     f = ROUTES.get(path)
@@ -166,7 +206,7 @@ def _resolve_route(path: str) -> Path:
             return matches[-1]
     # ★2026-08-11 审批链路修复：/api/pool 读最新含 pitch 的 opp_pool_*.json（原固定名 opportunity_pool.json 是 08-08 旧数据）
     if path == "/api/pool":
-        _best = _latest_opp_pool()
+        _best = _latest_pool_path()
         return _best if _best is not None else f
     if f.exists():
         return f
@@ -197,8 +237,8 @@ class Handler(BaseHTTPRequestHandler):
     def _send_json(self, obj, code: int = 200):
         try:
             obj = _json_safe(obj)
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "deck/deck_server.py:229 _send_json")
         self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"))
 
     def _redirect(self, location: str):
@@ -217,6 +257,8 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         if n <= 0:
             return {}
+        if n > 1_048_576:
+            raise ValueError("请求体过大（>1MB）")
         return json.loads(self.rfile.read(n).decode("utf-8"))
 
     def do_GET(self):
@@ -225,7 +267,15 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 sys.path.insert(0, str(BASE))
                 from strategy.portfolio import _load
-                return self._send_json(_load())
+                _pd = _load()
+                # ★2026-11-26：合并最近一次风控同步结果（含被拒候选），供 UI 展示
+                _rs = LOGS / "risk_last_sync.json"
+                if _rs.exists():
+                    try:
+                        _pd["risk_last_sync"] = json.loads(_rs.read_text(encoding="utf-8"))
+                    except Exception as _dsh_exc:
+                        _dsh_swallow(_dsh_exc, "deck/deck_server.py:265 do_GET")
+                return self._send_json(_pd)
             except Exception as e:
                 return self._send_json({"error": str(e)}, 500)
         if path == "/api/pool":          # ★外包 #6：读最新含候选池（与 /api/pitch_v2 同源）
@@ -233,7 +283,15 @@ class Handler(BaseHTTPRequestHandler):
             if not f.exists():
                 return self._send_json({"error": f"机会池不存在: {f.name}", "hint": "先运行 python factors/opportunities/scan.py --pitch"}, 404)
             try:
-                return self._send_json(json.loads(f.read_text(encoding="utf-8")))
+                _pd = json.loads(f.read_text(encoding="utf-8"))
+                # ★2026-11-20 pitch 候选 stop_plan 补类型规则默认值（与 pitch_v2/止损引擎同源）
+                try:
+                    sys.path.insert(0, str(BASE / "deck"))
+                    import live_api
+                    live_api.fill_pitch_stops(_pd.get("pitch") or [])
+                except Exception as _dsh_exc:
+                    _dsh_swallow(_dsh_exc, "deck/deck_server.py:281 do_GET")
+                return self._send_json(_pd)
             except Exception as e:
                 return self._send_json({"error": str(e)}, 500)
         if path == "/":   # ★V8 路由切换（#292）：门户 → ui_v2/pages/portal.html（API 驱动静态页，旧 portal_* 模板退役）
@@ -264,12 +322,39 @@ class Handler(BaseHTTPRequestHandler):
             return self._v2_page("etf.html", "etf missing")
         if path == "/pitchtrack" or path == "/pitchtrack.html":   # ★2026-08-15 主观多池远期（5 池对比 + 牛散决策者分组）
             return self._v2_page("pitchtrack.html", "pitchtrack missing")
-        if path == "/api/harness":   # ★2026-08-15 harness 状态快照（output/harness_state.json，agent 维护）
+        if path == "/api/harness":   # ★2026-08-15 harness 状态快照；★2026-09-09 文件缺失不再 404——实时探活 3080 聚合
             try:
+                import urllib.request as _ur
                 _hs = BASE / "output" / "harness_state.json"
-                if _hs.exists():
+                # agent 自维护快照新鲜（≤60s）→ 直接采用；否则实时探活 HARNESS:3080 聚合降级快照
+                if _hs.exists() and time.time() - _hs.stat().st_mtime < 60:
                     return self._send_json(json.loads(_hs.read_text(encoding="utf-8")))
-                return self._send_json({"harness": {"online": False}, "error": "harness_state.json 未生成"}, 404)
+                _st = {"harness": {"online": False, "name": "DeepSeek HARNESS", "rev": "—"},
+                       "agent": {"framework": "DeepSeek HARNESS", "model": "—", "role": "—", "session_id": None},
+                       "goal": {"active_task": "未连接 3080", "objective_ctx": "", "rounds_total": 0, "phase": "idle"},
+                       "rounds": [], "links": {"docs": []}, "state_mode": "probe"}
+                try:
+                    _r = _ur.urlopen("http://127.0.0.1:3080/quantapi/sessions", timeout=4)
+                    if _r.status == 200:
+                        _ss = (json.loads(_r.read().decode("utf-8")) or {}).get("sessions", [])
+                        _st["harness"]["online"] = True
+                        _st["harness"]["rev"] = str(len(_ss))
+                        _st["agent"]["session_id"] = _ss[0].get("id") if _ss else None
+                        _st["goal"]["active_task"] = (_ss[0].get("title") or _ss[0].get("preview") or "等待触发自主推进") if _ss else "尚无会话"
+                        _st["goal"]["rounds_total"] = len(_ss)
+                        _st["rounds"] = [{"n": i + 1, "title": (s.get("title") or s.get("preview") or "会话")[:30],
+                                          "detail": (s.get("preview") or "")[:60]} for i, s in enumerate(_ss[:5])]
+                        try:
+                            _rr = _ur.urlopen("http://127.0.0.1:3080/quantapi/recent?limit=3", timeout=4)
+                            _rec = json.loads(_rr.read().decode("utf-8"))
+                            if isinstance(_rec, list):
+                                _st["rounds"] = [{"n": i + 1, "title": x.get("role") or "消息",
+                                                  "detail": str(x.get("content") or "")[:60]} for i, x in enumerate(_rec[:5])]
+                        except Exception as _dsh_exc:
+                            _dsh_swallow(_dsh_exc, "deck/deck_server.py:342 do_GET")
+                except Exception as _e:
+                    _st["error"] = f"3080 探活失败: {str(_e)[:60]}"
+                return self._send_json(_st)
             except Exception as e:
                 return self._send_json({"error": str(e)}, 500)
         if path == "/api/build_mode":   # ★2026-08-16 构建模式（dev=开发版徽章 / release=公测发布版无徽章；config/ui_build.json 驱动）
@@ -295,8 +380,8 @@ class Handler(BaseHTTPRequestHandler):
                         for ln in md_path.read_text(encoding="utf-8", errors="replace").splitlines():
                             if ln.startswith("description:"):
                                 return ln.split(":", 1)[1].strip().strip('"').strip("'")[:120]
-                    except Exception:
-                        pass
+                    except Exception as _dsh_exc:
+                        _dsh_swallow(_dsh_exc, "deck/deck_server.py:372 _desc")
                     return ""
 
                 skills = []
@@ -317,15 +402,15 @@ class Handler(BaseHTTPRequestHandler):
                                         if ln.startswith("name:"):
                                             desc = ln.split(":", 1)[1].strip()[:120]
                                             break
-                                except Exception:
-                                    pass
+                                except Exception as _dsh_exc:
+                                    _dsh_swallow(_dsh_exc, "deck/deck_server.py:394 do_GET")
                             presets.append({"name": d.name, "desc": desc})
                 return self._send_json({"ok": True, "skills": skills, "presets": presets})
             except Exception as e:
                 return self._send_json({"ok": False, "error": str(e)}, 500)
         if path.startswith("/api/proxy/"):   # ★2026-08-16 反向代理 GET → :3080 HARNESS（前端同源访问，零跨源）
-            import urllib.request as _ur
             import urllib.error as _ue
+            import urllib.request as _ur
             _tgt = "http://127.0.0.1:3080/" + path[len("/api/proxy/"):]
             if "?" in self.path:
                 _tgt += "?" + self.path.split("?", 1)[1]
@@ -370,8 +455,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not code:
                     return self._send_json({"ok": False, "error": "需要 code 参数"}, 400)
                 sys.path.insert(0, str(BASE))
-                from data.sector_research import (sector_timing, sector_strong_factors,
-                                                  sector_pitch, sector_retail, sector_crowd)
+                from data.sector_research import (
+                    sector_crowd,
+                    sector_pitch,
+                    sector_retail,
+                    sector_strong_factors,
+                    sector_timing,
+                )
                 timing = sector_timing(code)
                 factors = sector_strong_factors(code)
                 pitch = sector_pitch(code, strong_factors=factors)
@@ -500,13 +590,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(collect())
             except Exception as e:
                 return self._send_json({"error": str(e)}, 500)
-        if path == "/api/manual_update":   # ★2026-08-10 手动全域更新（POST；自动程序运行中自动拒绝）
-            try:
-                sys.path.insert(0, str(BASE))
-                from data.manual_update import start
-                return self._send_json(start())
-            except Exception as e:
-                return self._send_json({"error": str(e)}, 500)
+        if path == "/api/manual_update":   # ★2026-08-10 手动全域更新（仅 POST；GET 一律 405，防 CSRF）
+            return self._send_json({"error": "请使用 POST /api/manual_update"}, 405)
         if path == "/api/update_status":   # ★2026-08-10 手动更新状态（busy/上次结果/日志）
             try:
                 sys.path.insert(0, str(BASE))
@@ -529,11 +614,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v2" or path == "/v2/":   # ★#366 旧骨架页 → 301 门户（index.html 是"V2 建设中"历史残留，主入口已切 /）
             return self._redirect("/")
         if path.startswith("/v2/"):   # ★2026-08-13 UI v2 静态路由（ui_v2/ 目录——API 驱动静态页，无生成器机制）
-            _rel = path[len("/v2/"):].replace("..", "")
-            f = BASE / "ui_v2" / _rel
-            if f.is_file():
-                _ct = "text/css; charset=utf-8" if _rel.endswith(".css") else (
-                    "application/javascript; charset=utf-8" if _rel.endswith(".js") else "text/html; charset=utf-8")
+            f = _safe_file(BASE / "ui_v2", path[len("/v2/"):], (".html", ".js", ".css", ".json", ".svg", ".png", ".ico"))
+            if f is not None:
+                _ct = "text/css; charset=utf-8" if f.suffix == ".css" else (
+                    "application/javascript; charset=utf-8" if f.suffix == ".js" else
+                    "application/json; charset=utf-8" if f.suffix == ".json" else "text/html; charset=utf-8")
                 return self._send(200, f.read_bytes(), _ct)
             return self._send(404, b"ui_v2 404", "text/plain; charset=utf-8")
         if path == "/stock_link.js":   # ★2026-08-12 用户需求#181：全站个股代码联动组件（点击弹全息）
@@ -573,6 +658,7 @@ class Handler(BaseHTTPRequestHandler):
                 or path == "/api/live/endpoints" \
                 or path == "/api/live/turnlow_top" \
                 or path == "/api/live/wufu_rotation" \
+                or path == "/api/live/nav" \
                 or path == "/api/live/chain_refresh":   # ★#310 数据资产 + #313 因子排名 + #319 数据库面板 + #323 因子池UI数据包 + #329 轮动日历 + #339 决策链实时更新 + #424 竞价因子 + #2026-08-14 盘中实时行情 + API接口状态 + #2026-08-15 turn_low 防守主力 + #2026-08-16 五福轮动摆件
             try:
                 sys.path.insert(0, str(BASE / "deck"))
@@ -606,6 +692,7 @@ class Handler(BaseHTTPRequestHandler):
                       "endpoints": live_api.live_endpoints,   # ★2026-08-14 API接口状态探测
                       "turnlow_top": live_api.live_turnlow_top,   # ★2026-08-15 turn_low 防守主力参考
                       "wufu_rotation": live_api.live_wufu_rotation,   # ★2026-08-16 五福轮动门户摆件
+                      "nav": live_api.live_nav,   # ★2026-11-11 导航/文案动态下发（config/ui.yaml）
                       "chain_refresh": live_api.live_chain_refresh}[_fn]
                 return self._send_json(fn())
             except Exception as e:
@@ -613,33 +700,18 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     import traceback as _tb
                     _tb.print_exc()
-                except Exception:
-                    pass
+                except Exception as _dsh_exc:
+                    _dsh_swallow(_dsh_exc, "deck/deck_server.py:692 do_GET")
                 return self._send_json({"error": str(e)}, 500)
-        if path == "/api/export_data":   # ★2026-08-12 用户需求#179：数据导出中心（Excel + 海报）
-            try:
-                import subprocess as _sp_e, glob as _gl_e
-                _r = _sp_e.run([sys.executable, "-X", "utf8",
-                                str(BASE / "report" / "export_center.py")],
-                               capture_output=True, text=True, timeout=180,
-                               encoding="utf-8", errors="replace")
-                _xf = sorted([Path(x) for x in _gl_e.glob(str(BASE / "output" / "data_export_*.xlsx"))],
-                             key=lambda p: p.stat().st_mtime)
-                _pf = sorted([Path(x) for x in _gl_e.glob(str(BASE / "output" / "data_poster_*.html"))],
-                             key=lambda p: p.stat().st_mtime)
-                return self._send_json({
-                    "ok": _r.returncode == 0,
-                    "excel": _xf[-1].name if _xf else None,
-                    "poster": _pf[-1].name if _pf else None,
-                    "log": (_r.stdout or "").strip().splitlines()[-1] if _r.stdout else "",
-                })
-            except Exception as e:
-                return self._send_json({"error": str(e)}, 500)
+        if path == "/api/export_data":   # ★#179 数据导出（仅 POST；GET 405 防 CSRF）
+            return self._send_json({"error": "请使用 POST /api/export_data"}, 405)
         if path.startswith("/dl/"):   # ★2026-08-12 #179：导出文件下载（/dl/data_export_xxx.xlsx）
             _name = path.split("/", 2)[2]
-            _fp = BASE / "output" / _name
-            if _fp.exists():
-                _ct = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"                     if _name.endswith(".xlsx") else "text/html; charset=utf-8"
+            _fp = _safe_file(BASE / "output", _name, (".xlsx", ".html", ".json", ".csv", ".md"))
+            if _fp is not None:
+                _ct = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if _fp.suffix == ".xlsx" else (
+                    "application/json; charset=utf-8" if _fp.suffix == ".json" else
+                    "text/csv; charset=utf-8" if _fp.suffix == ".csv" else "text/html; charset=utf-8")
                 return self._send(200, _fp.read_bytes(), _ct)
             return self._send(404, b"file not found")
         if path == "/api/stock_check":   # ★2026-08-10 个股交叉评级（GET ?code=000650）
@@ -693,6 +765,20 @@ class Handler(BaseHTTPRequestHandler):
             files = sorted(_glob.glob(str(BASE / "deck" / "dashboard_techpitch_*.html")), key=lambda x: Path(x).stat().st_mtime)
             p = Path(files[-1]) if files else BASE / "deck" / "dashboard_techpitch.html"
             return self._send(200, p.read_bytes() if p.exists() else b"dashboard_techpitch.html missing", "text/html; charset=utf-8")
+        if path == "/api/pitch_v2":   # ★2026-11-20 动态补 stop_plan（type_stop_plan + 配置默认），与止损引擎同源
+            try:
+                sys.path.insert(0, str(BASE / "deck"))
+                import live_api
+                return self._send_json(live_api.live_pitch_v2())
+            except Exception as e:
+                return self._send_json({"error": str(e)}, 500)
+        if path == "/api/auto_execute":   # ★2026-11-20 持仓页自动买卖开关状态
+            try:
+                sys.path.insert(0, str(BASE / "deck"))
+                import live_api
+                return self._send_json(live_api.auto_execute_status())
+            except Exception as e:
+                return self._send_json({"error": str(e)}, 500)
         if path in ROUTES:
             f = _resolve_route(path)
             if f is None or not f.exists():
@@ -751,9 +837,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
+        if not _origin_ok(self):   # ★2026-11-10 CSRF 防护：拒绝跨源写操作
+            return self._send_json({"ok": False, "error": "跨源写操作被拒绝"}, 403)
+        if path == "/api/export_data":   # ★#179 数据导出（POST 执行；GET 已 405）
+            try:
+                import glob as _gl_e
+                import subprocess as _sp_e
+                _r = _sp_e.run([sys.executable, "-X", "utf8",
+                                str(BASE / "report" / "export_center.py")],
+                               capture_output=True, text=True, timeout=180,
+                               encoding="utf-8", errors="replace")
+                _xf = sorted([Path(x) for x in _gl_e.glob(str(BASE / "output" / "data_export_*.xlsx"))],
+                             key=lambda p: p.stat().st_mtime)
+                _pf = sorted([Path(x) for x in _gl_e.glob(str(BASE / "output" / "data_poster_*.html"))],
+                             key=lambda p: p.stat().st_mtime)
+                return self._send_json({
+                    "ok": _r.returncode == 0,
+                    "excel": _xf[-1].name if _xf else None,
+                    "poster": _pf[-1].name if _pf else None,
+                    "log": (_r.stdout or "").strip().splitlines()[-1] if _r.stdout else "",
+                })
+            except Exception as e:
+                return self._send_json({"error": str(e)}, 500)
         if path.startswith("/api/proxy/"):   # ★2026-08-16 反向代理 POST → :3080（删除/批量/清空/发送全走这里）
-            import urllib.request as _ur
             import urllib.error as _ue
+            import urllib.request as _ur
             _tgt = "http://127.0.0.1:3080/" + path[len("/api/proxy/"):]
             try:
                 _body = self._read_json()
@@ -782,7 +890,8 @@ class Handler(BaseHTTPRequestHandler):
                 rec = self._read_json()
                 typ = rec.get("type")
                 name = rec.get("name") or ""
-                import re as _re, shutil as _sh
+                import re as _re
+                import shutil as _sh
                 if typ not in ("skill", "preset") or not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
                     return self._send_json({"ok": False, "error": "type 需为 skill/preset，name 需为小写字母数字连字符"}, 400)
                 src = BASE / "assets" / ("skills" if typ == "skill" else "presets") / name
@@ -872,7 +981,10 @@ class Handler(BaseHTTPRequestHandler):
                         try:
                             sys.path.insert(0, str(BASE))
                             # ① 远期池 decided 清空
-                            from factors.opportunities.pitch_track import load_latest as _pl, _write as _pw
+                            from factors.opportunities.pitch_track import _write as _pw
+                            from factors.opportunities.pitch_track import (
+                                load_latest as _pl,
+                            )
                             _pool = _pl()
                             _changed = False
                             for _e in _pool.get("entries", []):
@@ -882,7 +994,8 @@ class Handler(BaseHTTPRequestHandler):
                             if _changed:
                                 _pw(_pool)
                             # ② 持仓回退：该 code 未成交（entry_price=None）的 holding/over_limit 移除
-                            from strategy.portfolio import _load as _pl2, _save as _ps2
+                            from strategy.portfolio import _load as _pl2
+                            from strategy.portfolio import _save as _ps2
                             _d = _pl2()
                             _removed = 0
                             _keep = []
@@ -896,53 +1009,51 @@ class Handler(BaseHTTPRequestHandler):
                             if _removed:
                                 _d["positions"] = _keep
                                 _ps2(_d)
-                        except Exception:
-                            pass
+                        except Exception as _dsh_exc:
+                            _dsh_swallow(_dsh_exc, "deck/deck_server.py:1001 _bg_undo_all")
                     _th.Thread(target=_bg_undo_all, daemon=True).start()
-                except Exception:
-                    pass
+                except Exception as _dsh_exc:
+                    _dsh_swallow(_dsh_exc, "deck/deck_server.py:1004 do_POST")
                 return self._send_json({"ok": True, "undo": rec["code"],
                                         "removed": before - len(hist), "total": len(hist)})
             if not rec.get("code") or rec.get("action") not in ("buy", "drop"):
                 return self._send_json({"error": "需要 code + action(buy/drop/undo)"}, 400)
             rec = {k: rec.get(k) for k in ("date", "code", "action", "ts", "note", "target", "stop")}
-            # ★★L0 硬门控（2026-08-15 低频主观量化改造 · 设计书 P2-2）：
-            #   防御期（择时 score<40）下 revalue/tech_sentiment 买入硬拒绝——实盘归因（因子池留言）：
-            #   这两类下跌日放大亏损（T+1 归因 -1.65%~-2.18%），UI 二次确认可绕过 → 后端固化为硬规则
+            # ★★2026-11-26 L0 硬门控：提取到 risk_gate.l0_gate（共享给手动/自动两路径）
+            #   全 fail-closed：择时数据缺失/异常/防御期一律拒绝高风险类型买入，不再静默放行。
             try:
                 import glob as _tg0
                 import os as _os0
-                _tf0 = sorted(_tg0.glob(str(OUTPUT / "timing_system_*.json")), key=_os0.path.getmtime)
-                _tm_score = None
-                if _tf0:
-                    _td0 = json.loads(Path(_tf0[-1]).read_text(encoding="utf-8"))
-                    _tm_score = _td0.get("score")
-                if rec.get("action") == "buy" and _tm_score is not None and _tm_score < 40:
-                    _gcode = str(rec["code"]).upper()
-                    _otype = ""
-                    _pf0 = sorted(_tg0.glob(str(LOGS / "pitch_v2*.json")), key=_os0.path.getmtime)
-                    if _pf0:
-                        _pd0 = json.loads(Path(_pf0[-1]).read_text(encoding="utf-8"))
-                        for _p0 in (_pd0.get("pitch") or []):
-                            if str(_p0.get("code", "")).upper() == _gcode:
-                                _otype = _p0.get("otype") or ""
+                from risk import risk_gate as _RG
+                _gcode = str(rec["code"]).upper()
+                # otype 反查：pitch_v2 → tech_pitch（沿用原逻辑）
+                _otype = ""
+                _pf0 = sorted(_tg0.glob(str(LOGS / "pitch_v2*.json")), key=_os0.path.getmtime)
+                if _pf0:
+                    _pd0 = json.loads(Path(_pf0[-1]).read_text(encoding="utf-8"))
+                    for _p0 in (_pd0.get("pitch") or []):
+                        if str(_p0.get("code", "")).upper() == _gcode:
+                            _otype = _p0.get("otype") or ""
+                            break
+                if not _otype:
+                    _tf1 = sorted(_tg0.glob(str(LOGS / "tech_pitch*.json")), key=_os0.path.getmtime)
+                    if _tf1:
+                        _td1 = json.loads(Path(_tf1[-1]).read_text(encoding="utf-8"))
+                        for _e1 in (_td1.get("entries") or []):
+                            if str(_e1.get("code", "")).upper() == _gcode:
+                                _otype = _e1.get("otype") or ""
                                 break
-                    if not _otype:
-                        _tf1 = sorted(_tg0.glob(str(LOGS / "tech_pitch*.json")), key=_os0.path.getmtime)
-                        if _tf1:
-                            _td1 = json.loads(Path(_tf1[-1]).read_text(encoding="utf-8"))
-                            for _e1 in (_td1.get("entries") or []):
-                                if str(_e1.get("code", "")).upper() == _gcode:
-                                    _otype = _e1.get("otype") or ""
-                                    break
-                    if _otype in ("revalue", "tech_sentiment"):
-                        return self._send_json({
-                            "ok": False,
-                            "error": (f"L0 门控拦截：防御期（择时 score={_tm_score:.0f}<40）下 "
-                                      f"{_otype} 禁止买入——实盘归因下跌日放大亏损（-1.65%~-2.18%），硬规则不放开"),
-                            "gate": {"defensive": True, "score": _tm_score, "otype": _otype}}, 403)
-            except Exception:
-                pass
+                # ★L0 只约束买入；卖出(drop)不受择时门控限制（减仓是风控的一部分）
+                _l0_ok, _l0_why = ((True, "not_buy") if rec.get("action") != "buy"
+                                   else _RG.l0_gate(_otype, _gcode))
+                if not _l0_ok:
+                    return self._send_json({
+                        "ok": False, "error": _l0_why,
+                        "gate": {"defensive": True, "otype": _otype, "reason": _l0_why}}, 403)
+            except Exception as _e:
+                # 门控自身异常 → 安全模式（禁新开仓），绝不 fail-open
+                return self._send_json({
+                    "ok": False, "error": f"L0 风控门控异常（安全模式禁买）: {str(_e)[:100]}"}, 403)
             # ★2026-08-11 百轮#36：决策留痕——记录审批时的市场环境档位（择时系统结论）
             #   复盘时能回答"这笔买入是在什么环境下做的"（适合买入/谨慎/不适合 + 分数）
             try:
@@ -953,14 +1064,14 @@ class Handler(BaseHTTPRequestHandler):
                     _td = json.loads(Path(_tf[-1]).read_text(encoding="utf-8"))
                     rec["env_level"] = _td.get("level", "")
                     rec["env_score"] = _td.get("score")
-            except Exception:
-                pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "deck/deck_server.py:1056 do_POST")
             # ★2026-08-12 用户需求#177：Pitch 全量标记——buy 时从最新 pitch_v2 候选自动提取
             #   因子归因（哪个因子/多因子命中）/止损条件/风控/预期，存数据库供"实战 vs 回测"归因
             #   （未来复盘：因子实战最强 → 对比 ICIR120/ICIR变化 → 给因子打分）
             try:
                 import glob as _pg
-                import os as _os2   # ★#177 修复：deck_server 顶部无 os，需局部导入
+                import os as _os2  # ★#177 修复：deck_server 顶部无 os，需局部导入
                 _pf = sorted(_pg.glob(str(LOGS / "pitch_v2*.json")), key=_os2.path.getmtime)
                 _meta = None
                 if _pf:
@@ -978,8 +1089,34 @@ class Handler(BaseHTTPRequestHandler):
                             break
                 if _meta:
                     rec["pitch_meta"] = _meta
-            except Exception:
-                pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "deck/deck_server.py:1081 do_POST")
+            # ★★2026-11-26 同步下单前风控：RiskAgent 一票否决（REJECT 直接 403，不让失败决策落盘）
+            #   后台 sync_from_decisions 还会再查一次（双保险）；此处让前端立即拿到拒绝原因。
+            try:
+                from risk import risk_gate as _RG
+                from risk.risk_agent import Decision as _Dec
+                from strategy import portfolio as _PF
+                _pos = _PF._load().get("positions", [])
+                _holding = [p for p in _pos if p.get("status") == "holding"]
+                _unit = 1.0 / max(_PF.MAX_POSITIONS, 1)
+                _weights = {p["code"]: _unit for p in _holding}
+                _dd, _avail = _PF._drawdown_proxy(_holding)
+                # ★风控只约束买入；卖出(drop)必须始终允许（减仓是风控的一部分）
+                _chk = (None if rec.get("action") != "buy" else _RG.pretrade_check(
+                    rec["code"], _unit, _weights, _dd, dd_available=_avail))
+                if _chk is not None and _chk.decision == _Dec.REJECT:
+                    return self._send_json({
+                        "ok": False, "error": _chk.reason,
+                        "risk": {"decision": _chk.decision.value, "reason": _chk.reason}}, 403)
+                if _chk is not None and _chk.decision == _Dec.REDUCE:
+                    rec["risk_size_cap"] = round(float(_chk.adjusted_size), 4)
+            except ImportError as _e:
+                return self._send_json({
+                    "ok": False, "error": f"风控模块不可用（安全模式禁买）: {_e}"}, 403)
+            except Exception as _e:
+                return self._send_json({
+                    "ok": False, "error": f"风控检查异常（安全模式禁买）: {str(_e)[:100]}"}, 403)
             # append 模式（★写保护免疫：读最新时间戳文件，写新时间戳文件）
             # ★2026-08-15 并发写锁：读-改-写串行化（实测并发 10 请求仅存 4 条 → 修复）
             with DECIDE_LOCK:
@@ -1006,25 +1143,34 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     import threading
                     def _bg_sync(code=rec.get("code")):
+                        # ★2026-11-26：记录风控同步结果（含被拒候选），末尾落盘供 /api/portfolio 展示
+                        _sync_res = {}
                         # ★2026-08-11 去静默：联动异常写入日志（按日时间戳名，固定名被写保护锁丢日志）
                         _log = LOGS / f"decide_sync_{time.strftime('%Y%m%d')}.log"
                         def _wlog(msg):
                             try:
                                 with open(_log, "a", encoding="utf-8") as f:
                                     f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
-                            except Exception:
-                                pass
+                            except Exception as _dsh_exc:
+                                _dsh_swallow(_dsh_exc, "deck/deck_server.py:1143 _wlog")
                         _wlog(f"decide={code} start")
                         # 1) 持仓同步（持股≤5：buy → holding）
                         try:
                             sys.path.insert(0, str(BASE))
                             from strategy.portfolio import sync_from_decisions
-                            sync_from_decisions()
+                            _sync_res = sync_from_decisions() or {}
+                            _wlog(f"  ✓ sync_from_decisions: {_sync_res}")
                         except Exception as e:
                             _wlog(f"  ✕ sync_from_decisions: {str(e)[:200]}")
                         # 2) 远期池联动（长线 append_pitch + 科技线追加）——独立 try，失败不阻断
                         try:
-                            from factors.opportunities.pitch_track import append_pitch, _write as _pt_write, load_latest
+                            from factors.opportunities.pitch_track import (
+                                _write as _pt_write,
+                            )
+                            from factors.opportunities.pitch_track import (
+                                append_pitch,
+                                load_latest,
+                            )
                             p2 = _resolve_route("/api/pitch_v2")
                             if p2 and p2.exists():
                                 append_pitch(p2)
@@ -1061,7 +1207,10 @@ class Handler(BaseHTTPRequestHandler):
                         # 3) 审批状态标记（独立 try，不受上面影响）：远期池该 code 条目标 decided=buy + 升级 human_select
                         #    ★#346 四池独立：人工买入 → 该 code 从 auto_pitch/machine_top01 流动到 human_select（人工池 = 持仓）
                         try:
-                            from factors.opportunities.pitch_track import load_latest as _pl, _write as _pw
+                            from factors.opportunities.pitch_track import _write as _pw
+                            from factors.opportunities.pitch_track import (
+                                load_latest as _pl,
+                            )
                             _pool2 = _pl()
                             _chg = False
                             for _e in _pool2.get("entries", []):
@@ -1077,12 +1226,30 @@ class Handler(BaseHTTPRequestHandler):
                                 _wlog(f"  ✓ 远期池 decided=buy + human_select: {code}")
                         except Exception as e:
                             _wlog(f"  ✕ decided 标记: {str(e)[:120]}")
+                        # ★2026-11-26：风控同步结果落盘（异步无法回原响应，供 /api/portfolio 展示）
+                        try:
+                            _sr = LOGS / "risk_last_sync.json"
+                            _sr.write_text(json.dumps({
+                                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "code": code, "sync": _sync_res,
+                            }, ensure_ascii=False, indent=1), encoding="utf-8")
+                        except Exception as _e:
+                            _wlog(f"  ✕ risk_last_sync: {str(_e)[:120]}")
                     threading.Thread(target=_bg_sync, daemon=True).start()
                     sync = {"async": True, "note": "持仓+远期池联动已在后台执行"}
                 except Exception as e:
                     sync = {"error": str(e)[:80]}
             return self._send_json({"ok": True, "record": rec, "total": len(hist),
                                     "portfolio_sync": sync})
+        if path == "/api/auto_execute":   # ★2026-11-20 一键开关自动买卖（写 config auto_execute.enabled）
+            try:
+                body = self._read_json()
+                sys.path.insert(0, str(BASE / "deck"))
+                import live_api
+                r = live_api.set_auto_execute(bool(body.get("enabled")))
+                return self._send_json(r, 200 if r.get("ok") else 400)
+            except Exception as e:
+                return self._send_json({"error": str(e)}, 400)
         if path == "/api/portfolio/sell":    # ★T-2：卖出 → 状态机 exit + history + 人工池降级
             try:
                 body = self._read_json()
@@ -1092,7 +1259,8 @@ class Handler(BaseHTTPRequestHandler):
                 # ★#346 四池独立：卖出 → 该 code 从 human_select 池降级（人工池 = 当前持仓，卖出即流出）
                 if r.get("ok"):
                     try:
-                        from factors.opportunities.pitch_track import load_latest as _pl, _write as _pw
+                        from factors.opportunities.pitch_track import _write as _pw
+                        from factors.opportunities.pitch_track import load_latest as _pl
                         _pool = _pl()
                         _chg = False
                         for _e in _pool.get("entries", []):
@@ -1102,8 +1270,8 @@ class Handler(BaseHTTPRequestHandler):
                                 _chg = True
                         if _chg:
                             _pw(_pool)
-                    except Exception:
-                        pass
+                    except Exception as _dsh_exc:
+                        _dsh_swallow(_dsh_exc, "deck/deck_server.py:1262 do_POST")
                 return self._send_json(r, 200 if r.get("ok") else 404)
             except Exception as e:
                 return self._send_json({"error": str(e)}, 400)
@@ -1184,7 +1352,10 @@ class Handler(BaseHTTPRequestHandler):
                           "reason_short": d.get("reason_short", "")}
                          for d in _decisions if d.get("code")]
                 sys.path.insert(0, str(BASE))
-                from factors.opportunities.pitch_track import append_niu_select, PERSONA_NAMES
+                from factors.opportunities.pitch_track import (
+                    PERSONA_NAMES,
+                    append_niu_select,
+                )
                 # 决策日 = 最新交易日（bars）
                 _date = ""
                 try:

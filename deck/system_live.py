@@ -8,6 +8,17 @@
   4. api_health: 各 API 端点存活
   5. deck: 自身状态
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import json
 import re
 import socket
@@ -28,9 +39,8 @@ DBS = {
 
 SCHEDULED_TASKS = [
     ("LWQuant-DevDriver", "每 4h 巡检"),
-    ("LWQuant-AfterCloseScan", "17:35 盘后机会扫描"),
-    ("LWQuant-FactorDaily", "19:15 因子池"),
-    ("LWQuant-DailyPipeline", "18:30 每日全链"),
+    ("LWQuant-AfterCloseScan", "19:30 盘后兜底扫描"),
+    ("LWQuant-DailyPipeline", "17:30 每日全链"),
     ("LWQuant-DeckGuard", "每 30min 守护"),
 ]
 
@@ -90,8 +100,8 @@ def _dev_auto_tail(n=8) -> list:
             try:
                 lines = p.read_text(encoding="utf-8", errors="replace").strip().splitlines()
                 return lines[-n:]
-            except Exception:
-                pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "deck/system_live.py:92 _dev_auto_tail")
     return []
 
 
@@ -160,8 +170,8 @@ def _deck_pid() -> int:
         for line in r.stdout.splitlines():
             if ":8787" in line and "LISTENING" in line:
                 return int(line.split()[-1])
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/system_live.py:162 _deck_pid")
     return 0
 
 
@@ -181,8 +191,8 @@ def _activity_feed(minutes: int = 60) -> list:
                         "file": p.name, "age_min": round(age / 60, 1),
                         "ts": time.strftime("%H:%M:%S", time.localtime(mt)),
                     })
-            except Exception:
-                pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "deck/system_live.py:183 _activity_feed")
     items.sort(key=lambda x: x["age_min"])
     return items[:15]
 
@@ -201,7 +211,9 @@ def _next_schedule() -> list:
                 r = subprocess.run(["schtasks", "/Query", "/TN", name, "/FO", "LIST", "/V"],
                                    capture_output=True, text=True, errors="replace",
                                    encoding="gbk", timeout=8)
-                m = _re.search(r"下次运行时间:\s*(.+)", r.stdout)
+                # ★2026-08-25 兼容英文系统（schtasks 输出 "Next Run Time"，中文正则匹配不到 → 永远"暂无计划任务"）
+                m = (_re.search(r"下次运行时间:\s*(.+)", r.stdout)
+                     or _re.search(r"Next Run Time:\s*(.+)", r.stdout))
                 if not m:
                     continue
                 nxt = m.group(1).strip()
@@ -221,8 +233,8 @@ def _next_schedule() -> list:
                                     "mins_left": None})
             except Exception:
                 continue
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "deck/system_live.py:225 _next_schedule")
     return out
 
 

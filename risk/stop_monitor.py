@@ -19,6 +19,17 @@
 输出：logs/stop_alerts_{ts}.json（触发清单 + 汇总）+ deck/ 双写
   → 待处理面板 /dashboard_actions.html 消费
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import glob
 import json
 import os
@@ -43,8 +54,8 @@ def _latest(files):
     if files:
         try:
             return json.loads(Path(files[-1]).read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "risk/stop_monitor.py:46 _latest")
     return {}
 
 
@@ -73,12 +84,12 @@ def _latest_roe(code: str):
         con.close()
         if r and r[1] is not None and r[2] and float(r[2]) > 0:
             return {"ann_date": str(r[0])[:10], "roe": float(r[1]) / float(r[2])}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "risk/stop_monitor.py:76 _latest_roe")
     return None
 
 
-def _check_one(e: dict, plan: dict) -> dict:
+def _check_one(e: dict, plan: dict, is_position: bool = False) -> dict:
     """单只入池股止损检测 → {status, alerts, metrics}"""
     code = e.get("code", "")
     otype = e.get("otype", "value")
@@ -121,6 +132,23 @@ def _check_one(e: dict, plan: dict) -> dict:
                     "ma20_at_entry": round(ma20_at_entry, 2) if ma20_at_entry else None})
 
     status = "NORMAL"
+    # ⓪ 高点回撤（配置 high_drawdown_exit：入场后阶段高点回落 ≥ X% → 离场）
+    #   ★2026-11-20 ①与 max_drawdown_pct（入场价回撤）口径不同，不可互填
+    #   ②只对真实持仓启用：远期池样本入池后冲高回落是常态，按高点回撤判会被大面积误标
+    hde = plan.get("high_drawdown_exit")
+    if is_position and hde and entry_date:
+        _post = close[df["date"].astype(str) >= str(entry_date)]
+        if len(_post):
+            peak = float(_post.max())
+            if peak > 0:
+                dd_peak = last / peak - 1
+                metrics["peak"] = round(peak, 3)
+                metrics["dd_from_peak"] = round(dd_peak, 4)
+                if dd_peak <= -hde:
+                    alerts.append({"rule": f"高点回撤（-{hde*100:.0f}%）",
+                                   "detail": f"现价 {last:.2f}，入场后高点 {peak:.2f}，回撤 {dd_peak*100:.1f}%",
+                                   "action": "离场"})
+                    status = "TRIGGERED"
     # ① 回撤保护线（vs 入池价）
     dd_protect = plan.get("max_drawdown_pct")
     if dd_protect and entry_close:
@@ -180,16 +208,50 @@ def _check_one(e: dict, plan: dict) -> dict:
             "entry_date": entry_date, "status": status, "alerts": alerts, "metrics": metrics}
 
 
+def _held_positions() -> dict:
+    """{code: {entry_date, entry_price}} 真实持仓基准——池条目可能是几个月前入池，
+    高点回撤/入场回撤/时间止损必须用真实买入日与成本，不能用入池基准。"""
+    try:
+        import sys as _s
+        if str(BASE) not in _s.path:
+            _s.path.insert(0, str(BASE))
+        from strategy.portfolio import _load
+        return {p.get("code"): {"entry_date": p.get("entry_date"),
+                                "entry_price": p.get("entry_price")}
+                for p in (_load().get("positions") or [])
+                if p.get("status") == "holding"}
+    except Exception:
+        return {}
+
+
 def run() -> Path:
     """监测 pitch_track 入池股 + 真实持仓 → 输出触发清单"""
     pt = _latest(sorted(glob.glob(str(BASE / "logs" / "pitch_track_pool_*.json"))))
     entries = [e for e in pt.get("entries", []) if e.get("entry_close")]
     from risk.type_stop_rules import type_stop_plan
 
+    held = _held_positions()
     results = []
     for e in entries:
-        plan = type_stop_plan(e.get("otype", "value"), e.get("score"))
-        results.append(_check_one(e, plan))
+        is_pos = e.get("code") in held
+        _e = e
+        if is_pos:
+            hp = held[e["code"]] or {}
+            _e = dict(e)
+            # ★2026-11-20 用真实持仓基准覆盖池条目（池只升级 pool_type，不更新 entry_date/close）
+            if hp.get("entry_date"):
+                _e["entry_date"] = hp["entry_date"]
+                try:
+                    _e["age_days"] = max(0, (datetime.now() -
+                        datetime.strptime(str(hp["entry_date"])[:10], "%Y-%m-%d")).days)
+                except Exception as _dsh_exc:
+                    _dsh_swallow(_dsh_exc, "risk/stop_monitor.py:236 run")
+            if hp.get("entry_price"):
+                _e["entry_close"] = hp["entry_price"]
+        plan = type_stop_plan(_e.get("otype", "value"), _e.get("score"))
+        _r = _check_one(_e, plan, is_position=is_pos)
+        _r["is_position"] = is_pos
+        results.append(_r)
 
     n_trig = sum(1 for r in results if r["status"] == "TRIGGERED")
     n_near = sum(1 for r in results if r["status"] == "NEAR")
@@ -206,8 +268,8 @@ def run() -> Path:
     try:
         (BASE / "deck" / f"stop_alerts_{ts}.json").write_text(
             json.dumps(out, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "risk/stop_monitor.py:260 run")
     return p
 
 

@@ -29,6 +29,17 @@
   python dev_auto.py --stop      熔断：停止循环（禁用计划任务 + 写 STOP.md）
   python dev_auto.py --reset     恢复：清除熔断（启用计划任务）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 
 # ★2026-08-13 黑框隐藏（总指挥要求：计划任务/常驻进程不弹黑框，运行完自动关闭不留窗）
@@ -37,8 +48,8 @@ try:
     _h = ctypes.windll.kernel32.GetConsoleWindow()
     if _h:
         ctypes.windll.user32.ShowWindow(_h, 0)
-except Exception:
-    pass
+except Exception as _dsh_exc:
+    _dsh_swallow(_dsh_exc, "dev_auto.py:40 <module>")
 
 import hashlib
 import json
@@ -84,8 +95,8 @@ def _read_state() -> dict:
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "dev_auto.py:87 _read_state")
     return {}
 
 
@@ -251,8 +262,8 @@ def _notes_fingerprint() -> dict:
                     try:
                         st = f.stat()
                         cur[str(f.relative_to(PROJECT))] = f"{st.st_size}_{int(st.st_mtime)}"
-                    except Exception:
-                        pass
+                    except Exception as _dsh_exc:
+                        _dsh_swallow(_dsh_exc, "dev_auto.py:254 _notes_fingerprint")
     return cur
 
 
@@ -328,8 +339,8 @@ def _m2_finished() -> bool:
             if pid_str.isdigit() and _pid_alive(int(pid_str)):
                 return False                             # 锁里 PID 真存活 → 实例在跑
             # PID 已死/非数字 → 陈旧残留锁，视为无实例在跑，继续判断日志
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "dev_auto.py:331 _m2_finished")
     if not BULK_LOG.exists():
         return False
     lines = [l for l in BULK_LOG.read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip()]
@@ -523,8 +534,8 @@ def run_update():
                 gen = _json2.loads(pp.read_text(encoding="utf-8")).get("generated_at", "")
                 if gen and gen[:10] >= (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"):
                     stale = False
-            except Exception:
-                pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "dev_auto.py:526 run_update")
         if stale:
             r6d = subprocess.run(
                 [sys.executable, "-X", "utf8", str(BASE / "strategy" / "pitch.py"), "--n", "5"],
@@ -689,8 +700,8 @@ def run_update():
         try:
             _ui_date_file.write_text(datetime.now().strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
             log(f"页面模板已生成（今日首轮，标记 {_ui_date_file.name}）")
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "dev_auto.py:692 run_update")
     else:
         log("页面模板今日已生成（API 实时刷新，跳过重复生成）")
     # 8.57) ★版本清理（每日首轮生成后尝试；写保护下删除失败忽略）

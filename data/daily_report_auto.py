@@ -12,13 +12,24 @@
 用法：python data/daily_report_auto.py [--dry-run]
 """
 # ★2026-08-13 黑框隐藏（自动化运行不弹黑框）
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 try:
     import ctypes
     _h = ctypes.windll.kernel32.GetConsoleWindow()
     if _h:
         ctypes.windll.user32.ShowWindow(_h, 0)
-except Exception:
-    pass
+except Exception as _dsh_exc:
+    _dsh_swallow(_dsh_exc, "data/daily_report_auto.py:20 <module>")
 
 import sys
 import json
@@ -53,8 +64,8 @@ def _trade_date():
         d = DailyCache().latest_trade_date()
         if d:
             return str(d)
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "data/daily_report_auto.py:56 _trade_date")
     return datetime.now().strftime("%Y-%m-%d")
 
 

@@ -125,8 +125,9 @@ def fetch_etf(code):
         try:
             if os.path.exists(path):
                 df = pd.read_csv(path)
-                last = str(df['date'].max())
+                last = str(df['date'].max())[:10]
                 new = ak.fund_etf_hist_sina(symbol=symbol)
+                new['date'] = new['date'].astype(str).str[:10]
                 new = new[new['date'] > last]
                 if new is not None and len(new):
                     df = pd.concat([df, new]).drop_duplicates(subset=['date'], keep='last').sort_values('date')

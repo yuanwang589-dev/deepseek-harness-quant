@@ -209,12 +209,13 @@
       STRATS = (d && d.strategies) || {};
       renderStrategyOptions();
     }).catch(function () {
-      // 兜底：目录接口不可用时不阻塞（仅内置两个）
-      STRATS = {
-        tech3: { name: '技术三因子', category: '策略', instant: true, desc: 'rps_120 反转 + lowvol_60 反转 + near_high_250 正向（月频）', factors: ['rps_120', 'lowvol_60', 'near_high_250'], defaults: { topn: 5, stocks: 300 } },
-        script1: { name: '大市值三因子', category: '复刻', instant: true, desc: '营收增长率 + 市值 + Beta（月频）', factors: ['营收增长率', '市值', 'Beta'], defaults: { topn: 5, stocks: 300 } }
-      };
+      // ★2026-11-11：不再写死策略兜底（违反动态化铁律）；失败时明确提示
+      STRATS = {};
       renderStrategyOptions();
+      try {
+        var sel = document.getElementById('bt-strategy');
+        if (sel && !sel.options.length) sel.innerHTML = '<option value="">策略目录加载失败</option>';
+      } catch (e) {}
     });
   }
   document.getElementById('bt-cat-filter').addEventListener('change', renderStrategyOptions);

@@ -19,6 +19,17 @@
   python risk/take_profit_check.py            # 实盘检查
   python risk/take_profit_check.py --demo     # 3 只模拟持仓自测
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import json
 import sqlite3
@@ -106,6 +117,23 @@ def _stock_name(code: str) -> str:
     return _stock_name_cache.get(code, code)
 
 
+def tp_rule_for(otype: str) -> dict:
+    """类型 → 止盈规则（config risk.take_profit_short_types 驱动）。
+    长持类型（value/quality_gap/…）保留类型表目标；短线类型用 risk.profit_take_low。
+    展示层兜底也必须调它，不能自己写死 20%。"""
+    rule = dict(TAKE_PROFIT_RULES.get(otype or "", DEFAULT_TP))
+    try:
+        from risk.risk_config import risk_defaults
+        _d = risk_defaults()
+        _short = _d.get("take_profit_short_types") or ["tech_sentiment"]
+        _tp_low = _d.get("take_profit_low")
+        if _tp_low is not None and (otype or "") in _short:
+            rule["target_pct"] = _tp_low
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "risk/take_profit_check.py:121 tp_rule_for")
+    return rule
+
+
 def check_position(pos: dict) -> dict:
     """单持仓止盈检查 → 信号 dict"""
     code = pos.get("code")
@@ -113,13 +141,20 @@ def check_position(pos: dict) -> dict:
     info = _lookup_otype(code) if not otype else {}
     otype = otype or info.get("otype")
     upside_est = pos.get("target") or info.get("upside_est")
-    rule = TAKE_PROFIT_RULES.get(otype or "", DEFAULT_TP)
+    rule = tp_rule_for(otype)
     bars = _latest_bars(code)
     nm = pos.get("name") or ""
     if not nm or nm == code:
         nm = _stock_name(code)   # ★#321 name 兜底（全市场名表）
     out = {"code": code, "name": nm, "otype": otype or "unknown",
-           "entry_date": pos.get("entry_date"), "status": "holding", "signals": [], "tp": rule}
+           "entry_date": pos.get("entry_date"), "status": "holding", "signals": [], "tp": rule,
+           # ★2026-11-20 前端直接读顶层字段（原只写 tp 子对象，持仓卡 target_pct/pullback_pct 恒 undefined）
+           "target_pct": rule.get("target_pct"), "pullback_pct": rule.get("pullback_pct"),
+           "time_weeks": rule.get("time_weeks"),
+           # ★2026-11-20 目标止盈由类型规则推导（个股无专属目标）→ 标「规则推导」；
+           #   若将来按审批写入个股专属目标，需同时让 target_pct 取该值，再把这里改成 bool(pos.get("target"))
+           "estimated": True,
+           "note": rule.get("note")}
     if len(bars) < 5:
         out["signals"].append({"type": "info", "msg": "K线不足，无法评估"})
         return out
@@ -192,8 +227,8 @@ def main():
     p.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
     try:
         (OUT_DIR / "take_profit_signals.json").write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "risk/take_profit_check.py:219 main")
     print(f"止盈检查：{len(signals)} 持仓 · {len(alerts)} 触发 | {p.name}")
     for s in signals:
         for sig in s["signals"]:

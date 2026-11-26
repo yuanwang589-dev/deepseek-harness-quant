@@ -27,6 +27,17 @@
     ]
   }
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import glob
 import json
 import os
@@ -48,8 +59,8 @@ def load_latest() -> dict:
     if files:
         try:
             return json.loads(Path(files[-1]).read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/pitch_track.py:51 load_latest")
     return {"ts": "", "entries": []}
 
 
@@ -78,8 +89,8 @@ def append_pitch(pitch_file) -> dict:
             for _r in json.loads(_dfs[-1].read_text(encoding="utf-8")):
                 if isinstance(_r, dict) and _r.get("code") and _r.get("action") in ("buy", "drop"):
                     dec_map[_r["code"]] = _r["action"]
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/pitch_track.py:81 append_pitch")
     # ★entry_date 用 pool_date（pitch 基于的数据日期）而非 date（生成日）；异常回退 bars 最近交易日
     entry_date = d.get("pool_date") or d.get("date") or datetime.now().strftime("%Y-%m-%d")
     try:
@@ -93,8 +104,8 @@ def append_pitch(pitch_file) -> dict:
             con0.close()
         if _mx and entry_date > _mx:   # pool_date 虚标未来（如 08-10 > 08-07）→ 用最近交易日
             entry_date = _mx
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/pitch_track.py:96 append_pitch")
     # 入池日收盘（bars.db，immutable 只读连接秒开）
     con = sqlite3.connect(f"file:{BARS_DB}?mode=ro&immutable=1", uri=True, timeout=3)
     # ★2026-08-11 问题 5：跨日重复累积（同 code 多条）→ 按 code 唯一去重，保留最早入池条目
@@ -144,8 +155,8 @@ def append_pitch(pitch_file) -> dict:
                     _append(t["code"], t.get("name", ""), t.get("otype", "breakout"),
                             t.get("score"), t.get("risk_level", ""), "")
         # 清理重复（交叉可能重复 append 同 code——但 existing 已挡）
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/pitch_track.py:147 append_pitch")
     con.close()
     if added:
         p = _write(pool)
@@ -205,8 +216,8 @@ def update_fwd() -> dict:
     try:
         conns.append(("main", sqlite3.connect(f"file:{BARS_DB}?mode=ro&immutable=1",
                                               uri=True, timeout=3)))
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/pitch_track.py:208 update_fwd")
     try:
         from data.cache import CACHE_DIR
         for _p in sorted(CACHE_DIR.glob("bars_incr_*.db"))[-3:]:
@@ -215,8 +226,8 @@ def update_fwd() -> dict:
                                                        uri=True, timeout=3)))
             except Exception:
                 continue
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/pitch_track.py:218 update_fwd")
     changed = 0
     # ★修复：entry_date 若为未来（>bars 最新）→ 回退最近交易日（2026-08-10 首版 bug）
     # ★2026-08-13 #221：改用 DailyCache.latest_trade_date()（≥4000 只完整性门槛）——
@@ -278,8 +289,8 @@ def update_fwd() -> dict:
     for _n, _c in conns:
         try:
             _c.close()
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/pitch_track.py:281 update_fwd")
     if changed:
         p = _write(pool)
         print(f"Pitch 远期池: 更新 {changed} 项远期收益 → 池内 {len(pool['entries'])} 条（双库合并）")
@@ -358,16 +369,16 @@ def append_machine_top01(n_top: int = 5) -> dict:
             for _p in (_pd.get("pitch") or []):
                 names[_p.get("code")] = (_p.get("name"), _p.get("otype"), _p.get("stop_plan") or {},
                                          _p.get("risk_level", ""))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/pitch_track.py:361 append_machine_top01")
     # ★2026-08-13 #321：机器池股票来自 ext_hits 共识（不在 pitch_v2）→ name 从全市场名表补
     _basic_names = {}
     try:
         _bc = sqlite3.connect("file:data/cache/stock_basic.db?mode=ro&immutable=1", uri=True, timeout=3)
         _basic_names = dict(_bc.execute("SELECT code, name FROM stock_basic").fetchall())
         _bc.close()
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/pitch_track.py:369 append_machine_top01")
     # ★#375 用户需求：带止损止盈条件的短线（tech_pitch）也应该进机器池
     #   tech_pitch 短线候选自带短线止损（trailing_ma/stop_loss_pct/atr_stop/short_line），
     #   与因子最强（machine_top01）并列，都是机器客观选择、带止损止盈 → 一并入机器池 B
@@ -389,8 +400,8 @@ def append_machine_top01(n_top: int = 5) -> dict:
                     "risk_level": _t.get("risk_level") or "",
                     "add_date": _t.get("add_date") or "",
                 })
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/pitch_track.py:392 append_machine_top01")
     # ★#180 止损止盈：机器池无定制 stop_plan → 用类型止损矩阵默认（stop_plan_for）
     try:
         from strategy.portfolio import stop_plan_for, _load_stop_matrix
@@ -405,21 +416,24 @@ def append_machine_top01(n_top: int = 5) -> dict:
             # ★#180 已存在但止损空 → 补止损（首次运行旧代码遗留）
             for _e in pool["entries"]:
                 if _e["code"] == code and not (_e.get("stop_plan") or {}):
-                    _e["stop_plan"] = stop_plan_for("machine_top01", _MATRIX) or {
-                        "otype": "machine_top01", "stop_loss_pct": 0.07,
-                        "time_stop_weeks": 8, "max_drawdown_pct": 0.12}
+                    _e["stop_plan"] = stop_plan_for("machine_top01", _MATRIX)
                     added += 1
             continue
         nm, ot, sp, rk = names.get(code, (code, "machine_top01", {}, ""))
         if not nm or nm == code:
             nm = _basic_names.get(code, code)
         if not sp:
-            sp = stop_plan_for(ot or "machine_top01", _MATRIX) or {}
+            sp = stop_plan_for(ot or "machine_top01", _MATRIX)
         if not sp:
-            # ★#180 通用默认止损（机器池兜底：时间止损 8 周 + 回撤 -12% + 7% 硬止损）
-            sp = {"otype": ot or "machine_top01", "stop_loss_pct": 0.07,
-                  "time_stop_weeks": 8, "time_stop_min_gain": 0.0,
-                  "trailing_ma": None, "max_drawdown_pct": 0.12}
+            # 机器池兜底：config/params.yaml(risk) 默认值（单一真源，2026-11-20）
+            from risk.risk_config import risk_defaults
+            _d = risk_defaults()
+            sp = {"otype": ot or "machine_top01",
+                  "stop_loss_pct": _d.get("stop_loss_pct"),
+                  "time_stop_weeks": _d.get("time_stop_weeks"),
+                  "time_stop_min_gain": 0.0,
+                  "trailing_ma": _d.get("trailing_ma"),
+                  "max_drawdown_pct": _d.get("max_drawdown_pct")}
         row = con.execute("SELECT close FROM daily_bar WHERE code=? AND date=?",
                           (code, entry_date)).fetchone()
         pool["entries"].append({
@@ -550,8 +564,8 @@ def append_niu_select(persona: str, picks: list, date: str = "",
                               uri=True, timeout=3)
         _basic_names = dict(_bc.execute("SELECT code, name FROM stock_basic").fetchall())
         _bc.close()
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/pitch_track.py:556 append_niu_select")
     con = sqlite3.connect(f"file:{BARS_DB}?mode=ro&immutable=1", uri=True, timeout=3)
     added = rechecked = 0
     for pk in picks:
@@ -663,8 +677,8 @@ def append_ai_select(picks: list, date: str = "", skip_reason: str = "") -> dict
         _fs = sorted((BASE / "logs").glob("pitch_v2*.json"), key=lambda x: x.stat().st_mtime)
         if _fs:
             _pf = {p.get("code"): p for p in (json.loads(_fs[-1].read_text(encoding="utf-8")).get("pitch") or [])}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/pitch_track.py:669 append_ai_select")
 
     added = 0
     rechecked = 0
@@ -756,8 +770,8 @@ def _append_ai_insight(picks: list, date: str, added: int, skip_reason: str = ""
                 "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
         f.write_text(json.dumps(recs, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/pitch_track.py:762 _append_ai_insight")
 
 
 if __name__ == "__main__":

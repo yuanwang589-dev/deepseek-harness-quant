@@ -22,6 +22,17 @@
   python factors/opportunities/scan.py --types reversal,value   # 指定类型
   python factors/opportunities/scan.py --pitch        # 输出 Pitch 候选（三重过滤）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import json
 import sqlite3
@@ -39,17 +50,33 @@ sys.path.insert(0, str(BASE))
 import numpy as np
 import pandas as pd
 
+from data.paths import BARS_DB as _BARS_P
+from data.paths import FINANCE_DB as _FIN_P
+from data.paths import QUALITY_DB as _QD_P
+from data.paths import STOCK_BASIC_DB as _BASIC_P
+from data.pit import latest_disclosed_period
 from factors.opportunities.registry import OPPORTUNITY_TYPES, ORDER, SCORE_THRESHOLDS
-from factors.opportunities.score import (opportunity_score, gains_score, prob_score,
-                                         risk_score, PITCH_GATE, CONSENSUS_BONUS,
-                                         size_tier_of, strong_strength, classify_pitch_sub,
-                                         EXPRESS_MIN_FAMILY, CONSENSUS_MIN_FAMILY,
-                                         EXPRESS_PER_LINE, CONSENSUS_PER_LINE)
+from factors.opportunities.score import (
+    CONSENSUS_BONUS,
+    CONSENSUS_MIN_FAMILY,
+    CONSENSUS_PER_LINE,
+    EXPRESS_MIN_FAMILY,
+    EXPRESS_PER_LINE,
+    PITCH_GATE,
+    SCORING_CFG,
+    classify_pitch_sub,
+    gains_score,
+    opportunity_score,
+    prob_score,
+    risk_score,
+    size_tier_of,
+    strong_strength,
+)
 
-BARS_DB = r"data\cache\bars.db"
-FIN_DB = r"data\cache\finance.db"
-QD_DB = r"data\cache\finance_quality.db"
-BASIC_DB = r"data\cache\stock_basic.db"
+BARS_DB = str(_BARS_P)
+FIN_DB = str(_FIN_P)
+QD_DB = str(_QD_P)
+BASIC_DB = str(_BASIC_P)
 OUT = BASE / "logs" / f"opp_pool_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"   # 每次运行唯一文件名（安全层限制同名文件只能写一次）
 # 兼容读取：pitch_v2.py 用 get_latest_pool() 取最新
 
@@ -74,18 +101,20 @@ def batch_check_one(code: str) -> dict:
     global _risk_cache, _risk_loaded
     if not _risk_loaded:
         try:
-            from risk.stock_risk import _check_row
             import sqlite3
+
+            from risk.stock_risk import _check_row
             con = sqlite3.connect(QD_DB)
-            period = con.execute(
-                "SELECT period, COUNT(*) c FROM quality WHERE period < '2026-07-01' "
-                "GROUP BY period ORDER BY period DESC LIMIT 1").fetchone()
+            # ★2026-11-10 PIT：按法定披露截止日截断（原硬编码 < 2026-07-01 会永久滞后）
+            _cut = latest_disclosed_period()
             # 取最新且覆盖≥1000 的期
+            # ★2026-08-21 性能修复：原关联子查询（外层每行重算 COUNT）是 O(n²)，
+            #   quality 全历史 228K 行时耗时 66 分钟 -> 改 GROUP BY HAVING 单趟扫描（<1s）
             rows = con.execute(
                 "SELECT code, roe_avg, gp_margin, current_ratio, liability_to_asset, cfo_to_np "
-                "FROM quality WHERE period=(SELECT MAX(period) FROM quality "
-                "WHERE period<'2026-07-01' AND (SELECT COUNT(*) FROM quality q2 "
-                "WHERE q2.period=quality.period)>=1000)").fetchall()
+                "FROM quality WHERE period=(SELECT period FROM quality "
+                "WHERE period<=? GROUP BY period HAVING COUNT(*)>=1000 "
+                "ORDER BY period DESC LIMIT 1)", (_cut,)).fetchall()
             con.close()
             for code_r, roe, gp, cr, liab, cfo in rows:
                 _risk_cache[code_r] = _check_row(code_r, None, roe, gp, cr, liab, cfo)
@@ -148,15 +177,16 @@ def load_panel(end: str = None, days: int = 300):
       此处读取时合并（主库历史 + 增量库最新），保证增量数据对扫描可见
     """
     rows = []
-    from data.cache import CACHE_DIR as _CD
     from pathlib import Path as _P
+
+    from data.cache import CACHE_DIR as _CD
     # ★2026-08-11 #65 修复：只读最近 3 个增量库 + immutable（原遍历全部 64 个 + 普通连接，
     #   每库等锁 5-20s → load_panel 10min+ 无输出）。增量语义：最新库已含全部增量，3 个兜底足够。
     inc_files = sorted(_CD.glob("bars_incr_*.db"))[-3:]
     dbs = [BARS_DB] + [str(p) for p in inc_files]
     for db in dbs:
         try:
-            uri = f"{_P(db).as_uri()}?mode=ro&immutable=1"   # immutable 免等锁（0.01s vs 20s）
+            uri = f"{_P(db).resolve().as_uri()}?mode=ro&immutable=1"   # immutable 免等锁（0.01s vs 20s）
             con = sqlite3.connect(uri, uri=True, timeout=3)
             r2 = con.execute(
                 "SELECT code, date, close, volume FROM daily_bar WHERE adjust='qfq' "
@@ -184,9 +214,15 @@ def load_fundamentals(end: str = None) -> pd.DataFrame:
       ORDER BY COUNT(*) DESC 会取到 2022 年报 5399 只（太老）→ 按 period 倒序 + 覆盖阈值，2026-08-09 修复）
     """
     con = sqlite3.connect(FIN_DB)
-    period = con.execute(
-        "SELECT period FROM finance_report WHERE period < '2026-07-01' "
-        "GROUP BY period HAVING COUNT(*) >= 4000 ORDER BY period DESC LIMIT 1").fetchone()[0]
+    # ★2026-11-10 PIT：按 end 时点的法定披露截止日截断（原硬编码 < 2026-07-01）
+    _cut = latest_disclosed_period(end)
+    _prow = con.execute(
+        "SELECT period FROM finance_report WHERE period <= ? "
+        "GROUP BY period HAVING COUNT(*) >= 4000 ORDER BY period DESC LIMIT 1", (_cut,)).fetchone()
+    if not _prow:
+        con.close()
+        return pd.DataFrame()
+    period = _prow[0]
     rows = con.execute(
         "SELECT code, period, net_profit, sq_net_yoy, sq_rev_yoy, roe FROM finance_report WHERE period=?",
         (period,)).fetchall()
@@ -204,10 +240,11 @@ def load_fundamentals(end: str = None) -> pd.DataFrame:
 
 def load_quality() -> pd.DataFrame:
     con = sqlite3.connect(QD_DB)
-    # ★取覆盖最全的最近期（≥1000 只；MAX(period) 可能只有 47 只）
+    # ★2026-11-10 PIT：按法定披露截止日截断
+    _cut = latest_disclosed_period()
     period = con.execute(
-        "SELECT period FROM quality WHERE period < '2026-07-01' "
-        "GROUP BY period HAVING COUNT(*) >= 1000 ORDER BY period DESC LIMIT 1").fetchone()
+        "SELECT period FROM quality WHERE period <= ? "
+        "GROUP BY period HAVING COUNT(*) >= 1000 ORDER BY period DESC LIMIT 1", (_cut,)).fetchone()
     if not period:
         con.close()
         return None
@@ -299,15 +336,17 @@ def _dynamic_ext_factors(n: int = 15) -> list:
         # ★lowfreq 集合（manifest category == fundamental_lowfreq；与 factor_risk 同源）
         lowfreq = set()
         try:
-            import glob as _gl, json as _js, os as _os
+            import glob as _gl
+            import json as _js
+            import os as _os
             _mfs = sorted(_gl.glob(r"data/factorpool/output/factor_manifest_*.json"),
                           key=_os.path.getmtime)
             if _mfs:
                 _md = _js.load(open(_mfs[-1], encoding="utf-8"))
                 lowfreq = {x.get("code") for x in _md.get("factors", [])
                            if x.get("category") == "fundamental_lowfreq"}
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:337 _dynamic_ext_factors")
         cands = []
         # ★2026-08-14 一致性改进（因子池 14:30 留言）：
         #   ① 移除 #419 黑名单（C2 已系统性修正方向，health ICIR120 全强正=注册方向正确——
@@ -393,7 +432,8 @@ _pitch_badge_cache = {"mt": 0.0, "data": None}
 
 def load_pitch_badges() -> dict:
     """读因子池 output/pitch_priority_badges_*.json（glob 最新）→ {otype: {badge, tier, winrate_6m, avg_ret_6m}}"""
-    import os as _os, glob as _gl
+    import glob as _gl
+    import os as _os
     try:
         _cands = sorted(_gl.glob(r"data/factorpool/output/pitch_priority_badges_*.json"),
                         key=_os.path.getmtime)
@@ -425,11 +465,18 @@ TOP_BUY_TIMING_MIN = 75.0     # 择时分 ≥75（当前 67.6，需极强择时�
 TOP_BUY_LEVEL = "适合买入"     # 择时档位必须是"适合买入"
 TOP_BUY_SCORE_PAD = 10.0      # score ≥ gate + 10（极强机会）
 TOP_BUY_T1_TYPES = ("quality_gap", "value")   # 实证强类型（70.4%/62.5% 胜率）
+# ★2026-11-11 配置覆盖（config/strategies.yaml scoring.top_buy）
+_TOP_BUY_CFG = SCORING_CFG.get("top_buy") or {}
+TOP_BUY_TIMING_MIN = float(_TOP_BUY_CFG.get("timing_min", TOP_BUY_TIMING_MIN))
+TOP_BUY_LEVEL = str(_TOP_BUY_CFG.get("level", TOP_BUY_LEVEL))
+TOP_BUY_SCORE_PAD = float(_TOP_BUY_CFG.get("score_pad", TOP_BUY_SCORE_PAD))
+TOP_BUY_T1_TYPES = tuple(_TOP_BUY_CFG.get("types") or TOP_BUY_T1_TYPES)
 
 
 def _load_timing_score() -> tuple:
     """读最新 timing_system_*.json → (score, level)。失败 → (None, None)。"""
-    import glob as _gl, os as _os
+    import glob as _gl
+    import os as _os
     try:
         _fs = sorted(_gl.glob(str(BASE / "output" / "timing_system_*.json")),
                      key=_os.path.getmtime)
@@ -560,7 +607,7 @@ def load_event_flags(codes: set, end: str = None) -> dict:
     out = {}
     try:
         from pathlib import Path as _P
-        uri = f"{_P(BARS_DB).as_uri()}?mode=ro&immutable=1"
+        uri = f"{_P(BARS_DB).resolve().as_uri()}?mode=ro&immutable=1"
         con = sqlite3.connect(uri, uri=True, timeout=3)
         # 先取 bars 最近交易日（★双库合并：主库 + 增量库最大值）
         mx = con.execute("SELECT MAX(date) FROM daily_bar").fetchone()[0]
@@ -569,8 +616,8 @@ def load_event_flags(codes: set, end: str = None) -> dict:
             _mx2 = _DC().latest_trade_date()
             if _mx2 and (mx is None or _mx2 > mx):
                 mx = _mx2
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:608 load_event_flags")
         if mx:
             from datetime import timedelta
             lo = (datetime.strptime(mx, "%Y-%m-%d") - timedelta(days=21)).strftime("%Y-%m-%d")
@@ -612,8 +659,8 @@ def load_event_flags(codes: set, end: str = None) -> dict:
                 "last_turn": last_turn,
             }
             out[c] = f
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:651 load_event_flags")
     _event_flags_cache.update({"ts": now, "data": out})
     return out
 
@@ -632,10 +679,10 @@ def apply_event_flags(opportunities: list) -> None:
             continue
         tags = []
         if fl["consec_down2"]:
-            o["risk"] = round(min((o.get("risk") or 0.5) * 1.3, 1.0), 2)
+            o["risk"] = round(min((o.get("risk") or 5.0) * 1.3, 10.0), 2)
             tags.append("🔴连续跌停排雷")
         elif fl["down_flag"]:
-            o["risk"] = round(min((o.get("risk") or 0.5) * 1.15, 1.0), 2)
+            o["risk"] = round(min((o.get("risk") or 5.0) * 1.15, 10.0), 2)
             tags.append("🔴跌停排雷")
         if fl["up_cnt5"] >= 2:
             tags.append(f"5日{fl['up_cnt5']}涨停活跃")
@@ -686,8 +733,8 @@ def load_fs_flags() -> dict:
             if hit:
                 out[code] = hit
         _fs_flags_cache["data"] = out
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:725 load_fs_flags")
     return out
 
 
@@ -744,8 +791,8 @@ def load_crowding() -> dict:
                 _lag = (_dt.date.fromisoformat(_lt) - _dt.date.fromisoformat(_md)).days
                 if _lag > 3:
                     return out
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:783 load_crowding")
         for ft in ("turn_mid_prox", "sentiment", "turnover", "reversal20", "lowvol"):
             v = row.get(f"crowding_{ft}", "")
             try:
@@ -755,8 +802,8 @@ def load_crowding() -> dict:
             if pct > 0:
                 out[ft] = round(pct, 1)
         _crowding_cache.update({"ts": now, "data": out})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:794 load_crowding")
     return out
 
 
@@ -796,8 +843,8 @@ def load_risk_multiplier() -> dict:
             return _risk_mult_cache["data"]
         d = json.load(open(best, encoding="utf-8"))
         _risk_mult_cache["data"] = {f: v["eff"] for f, v in d.get("factors", {}).items() if isinstance(v, dict) and "eff" in v}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:835 load_risk_multiplier")
     _risk_mult_cache["ts"] = now
     return _risk_mult_cache["data"]
 
@@ -858,8 +905,8 @@ def _big_caps() -> set:
             if mv >= p70:
                 out.add(str(c)[:6])
         con.close()
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:897 _big_caps")
     _DOMAIN_CACHE.update({"ts": now, "big": out})
     return out
 
@@ -899,8 +946,8 @@ def load_factor_manifest() -> dict:
                     "usage": str(x.get("usage", "")).strip(),
                     "name_cn": str(x.get("name_cn", "")).strip(),
                 }
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:938 load_factor_manifest")
     return _manifest_cache
 
 
@@ -926,8 +973,8 @@ def load_factor_health() -> dict:
                 "icir120": _f(r.get("icir120")),
                 "status": str(r.get("status", "")).strip(),
             }
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:965 load_factor_health")
     return _health_cache
 
 
@@ -1052,12 +1099,12 @@ def load_daily_ranks() -> dict:
                 if v is not None and pd.notna(v):
                     try:
                         entry[c[:-5]] = round(float(v), 4)   # 去 _rank 后缀
-                    except Exception:
-                        pass
+                    except Exception as _dsh_exc:
+                        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:1091 load_daily_ranks")
             if entry:
                 _daily_rank_cache[code] = entry
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:1095 load_daily_ranks")
     return _daily_rank_cache
 
 
@@ -1071,14 +1118,15 @@ _PW_PATHS = (
     BASE / "factors" / "risk" / "pitch_signal_weights.json",
     BASE / "logs" / "pitch_signal_weights.json",
 )
-# ★2026-08-14 因子池产出路径（时间戳名，glob 最新）
+# ★2026-11-10 修复：原 `<home>\Desktop\...` 是字面量占位符，永远不存在 → 死路径
 _PW_POOL_PATHS = (
-    Path(r"<home>\Desktop\量化代码库思路库\因子池\output"),
+    BASE / "data" / "factorpool" / "output",
 )
 
 
 def _load_pitch_weights() -> dict or None:
-    import os as _os, glob as _gl
+    import glob as _gl
+    import os as _os
     _f = None
     for _p in _PW_PATHS:
         if _p.exists():
@@ -1157,7 +1205,7 @@ def signal_metrics(o: dict, health: dict, daily_ranks: dict, manifest: dict = No
       - 同一 f3_family 内仅权重最高因子计权（家族去重）
       文件未产出 → 完全回退原全因子加权（行为不变）
     """
-    from factors.signal_family import signal_family_of, alias_of, category_to_family
+    from factors.signal_family import alias_of, category_to_family, signal_family_of
     manifest = manifest or {}
     factors = o.get("factors", {}) or {}
     code = o.get("code", "")
@@ -1305,8 +1353,8 @@ def load_strong_hits() -> dict:
         _strong_hits_cache = hits
         if hits:
             print(f"  [强因子直通] 跨家族强因子命中 {len(hits)} 只（{len(strong)} 个独立强因子，≥2 家族交叉）")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:1345 load_strong_hits")
     return _strong_hits_cache
 
 
@@ -1331,8 +1379,8 @@ def apply_strong_hits(opportunities: list) -> None:
             n += 1
         if n:
             print(f"  [强因子直通] 机会池内跨家族强因子确认 {n} 只（+3 分）")
-    except Exception:
-        pass  # 直通是增强，任何异常不阻断主流程
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:1371 apply_strong_hits")
 
 
 # ★2026-08-14 Pitch 改进规格 v2 ④（研究员 14:10 裁决 → 16:15 终裁）：成交额 ≥0.2 亿硬过滤
@@ -1355,9 +1403,9 @@ def _amount_20d_yi(codes: set) -> dict:
         return _amount_cache["data"]
     out = {}
     try:
+        import glob as _gl
         import sqlite3 as _sq
         from pathlib import Path as _P
-        import glob as _gl
         # 主库 + 最近 3 个增量库（immutable 只读，与 portfolio._latest_close_of 同款）
         _dbs = ["data/cache/bars.db"] + \
                sorted(_gl.glob("data/cache/bars_incr_*.db"))[-3:]
@@ -1365,7 +1413,7 @@ def _amount_20d_yi(codes: set) -> dict:
         _by_code = {c: {} for c in codes}
         for _db in _dbs:
             try:
-                _uri = _P(_db).as_uri() + "?mode=ro&immutable=1"
+                _uri = _P(_db).resolve().as_uri() + "?mode=ro&immutable=1"
                 _c = _sq.connect(_uri, uri=True, timeout=4)
                 _ph = ",".join("?" * len(codes))
                 for _r in _c.execute(
@@ -1387,8 +1435,8 @@ def _amount_20d_yi(codes: set) -> dict:
             if _recent:
                 out[_cd] = round(sum(v for _, v in _recent) / len(_recent) / 1e8, 3)
         _amount_cache.update({"ts": _now, "data": out})
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:1427 _amount_20d_yi")
     return out
 
 
@@ -1511,8 +1559,8 @@ def load_external_signals() -> dict:
                         entry["o2c"] = float(o2c) if pd.notna(o2c) else None
                     _bc[c_] = entry
                 _basic_confirm_cache.update({"data": _bc})
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:1551 load_external_signals")
         for _, row in df.iterrows():
             code = str(row["code"]).upper()
             if "." not in code:
@@ -1549,8 +1597,8 @@ def load_external_signals() -> dict:
                     "lowvol_rank": float(_lv) if pd.notna(_lv) else None,
                     "pv_hits": len(pv_hits),   # ★2026-08-14 pv 触发口径（固定 EXT 全集）
                 }
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:1589 load_external_signals")
     return _ext_signal_cache
 
 
@@ -1607,7 +1655,7 @@ def compute_factors(px: pd.DataFrame, vx: pd.DataFrame, fin: pd.DataFrame,
         #   finance_report.roe 为单季 ROE（Q1 单季>8% 极少 → value/quality_gap 触发稀少）
         #   → 有 roe_avg 的股票用年化值覆盖（质量数据全量后 5388 只覆盖）
         f["roe_avg"] = pd.to_numeric(f["roe_avg"], errors="coerce")
-        f["roe"] = f["roe_avg"].fillna(f["roe"])
+        f["roe"] = (f["roe_avg"] * 100.0).fillna(f["roe"])
 
     # 基本面硬筛标记
     f["roe"] = pd.to_numeric(f["roe"], errors="coerce")
@@ -1639,6 +1687,7 @@ def compute_factors(px: pd.DataFrame, vx: pd.DataFrame, fin: pd.DataFrame,
         f["pe_ttm"] = np.nan
     # 行业
     f = f.join(basic[["name", "industry"]], how="left")
+    f["name"] = f["name"].fillna("")   # stock_basic 缺失的股票名置空串（NaN 会让 :8s 格式化崩溃）
     f["industry"] = f["industry"].fillna("未知")
     return f
 
@@ -1677,25 +1726,29 @@ def triggers():
     return {
         "reversal": lambda r: (
             r["drawdown_60d"] < -0.25 and r["mom20"] > 0 and
-            (r["vol_ratio"] or 1) >= 1.2 and (r["roe"] or 0) > 0 and r["non_st"] == 1 and r["non_lowprice"] == 1),
+            (r["vol_ratio"] or 1) >= 1.2 and (r["roe"] or 0) > 2.0 and r["non_st"] == 1 and r["non_lowprice"] == 1),
         "value": lambda r: (
-            # ★真实估值：PB<20%分位（或 PB<1.5 兜底）且 PE>0 且 PE<20%分位，股息率>0 加分
-            (r["pb_pct"] or 1) <= 0.20 and ((r["pb"] or 99) < 1.5 or True) and
-            (r["pe_ttm"] or 0) > 0 and (r["pe_pct"] or 1) <= 0.30 and
-            # ★ROE 口径（2026-08-09）：单季 ROE（Q1 单季>8% 极少）→ 阈值按年化/4 换算：0.08/4=0.02
-            (r["roe"] or 0) > 0.02 and
+            # ★2026-11-10：估值缺失时用价格分位近似（原 pe_ttm=NaN → `(nan or 0)>0` 为 False
+            #   → value 类永久归零）。PB 缺失同样放行。
+            (r["pb_pct"] if pd.notna(r.get("pb_pct")) else 1) <= 0.20 and
+            (r["pb"] if pd.notna(r.get("pb")) else 1.0) < 1.5 and
+            ((r["pe_ttm"] or 0) > 0 if pd.notna(r.get("pe_ttm")) else True) and
+            (r["pe_pct"] if pd.notna(r.get("pe_pct")) else 1) <= 0.30 and
+            # ★ROE/同比口径（2026-11-10 修正）：finance_report 存百分点（4.67=4.67%），
+            #   原写法 >0.02 / >0.05 全部恒真 → revalue/event 占全市场 25%/34%。
+            (r["roe"] or 0) > 2.0 and
             (r["liability"] if pd.notna(r.get("liability")) else 1) < 0.70 and r["non_st"] == 1 and r["non_lowprice"] == 1),
         "breakout": lambda r: (
             (r["near_high_250"] or -1) > -0.05 and (r["vol_ratio"] or 1) >= 1.5 and
             r["ma50_up"] == 1 and r["ma200_up"] == 1 and r["non_st"] == 1 and r["non_lowprice"] == 1),
         "revalue": lambda r: (
-            (r["sq_nyoy"] or 0) > 0.50 and (r["roe"] or 0) > 0.05 and
+            (r["sq_nyoy"] or 0) > 50.0 and (r["roe"] or 0) > 5.0 and
             (r["pe_pct"] or 1) < 0.80 and r["non_st"] == 1 and r["non_lowprice"] == 1),
         "event": lambda r: (
-            (r["roe"] or 0) > 0.08 and (r["sq_nyoy"] or 0) > 0.20 and r["non_st"] == 1 and r["non_lowprice"] == 1),
+            (r["roe"] or 0) > 8.0 and (r["sq_nyoy"] or 0) > 20.0 and r["non_st"] == 1 and r["non_lowprice"] == 1),
         "quality_gap": lambda r: (
             # ★ROE 阈值 0.15 按单季口径换算：年化 15% ≈ 单季 0.0375（2026-08-09）
-            (r["roe"] or 0) > 0.0375 and (r["drawdown_60d"] or 0) < -0.25 and
+            (r["roe"] or 0) > 3.75 and (r["drawdown_60d"] or 0) < -0.25 and
             (r["liability"] if pd.notna(r.get("liability")) else 1) < 0.60 and
             (r["cfo_health"] if pd.notna(r.get("cfo_health")) else 1) == 1 and
             r["non_st"] == 1 and r["non_lowprice"] == 1),
@@ -1718,7 +1771,7 @@ def target_upside_approx(r, otype: str) -> float:
     """
     if otype in ("revalue", "event"):
         yoy = abs(r.get("sq_nyoy") or 0)
-        return min(30 + yoy * 25, 90)      # 50%→42.5%，100%→55%，200%→80%
+        return min(30 + yoy * 0.25, 90)    # 百分点口径：50→42.5%，100→55%，200→80%
     base = {
         "reversal": 25, "value": 30, "breakout": 40,
         "revalue": 60, "event": 35, "quality_gap": 40,
@@ -1765,7 +1818,36 @@ def winrate_approx(otype: str) -> float:
 
 # ==================== 主流程 ====================
 
+def _latest_data_audit():
+    """最新数据审计报告（report/data_audit_report*.json）；无则 None。"""
+    import glob as _g
+    import os as _os
+    fs = sorted(_g.glob(str(BASE / "report" / "data_audit_report*.json")), key=_os.path.getmtime)
+    if not fs:
+        return None
+    try:
+        return json.loads(Path(fs[-1]).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
 def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict:
+    # ★2026-11-10 数据闸门接入：FAIL 时按 data_audit.strict 决定阻断/告警
+    #   （原 gate() 全仓 0 调用，strict:true 是死配置）
+    _gate = _latest_data_audit()
+    if _gate and _gate.get("blocked"):
+        _strict = False
+        try:
+            import yaml
+            _strict = bool((yaml.safe_load(
+                (BASE / "config" / "params.yaml").read_text(encoding="utf-8")) or {}
+            ).get("data_audit", {}).get("strict", False))
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:1834 scan")
+        _msg = _gate.get("block_reason") or "数据审计未通过"
+        if _strict:
+            raise SystemExit(f"数据审计未通过：{_msg}")
+        print(f"  [数据闸门] {_msg} → 继续（strict=false）")
     # ★2026-08-10 修复：默认 date 用 bars.db 最近交易日（避免周末/节假日用当天日期
     #   导致 date 字段虚标未来；数据实际基于最近交易日）
     if date is None:
@@ -1840,8 +1922,8 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
                 _pv_n = int(mask.sum())
                 _pv_warn = "⚠" if not (5 <= _pv_n <= 20) else ""
                 print(f"  [pv哨兵] pv_consensus {_pv_n} 只（健康区间 5-20）{_pv_warn}")
-            except Exception:
-                pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:1914 scan")
             hits = f[mask]
             for code, r in hits.iterrows():
                 upside = target_upside_approx(r, ot)
@@ -1965,8 +2047,8 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
                 o["score"] = round(o["score"] + _cb, 1)
                 o["note"] = (o.get("note") or "") + f"·日历:{_cal['label']}({'+' if _cb>=0 else ''}{_cb})"
             print(f"  [日历层] {_cal['label']}（{_cal['start']}~{_cal['end']}）→ 全池 {_cb:+d} 分")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:2039 scan")
 
     # ★★CAL 月收益日历（因子池 CAL日历效应实证_20260810：2月+5/11月+5/10月+3/1月4月12月-5；
     #   CAL-4 12月小切大已实证推翻不实施）——市场级月度效应，全池统一加减分 + note 留痕。
@@ -1974,7 +2056,8 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
     #   实为只落地了 H16/H17 窗口层，CAL 月收益层缺失——本次补齐（与日历窗口同构，0 副作用兜底）。
     try:
         import datetime as _dt
-        _mon = _dt.datetime.now().month
+        # ★2026-11-10：用扫描日而非 datetime.now()（历史重算可复现）
+        _mon = _dt.datetime.strptime(str(date)[:10], "%Y-%m-%d").month
         _mb = 0
         if _mon == 2:
             _mb = 5   # CAL-1 春季躁动（+4.89%/胜率 75%）
@@ -1991,8 +2074,12 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
                 o["score"] = round(o["score"] + _mb, 1)
                 o["note"] = (o.get("note") or "") + f"·月历:{_ml}({'+' if _mb>=0 else ''}{_mb})"
             print(f"  [月历层] {_ml} → 全池 {_mb:+d} 分")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:2066 scan")
+
+    # ★2026-11-10 统一 clamp：日历/月历/共识加分直接相加会越界（实测 score=100.8）
+    for o in opportunities:
+        o["score"] = round(min(100.0, max(0.0, float(o.get("score") or 0.0))), 1)
 
     # ★★2026-08-11 信号联动（用户指示：机会池与因子池联动，分类按信号族，排名按 有效程度×强度 加权）
     #   ① signal_family：机会主信号族（触发因子加权归属，无法归类→其他）
@@ -2037,15 +2124,15 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
     #   在 ext_signal 之后（load_external_signals 已填充 _basic_confirm_cache）
     try:
         apply_basic_confirm(opportunities)
-    except Exception:
-        pass  # B-8 是增强，任何异常不阻断主流程
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:2116 scan")
 
     # ★强因子直通确认（2026-08-11 百轮#67）：factor_risk 家族代表 × rank≤0.10 跨家族≥2
     #   → 机会池内 +3 分（H8/H10 强因子实证落地；load_strong_hits 原已实现但未接入）
     try:
         apply_strong_hits(opportunities)
-    except Exception:
-        pass  # 直通是增强，任何异常不阻断主流程
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:2123 scan")
 
     # ★竞价强度反信号防守（T-3 裁决落地，2026-08-10）：strength≥6 高开放量 → 减分+回避标记
     #   实证：1 日短效（+0.9pp）、5/20 日反转（-2.3~-2.4pp）→ 防守用途，防追高被套
@@ -2077,8 +2164,8 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
             if n_heat:
                 print(f"  [反信号] 竞价过热减分 {n_heat} 只（{ad8}，strength≥{AUCTION_HEAT_THRESHOLD}）"
                       + (f"，其中 {n_combo} 只昨涨停组合双风险" if n_combo else ""))
-    except Exception:
-        pass  # 反信号是防守增强，任何异常不阻断主流程
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:2156 scan")
 
     # ★2026-08-12 C-10b 外包反向信号减分（用户指示"反向信号入系统做提示"）：
     #   flag_crowded（量化拥挤 8 因子共振，5日 -0.32~-0.66pp）/ flag_deadzone（四正冷门死区，
@@ -2108,8 +2195,8 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
                         n_pen += 1
                 if n_pen:
                     print(f"  [反信号] 反向 flag 减分 {n_pen} 只：{list(_rd.items())[:5]}")
-    except Exception:
-        pass  # 反向信号是防守增强，任何异常不阻断主流程
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:2187 scan")
 
     # ★短线事件排雷（外包 2026-08-10 短线体检结论落地，M7 防守层）：
     #   连续跌停/跌停 → risk 上调 + 🔴 标记；涨停活跃/追高 → 提示
@@ -2118,8 +2205,8 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
         n_mine = sum(1 for o in opportunities if o.get("event_flags", {}).get("consec_down2"))
         if n_mine:
             print(f"  [排雷] 连续跌停高危 {n_mine} 只")
-    except Exception:
-        pass  # 排雷是防守增强，任何异常不阻断主流程
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:2197 scan")
 
     # ★C3 拥挤度执行侧（2026-08-10 总指导接入）：五强因子 60 日波动率历史分位
     #   >90 → 因子池共识加分减半（防踩踏）；>95 → 暂停（该类机会不加分）
@@ -2131,8 +2218,8 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
                 import json as _jth
                 _th = _jth.loads((BASE / "report" / "ui_thresholds.json").read_text(encoding="utf-8"))
                 thr = {"down": float(_th["crowding"]["downweight"]), "pause": float(_th["crowding"]["pause"])}
-            except Exception:
-                pass
+            except Exception as _dsh_exc:
+                _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:2210 scan")
             hot = {k: v for k, v in crowd.items() if v >= thr["down"]}
             paused = {k for k, v in crowd.items() if v >= thr["pause"]}
             if hot:
@@ -2151,24 +2238,27 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
                         n_dw += 1
                 if n_dw:
                     print(f"  [拥挤度] 降权/暂停 {n_dw} 只（hot={hot} paused={sorted(paused)}）")
-    except Exception:
-        pass  # 拥挤度是防守增强，任何异常不阻断主流程
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:2230 scan")
 
     # ★H2 FS 假信号一票否决（外包 08-10 交付 6 flag，总指导 23:50 接入）：
     #   一字板/涨停诱多/天量滞涨/对倒/接飞刀/无量突破 → 剔除（防假信号进组合）
     try:
         opportunities = apply_fs_veto(opportunities)
-    except Exception:
-        pass  # FS 否决是防守增强，任何异常不阻断主流程
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:2237 scan")
 
     # ★F5 短线因子模块（外包 F1-F4 完成，总指导 12:35 接入）：
     #   ① event 涨停维度加分（premium/连板/5日活跃 rank≥0.85）② 排雷（连续跌停≥2 打7折 / 高位炸板打8.5折）
     try:
-        from factors.opportunities.shortterm_hook import apply_event_upgrade, apply_limitdown_mine
+        from factors.opportunities.shortterm_hook import (
+            apply_event_upgrade,
+            apply_limitdown_mine,
+        )
         apply_limitdown_mine(opportunities)
         apply_event_upgrade(opportunities)
-    except Exception:
-        pass  # 短线因子是增强，任何异常不阻断主流程
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/scan.py:2249 scan")
 
     # 大池子：全部机会统一按 score 排序
     opportunities.sort(key=lambda x: -x["score"])
@@ -2205,7 +2295,7 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
         #     🤝 consensus 多因子共识达成 —— 家族≥2 未直通 / also_types≥2 多类型命中 / B-12 十强 ext_signal
         #     📊 score    加权评分高分 —— 其余，大小盘分档配额（大盘2/中盘2/小盘1）
         #   数量：express ≤2 + consensus ≤3 + score ≤5 = 长线 ≤10（Pitch 为决策面，持仓纪律仍 ≤5）
-        TIER_SLOTS = {"大盘": 2, "中盘": 2, "小盘": 1}
+        TIER_SLOTS = SCORING_CFG.get("tier_slots") or {"大盘": 2, "中盘": 2, "小盘": 1}
 
         # 1) 常规门槛筛选（gate + 风控 + 同类前20% + 全局前20）→ eligible 池
         eligible = []
@@ -2307,8 +2397,9 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
         #         即使今日分数略低也能进入 Pitch，展示多样化的决策理由（宁缺毋滥底线保留）
         #    ★2026-08-11 实证校准（知识库）：quality_gap 17年 70.4% 全场最强 → 配额 2→3（高胜率多席位）；
         #      reversal 17年负期望 → 门槛 80 已基本排除，不占配额
-        OTYPE_SLOTS = {"revalue": 2, "value": 2, "quality_gap": 3, "event": 2,
-                       "reversal": 1, "breakout": 1, "pv_consensus": 1}
+        OTYPE_SLOTS = SCORING_CFG.get("otype_slots") or {
+            "revalue": 2, "value": 2, "quality_gap": 3, "event": 2,
+            "reversal": 1, "breakout": 1, "pv_consensus": 1}
         taken = {p["code"] for p in express} | {p["code"] for p in consensus}
         tier_fill = {"大盘": 0, "中盘": 0, "小盘": 0}
         otype_fill = {}
@@ -2320,7 +2411,7 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
         # ★2026-08-11 实证校准（知识库《Pitch台逻辑分析报告》）：高胜率类型（quality_gap 70.4%/value 62.5%）
         #   触发频率低但胜率高 → 该类第一名给"保底推送位"（超配额，不受市值档限制；总分 ≤8）——
         #   避免 value/quality_gap 高分机会被 revalue 高分挤掉市值档
-        REF_TYPES = ("quality_gap", "value")
+        REF_TYPES = tuple(SCORING_CFG.get("ref_types") or ("quality_gap", "value"))
         score_path = []   # ★2026-08-14 前移到 T1 预填之前（T1 块引用；原定义在主循环前过晚）
         # ★2026-08-14 Pitch 改进规格 v2 ②：T1 梯队保底（实证强 = 优先展示）
         #   T1（quality_gap 70.4% + value 62.5%）≥50% 且 quality_gap 保底 ≥2——
@@ -2445,7 +2536,8 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
     #   （防 4h 链每轮重复写 1.8M opp_pool 文件累积膨胀，同 #413/#429 根治）
     _unchanged = False
     try:
-        import glob as _g, os as _os
+        import glob as _g
+        import os as _os
         def _fp(r):
             _oc = sorted((o.get("code"), o.get("score")) for o in r.get("opportunities", []))
             _pc = sorted((p.get("code"), p.get("score")) for p in r.get("pitch", []))

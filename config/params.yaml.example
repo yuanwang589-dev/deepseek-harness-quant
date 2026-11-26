@@ -80,6 +80,22 @@ weights:
   bonus: 0.10                        # 加分项（RPS 领涨、调研、快报等）
   rebalance: "<your-config>" # 动态调权：按季度滚动 IC 校准
 
+  # ---- 权重版本元数据（第17课落地 #3：M3 回写权重前必须预留）----
+  weight_version: "<your-config>" # 当前权重版本（调权时递增，可回滚）
+  weight_date: "<your-config>" # 本次权重生效日期
+  decay_mode: "<your-config>" # 在线更新模式：指数遗忘
+  decay_lambda_factor: 0.99          # 财报/基本面因子（低频）遗忘因子 λ≈0.99
+  decay_lambda_price: 0.95           # 量价因子（中频）遗忘因子 λ≈0.95
+
+  # ---- 因子漂移/衰退监控（第17课 17.5：PSI + 决策矩阵）----
+  drift:
+    psi_threshold: 0.20              # PSI ≥ 0.20 视为漂移（课程默认阈值）
+    psi_warn: 0.10                   # PSI 0.10~0.25 关注区间下沿
+    ic_drop_threshold: 0.30          # IC 相对基线下降 > 30% 视为性能下降
+    ic_min: 0.03                     # 因子滚动 IC < 0.03 触发审查（课程综合练习）
+    ic_monitor_window: 60            # 滚动 IC 计算窗口（交易日）
+    data_quality_first: true         # 数据质量差 → 先修数据再决策（否则重训无效）
+
 # ---------- ★策略分层（v2.8，用户拍板 C 方案）----------
 # 实证发现：欧奈尔止损纪律（7%/移动止损/止盈）为"右侧趋势突破"设计，
 # 反转+低波是"左侧抄底"——任何止损线都让反转更差（无止损+7.7% vs -7%:+0.9%，MA50误杀200次）
@@ -98,22 +114,6 @@ layers:
     discipline: "oneil_style"        # 纪律 = 欧奈尔原版：硬止损 7% + 高点回撤 8%（右侧适用）
 
 
-  # ---- 权重版本元数据（第17课落地 #3：M3 回写权重前必须预留）----
-  weight_version: "<your-config>" # 当前权重版本（调权时递增，可回滚）
-  weight_date: "<your-config>" # 本次权重生效日期
-  decay_mode: "<your-config>" # 在线更新模式：指数遗忘
-  decay_lambda_factor: 0.99          # 财报/基本面因子（低频）遗忘因子 λ≈0.99
-  decay_lambda_price: 0.95           # 量价因子（中频）遗忘因子 λ≈0.95
-
-  # ---- 因子漂移/衰退监控（第17课 17.5：PSI + 决策矩阵）----
-  drift:
-    psi_threshold: 0.20              # PSI ≥ 0.20 视为漂移（课程默认阈值）
-    psi_warn: 0.10                   # PSI 0.10~0.25 关注区间下沿
-    ic_drop_threshold: 0.30          # IC 相对基线下降 > 30% 视为性能下降
-    ic_min: 0.03                     # 因子滚动 IC < 0.03 触发审查（课程综合练习）
-    ic_monitor_window: 60            # 滚动 IC 计算窗口（交易日）
-    data_quality_first: true         # 数据质量差 → 先修数据再决策（否则重训无效）
-
 # ---------- 交易纪律 [不可协商] ----------
 risk:
   stop_loss_pct: 0.07                # 硬止损 7%
@@ -122,11 +122,19 @@ risk:
   time_stop_min_gain: 0.03           # 3 周内涨幅 < 3% 触发
   profit_take_low: 0.20              # 止盈区间下沿 20%
   profit_take_high: 0.25             # 止盈区间上沿 25%
+  take_profit_short_types: ["tech_sentiment"]   # 这些类型目标止盈用 profit_take_low，其余类型用类型表目标
   trailing_stop_ma: 50               # 移动止损 50 日均线
   high_drawdown_exit: 0.08           # 阶段高点回撤 8% 卖出
   risk_budget_pct: 0.02              # 单票风险预算 账户 2% [CS-08]
-  max_position_pct: 0.10             # 单票硬上限 10%
+  max_position_pct: 0.20             # ★2026-11-26 风控接线：单票硬上限 20%（与 5 只等权 1/5 对齐）
+  max_symbol_exposure: 0.20          # 单标的集中度上限（risk_gate 读取）
+  max_total_exposure: 0.80           # 总仓位上限（risk_gate 读取）
   max_industry_pct: 0.30             # 行业上限 30%
+  # ★2026-11-26 L0 择时硬门控（全 fail-closed：数据缺失/异常一律拒绝高风险类型买入）
+  l0_high_risk_otypes: ["revalue", "tech_sentiment"]
+  l0_defensive_score: 40             # 择时 score < 40 = 防御期
+  l0_fail_closed: true               # 数据缺失时拒绝（不放行）
+  circuit_state_file: "logs/risk_circuit_state.json"  # 熔断状态持久化（跨进程）
   vol_target_annual: 0.18            # 组合目标波动 18%（[P0.5校准] 按 A 股实际波动）
 
   # ---- 三层风控（第15课，M4 落地）----
@@ -242,7 +250,7 @@ strategy_v3:
 # ---------- 数据审计（risk/data_audit.py 风控前置闸门，2026-08-07 新建）----------
 data_audit:
   enabled: true                 # 策略/回测前置调用 DataAuditor.gate()；FAIL 阻断
-  strict: true                  # 任一 FAIL → 阻断（当前 C5 ST 标记 FAIL 中 → 数据修复前策略不可信）
+  strict: true                  # ★2026-11-11：C5 ST 已回补（is_st 2.49%，2010-2026）→ 恢复严格阻断
   warn_block: false             # 可选：WARN 数过多也阻断
   warn_block_count: 6
   report_dir: "report"          # 输出 report/data_audit_report.{md,json}
@@ -267,3 +275,67 @@ factor_pool:
   evaluate_on_sched: true         # dev_auto 每轮评估候选+巡检 active
   fetch_on_sched: true            # 每轮刷新政策数据（EPU FRED 全量重下，量小）
   ts_eval_start: "<your-config>" # 时序因子评估起点（覆盖 2020-2025 回测 + 前段滚动窗口）
+
+# ---------- 市场快照（data/rebuild_market_snapshot.py · 择时风格/宽度数据源）----------
+# ★2026-10-16：行业宽度离线化——直接读 data/cache/sw_industry/{行业名}.csv（申万一级，
+#   秒级、零网络），不再串行拉 ~86 个东财板块（原路径东财变慢时撞 600s 超时）。
+#   清单配置化于此；代码内置同款 31 个兜底默认（配置缺失不崩溃）。
+snapshot:
+  sw_l1_industries:               # 申万一级 31 个（2021 版分类）
+    - 农林牧渔
+    - 基础化工
+    - 钢铁
+    - 有色金属
+    - 电子
+    - 汽车
+    - 家用电器
+    - 食品饮料
+    - 纺织服饰
+    - 轻工制造
+    - 医药生物
+    - 公用事业
+    - 交通运输
+    - 房地产
+    - 商贸零售
+    - 社会服务
+    - 综合
+    - 建筑材料
+    - 建筑装饰
+    - 电力设备
+    - 国防军工
+    - 计算机
+    - 传媒
+    - 通信
+    - 银行
+    - 非银金融
+    - 美容护理
+    - 石油石化
+    - 环保
+    - 煤炭
+    - 机械设备
+
+# ---------- 纸上短线轮换引擎（strategy/paper_rotation.py，2026-10-16）----------
+# 定位：纸上模拟盘（account='rotation'）验证「短线打分轮动」；不做真实下单。
+# 明细设计见 docs/plans/2026-10-16-paper-rotation-design.md
+paper_rotation:
+  enabled: false                 # 默认关；显式 true 才在晨更链执行
+  account_name: rotation         # paper.db 内的独立账户（绒不触碰 default）
+  initial_cash: 1000000          # 虚拟初始资金
+  max_positions: 6               # 最大持仓数
+  max_weight_per_stock: 0.25     # 单票仓位上限（实际 min(可用现金÷待买数, 总资产×25%)）
+  top_n_buy: 3                   # 每日买入短线分数前 N
+  exit_rank_threshold: 10        # 分数衰减：掉出前 N 名卖出
+  min_hold_days: 3               # 最小持有交易日（仅约束非止损类卖出）
+  max_hold_days: 20              # 时间止损（horizon_hint 上限，交易日）
+  execution: next_open           # 信号次日开盘撑合（当前唯一支持值）
+  tech_source: "logs/tech_pitch_*.json"   # 短线分数来源（glob，取 mtime 最新）
+
+# ---------- L2 台账自动执行（strategy/auto_execute.py，2026-11-20）----------
+auto_execute:
+  enabled: true
+  buy_n: 3
+  sell_on_stop: true
+  sell_on_take_profit: true
+  rebuy_cooldown_days: 5         # 刚卖出的票 N 个自然日内不自动买回（止损不被立刻打脸）
+  risk_gate_enabled: true        # ★2026-11-26：买入过 L0 + RiskAgent 门禁
+  sell_on_stop_rules: true       # ★2026-11-26：卖出叠加 StopRules 铁律（硬止损/止盈）

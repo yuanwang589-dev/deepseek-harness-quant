@@ -3,7 +3,7 @@
    active item: #5e6ad2 left border + rgba(94,106,210,.2)→#1c1c22 bg.
    底部：数据日 + 择时（读 portal_dash，LW.api 冗余兜底） */
 (function () {
-  var ITEMS = [
+  var DEFAULT_ITEMS = [
     { id: 'portal',   label: '门户',   ic: 'home',     url: '/' },
     { id: 'control',  label: '控制',   ic: 'cpu',      url: '/control' },
     { id: 'pitch',    label: '决策',   ic: 'target',   url: '/pitch' },
@@ -12,8 +12,8 @@
     { id: 'backtest', label: '回测',   ic: 'chart',    url: '/backtest' },
     { id: 'pitchtrack', label: '远期', ic: 'funnel', url: '/pitchtrack' }
   ];
-  // ★P2 菜单收敛（2026-08-15）：主菜单 6 项（门户/控制/决策/持仓/因子/回测）+「更多」分组（日报/数据/说明）
-  var MORE = [
+  // ★P2 菜单收敛（2026-08-15）：主菜单 +「更多」分组（兜底值；优先 /api/live/nav → config/ui.yaml）
+  var DEFAULT_MORE = [
     { id: 'report',  label: '日报', ic: 'doc',  url: '/report' },
     { id: 'data',    label: '数据', ic: 'db',   url: '/data' },
     { id: 'help',    label: '说明', ic: 'help', url: '/help' }
@@ -21,7 +21,25 @@
 
   window.LW = window.LW || {};
   LW.sidebar = {
+    _items: null,
+    _more: null,
     render: function (elId, opts) {
+      var self = this;
+      if (self._items) return self._render(elId, opts);
+      if (LW.api) {
+        // ★2026-11-11：菜单/文案走 /api/live/nav（config/ui.yaml），JS 仅保留兜底
+        LW.api.get('/api/live/nav').then(function (nav) {
+          if (nav && nav.main && nav.main.length) {
+            self._items = nav.main;
+            self._more = nav.more || [];
+          }
+          self._render(elId, opts);
+        }).catch(function () { self._render(elId, opts); });
+        return;
+      }
+      return self._render(elId, opts);
+    },
+    _render: function (elId, opts) {
       var el = document.getElementById(elId);
       if (!el) return;
       var IC = LW.icons || {};
@@ -32,7 +50,7 @@
             '<span class="sb-brand-text">Deepseek HARNESS <span style="font-weight:400">Quant</span></span>' +
           '</div>' +
           '<nav class="sb-nav">' +
-            ITEMS.map(function (it) {
+            (this._items || DEFAULT_ITEMS).map(function (it) {
               var cls = it.id === active ? 'sb-item active' : 'sb-item';
               return '<a class="' + cls + '" href="' + it.url + '">' + (IC[it.ic] || '') + it.label + '</a>';
             }).join('') +
@@ -41,7 +59,7 @@
               '<span>更多</span><span class="sb-more-chev">▸</span></div>' +
             '<div class="sb-more-body" id="' + elId + '-more-body" style="display:grid;grid-template-rows:0fr;transition:grid-template-rows .22s var(--ease-hover)">' +
               '<div style="overflow:hidden">' +
-                MORE.map(function (it) {
+                (this._more || DEFAULT_MORE).map(function (it) {
                   var cls = it.id === active ? 'sb-item active sb-sub-item' : 'sb-item sb-sub-item';
                   return '<a class="' + cls + '" href="' + it.url + '">' + (IC[it.ic] || '') + it.label + '</a>';
                 }).join('') +

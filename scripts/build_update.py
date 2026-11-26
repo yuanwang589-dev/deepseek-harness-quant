@@ -10,6 +10,17 @@
   3. 产出 update_<version>.zip：manifest.json + 变更文件（白名单外一律跳过）
   4. 白名单/保护与 scripts/update.py 完全一致（同一套规则）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import argparse
 import filecmp
 import hashlib
@@ -29,7 +40,7 @@ ALLOW_ROOTS = (
     "harness/home/profiles/web/plugins", "harness/home/skills",
 )
 ALLOW_FILES = (
-    "launcher.py", "main.py", "dev_auto.py", "README.md", "LICENSE",
+    "launcher.py", "main.py", "dev_auto.py", "dsh_log.py", "README.md", "LICENSE",
     "CHANGELOG.md", "VERSION", ".gitignore", "AGENTS.md",
     "harness/install.cmd", "requirements.txt",
 )
@@ -114,8 +125,8 @@ def sanitize_file(path: Path) -> bytes:
     if ext in (".py", ".md", ".html", ".js", ".json", ".yaml", ".yml", ".txt", ".css", ".cmd"):
         try:
             return sanitize_text(path.read_text(encoding="utf-8", errors="ignore")).encode("utf-8")
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "scripts/build_update.py:117 sanitize_file")
     return path.read_bytes()
 
 

@@ -14,6 +14,17 @@
 
 输出：logs/tech_pitch_{ts}.json + deck/ 双写；Deck 路由 /api/tech_pitch + /pitch.html（合并页）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import glob
 import json
 import os
@@ -79,8 +90,8 @@ def load_latest() -> dict:
     if files:
         try:
             return json.loads(Path(files[-1]).read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/tech_pitch.py:82 load_latest")
     return {"ts": "", "entries": [], "new_codes": []}
 
 
@@ -111,16 +122,16 @@ def _enrich(c: dict) -> dict:
         h = _holdout_one(code)
         if h:
             out["horizons"] = h
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/tech_pitch.py:114 _enrich")
     # Beneish
     try:
         from factors.opportunities.pitch_v2 import load_beneish
         m = load_beneish().get(code)
         if m:
             out["beneish"] = {"level": m.get("level"), "m_score": m.get("m_score")}
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/tech_pitch.py:122 _enrich")
     # 风控
     try:
         from factors.opportunities.pitch_v2 import load_risk_map
@@ -139,8 +150,8 @@ def _enrich(c: dict) -> dict:
         from risk.type_stop_rules import type_stop_plan
         sp = type_stop_plan(c["otype"], c["score"])
         out["stop_plan"] = sp
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/tech_pitch.py:142 _enrich")
     return out
 
 
@@ -205,8 +216,8 @@ def build(pool_file=None) -> Path:
     try:
         (BASE / "deck" / f"tech_pitch_{ts}.json").write_text(
             json.dumps(out, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/tech_pitch.py:208 build")
     return p
 
 

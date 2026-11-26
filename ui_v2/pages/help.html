@@ -56,7 +56,7 @@
     <div class="arch">
       <div class="layer">
         <h3><span class="ln" style="background:rgba(94,106,210,.16);color:#5e6ad2">L0</span> 择时层 · 仓位总闸</h3>
-        <div class="mini" style="color:var(--muted);line-height:1.8">四维评分（政策40%/宏观25%/情绪20%/宽度15%）= 适合买入/谨慎/不适合。<br>
+        <div class="mini" style="color:var(--muted);line-height:1.8">四维评分（<span data-timing-weight>政策40%/宏观25%/情绪20%/宽度15%</span>）= 适合买入/谨慎/不适合。<br>
           ⚠️ 实证（08-15）：<b style="color:var(--gold)">择时对低换手组合是净损耗</b>（12 参数组合 + 因子池 MA 重验双重确认），
           故 L0 仅作<b>满仓主义大波段参考</b>（红绿灯=参考，不接线），不做月度择向。<br>
           防御期（评分&lt;40）revalue/短线情绪审批从严（后端硬门控）。</div>
@@ -126,11 +126,11 @@
   <!-- 择时公式 -->
   <div class="v2-card anim-fade-in-up d1" style="margin-top:14px">
     <h2> 择时逻辑（公式 + 原因）</h2>
-    <div class="term"><b>评分公式</b> 政策 40% + 宏观 25% + 情绪 20% + 宽度 15%</div>
-    <div class="term"><b>政策（40%）</b> EPU + 社融 + 利差（防守区→择时降档联动）</div>
-    <div class="term"><b>宏观（25%）</b> Regime 状态 + 社融近 3 月 vs 近 6 月 + 利率（y10 下行=宽松加分）</div>
-    <div class="term"><b>情绪（20%）</b> 市场温度 0–100（越低越恐慌=买入区）</div>
-    <div class="term"><b>宽度（15%）</b> 行业宽度（60 日动量>0 行业占比，&lt;20% 恐慌底部）+ 宽度修正</div>
+    <div class="term"><b>评分公式</b> <span data-timing-weight>政策 40% + 宏观 25% + 情绪 20% + 宽度 15%</span></div>
+    <div class="term"><b>政策（<span data-dim="政策">40</span>%）</b> EPU + 社融 + 利差（防守区→择时降档联动）</div>
+    <div class="term"><b>宏观（<span data-dim="宏观">25</span>%）</b> Regime 状态 + 社融近 3 月 vs 近 6 月 + 利率（y10 下行=宽松加分）</div>
+    <div class="term"><b>情绪（<span data-dim="情绪">20</span>%）</b> 市场温度 0–100（越低越恐慌=买入区）</div>
+    <div class="term"><b>宽度（<span data-dim="宽度">15</span>%）</b> 行业宽度（60 日动量>0 行业占比，&lt;20% 恐慌底部）+ 宽度修正</div>
     <div class="term" style="border-bottom:none"><b>定位（08-15 修正）</b> 满仓主义大波段参考：平时满仓、择时=大波段减仓/加仓参考、极端熊市才收闸；<b>不接线、不做月度择向</b>（实证：择时对低换手组合纯损害）</div>
   </div>
 
@@ -286,6 +286,22 @@
       loadMu();
     });
   };
+
+  // ★2026-11-11：择时四维权重从 /api/live/enums 动态渲染（不再写死在 HTML）
+  (function () {
+    if (!window.LW || !LW.api) return;
+    LW.api.get('/api/live/enums').then(function (d) {
+      var td = (d && d.timing_dims) || {};
+      var ks = Object.keys(td);
+      if (!ks.length) return;
+      var txt = ks.map(function (k) { return k + Math.round((td[k].weight || 0) * 100) + '%'; }).join(' / ');
+      document.querySelectorAll('[data-timing-weight]').forEach(function (el) { el.textContent = txt; });
+      document.querySelectorAll('[data-dim]').forEach(function (el) {
+        var k = el.getAttribute('data-dim'), v = td[k];
+        if (v && v.weight != null) el.textContent = Math.round(v.weight * 100);
+      });
+    }).catch(function () {});
+  })();
 
   loadFunnel();
   loadSys();

@@ -15,6 +15,17 @@
     - 龙虎榜分 20：top_list 净买/机构席位（moneyflow_verify；夜间限流降级 0 分）
   输出：logs/tech_pitch_{ts}.json（与 v2 同规格，Deck/门户消费端不变）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import glob
 import json
 import os
@@ -64,10 +75,10 @@ def load_recent(days: int = CONSEC_DAYS) -> pd.DataFrame:
                     dates += [r[0] for r in _c.execute(
                         "SELECT DISTINCT date FROM daily_bar ORDER BY date DESC LIMIT ?", (days + 3,))]
                     _c.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as _dsh_exc:
+                    _dsh_swallow(_dsh_exc, "factors/opportunities/tech_pitch_v3.py:67 load_recent")
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/tech_pitch_v3.py:69 load_recent")
         dates = sorted(set(dates))[-days:]
         q = "SELECT code,date,open,high,low,close,pct_chg,volume,turn,is_st FROM daily_bar WHERE date IN (%s)" % ",".join("?" * len(dates))
         df = pd.read_sql_query(q, con, params=dates)
@@ -82,10 +93,10 @@ def load_recent(days: int = CONSEC_DAYS) -> pd.DataFrame:
                         df = pd.concat([df, _df2], ignore_index=True).drop_duplicates(
                             subset=["code", "date"], keep="last")
                     _c.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as _dsh_exc:
+                    _dsh_swallow(_dsh_exc, "factors/opportunities/tech_pitch_v3.py:85 load_recent")
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/tech_pitch_v3.py:87 load_recent")
         # ★2026-08-12 #136 ST 名单补充：主库最新日 is_st 可能丢列（Tushare 增量写 0）→
         #   用 scan.load_st_codes（含异常回溯）名单覆盖最新日 ST 标记，保证涨停板幅度判断正确
         try:
@@ -94,8 +105,8 @@ def load_recent(days: int = CONSEC_DAYS) -> pd.DataFrame:
             if _st:
                 _latest = df["date"].max()
                 df.loc[(df["date"] == _latest) & (df["code"].isin(_st)), "is_st"] = 1
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/tech_pitch_v3.py:97 load_recent")
     finally:
         con.close()
     return df
@@ -271,8 +282,8 @@ def build() -> Path:
             _before = len(cands)
             cands = cands[~cands["code"].isin(_over_codes)]
             print(f"  [科技线收敛] 竞价反信号剔除 {_before - len(cands)} 只过热（strength≥6）")
-    except Exception:
-        pass  # 竞价数据缺失 → 不剔除（容错）
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/tech_pitch_v3.py:274 build")
 
     entries = []
     now_date = df["date"].max()
@@ -296,8 +307,8 @@ def build() -> Path:
             from risk.stock_risk import check_one
             for _, _r2 in cands.iterrows():
                 risk_map[_r2["code"]] = check_one(_r2["code"])
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/tech_pitch_v3.py:299 build")
     for _, r in cands.iterrows():
         code = r["code"]
         stop_s, stop_px, atr = _stop_safety_score(code, df)
@@ -454,8 +465,8 @@ def build() -> Path:
     if prev:
         try:
             prev_codes = {e["code"] for e in json.loads(Path(prev[-1]).read_text(encoding="utf-8")).get("entries", [])}
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "factors/opportunities/tech_pitch_v3.py:457 build")
     for e in entries:
         e["is_new"] = e["code"] not in prev_codes
     new_codes = [e["code"] for e in entries if e["is_new"]]
@@ -478,8 +489,8 @@ def build() -> Path:
     p.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
     try:
         (BASE / "deck" / f"tech_pitch_{ts}.json").write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "factors/opportunities/tech_pitch_v3.py:481 build")
     return p
 
 

@@ -12,6 +12,17 @@ data/cache/unified.db —— 统一查询入口 + 数据资产管理：
 
 用法：python data/build_unified_db.py   （幂等：重建全部表，保留 factor 数据并 upsert）
 """
+# ★2026-11-26 静默异常统一记录（自动注入）
+try:
+    from dsh_log import swallow as _dsh_swallow
+except ImportError:
+    import sys as _dsh_sys
+    from pathlib import Path as _dsh_Path
+    for _d in [_dsh_Path(__file__).resolve().parent] + list(_dsh_Path(__file__).resolve().parents):
+        if (_d / 'dsh_log.py').exists():
+            _dsh_sys.path.insert(0, str(_d))
+            break
+    from dsh_log import swallow as _dsh_swallow
 import glob
 import json
 import os
@@ -70,8 +81,8 @@ def build_inventory(con):
                             (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), f.name, kind,
                              sz, f"实时盘点 {datetime.now().strftime('%m-%d')}"))
                 n += 1
-    except Exception:
-        pass
+    except Exception as _dsh_exc:
+        _dsh_swallow(_dsh_exc, "data/build_unified_db.py:73 build_inventory")
     return n
 
 
@@ -143,8 +154,8 @@ def build_macro_series(con):
                                     ("y2", r[0], r[2]))
                         n += 1
             src.close()
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/build_unified_db.py:146 build_macro_series")
     return n
 
 
@@ -182,14 +193,14 @@ def build_event_series(con):
                     try:
                         mx = src.execute(
                             f"SELECT MAX({date_col}) FROM [{t}]").fetchone()[0]
-                    except Exception:
-                        pass
+                    except Exception as _dsh_exc:
+                        _dsh_swallow(_dsh_exc, "data/build_unified_db.py:185 build_event_series")
             con.execute("INSERT OR REPLACE INTO event_series VALUES (?,?,?,?)",
                         (dbn, total, mx, datetime.now().strftime("%Y-%m-%d")))
             n += 1
             src.close()
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/build_unified_db.py:191 build_event_series")
     return n
 
 
@@ -208,8 +219,8 @@ def build_minute_factors(con):
                          datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d"),
                          "分钟因子产物"))
             n += 1
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/build_unified_db.py:211 build_minute_factors")
     # 增量 parquet 统计
     ip = root / "incr_parquet"
     if ip.exists():
@@ -221,8 +232,8 @@ def build_minute_factors(con):
             con.execute("INSERT OR REPLACE INTO minute_factors VALUES (?,?,?,?)",
                         ("incr_parquet/", total, mx, f"7z 增量 parquet {len(fs)} 个"))
             n += 1
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/build_unified_db.py:224 build_minute_factors")
     return n
 
 
@@ -248,14 +259,14 @@ def build_dual_source(con):
             if date_col:
                 try:
                     mx = src.execute(f"SELECT MAX({date_col}) FROM [{tbl}]").fetchone()[0]
-                except Exception:
-                    pass
+                except Exception as _dsh_exc:
+                    _dsh_swallow(_dsh_exc, "data/build_unified_db.py:251 build_dual_source")
             con.execute("INSERT OR REPLACE INTO dual_source VALUES (?,?,?,?,?)",
                         (grp, dbn, cnt, mx, note))
             n += 1
             src.close()
-        except Exception:
-            pass
+        except Exception as _dsh_exc:
+            _dsh_swallow(_dsh_exc, "data/build_unified_db.py:257 build_dual_source")
     return n
 
 
